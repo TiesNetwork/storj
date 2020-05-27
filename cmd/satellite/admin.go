@@ -12,6 +12,7 @@ import (
 	"storj.io/storj/pkg/revocation"
 	"storj.io/storj/private/version"
 	"storj.io/storj/satellite"
+	"storj.io/storj/satellite/accounting/live"
 	"storj.io/storj/satellite/metainfo"
 	"storj.io/storj/satellite/satellitedb"
 )
@@ -53,7 +54,15 @@ func cmdAdminRun(cmd *cobra.Command, args []string) (err error) {
 		err = errs.Combine(err, revocationDB.Close())
 	}()
 
-	peer, err := satellite.NewAdmin(log, identity, db, pointerDB, revocationDB, version.Build, &runCfg.Config)
+	accountingCache, err := live.NewCache(log.Named("live-accounting"), runCfg.LiveAccounting)
+	if err != nil {
+		return errs.New("Error creating live accounting cache on satellite api: %+v", err)
+	}
+	defer func() {
+		err = errs.Combine(err, accountingCache.Close())
+	}()
+
+	peer, err := satellite.NewAdmin(log, identity, db, pointerDB, revocationDB, accountingCache, version.Build, &runCfg.Config)
 	if err != nil {
 		return err
 	}

@@ -1178,7 +1178,15 @@ func (s *Service) GetAPIKeys(ctx context.Context, projectID uuid.UUID, cursor AP
 		cursor.Limit = maxLimit
 	}
 
-	page, err = s.store.APIKeys().GetPagedByProjectID(ctx, projectID, cursor)
+	page = &APIKeyPage{
+		Search:         cursor.Search,
+		Limit:          cursor.Limit,
+		Offset:         uint64((cursor.Page - 1) * cursor.Limit),
+		Order:          cursor.Order,
+		OrderDirection: cursor.OrderDirection,
+	}
+
+	page, err = s.store.APIKeys().GetPagedByProjectID(ctx, projectID, page)
 	if err != nil {
 		return nil, Error.Wrap(err)
 	}

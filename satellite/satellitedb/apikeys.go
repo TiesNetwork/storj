@@ -26,25 +26,17 @@ type apikeys struct {
 	db      *satelliteDB
 }
 
-func (keys *apikeys) GetPagedByProjectID(ctx context.Context, projectID uuid.UUID, cursor console.APIKeyCursor) (akp *console.APIKeyPage, err error) {
+func (keys *apikeys) GetPagedByProjectID(ctx context.Context, projectID uuid.UUID, page *console.APIKeyPage) (akp *console.APIKeyPage, err error) {
 	defer mon.Task()(&ctx)(&err)
 
-	search := "%" + strings.Replace(cursor.Search, " ", "%", -1) + "%"
+	search := "%" + strings.Replace(page.Search, " ", "%", -1) + "%"
 
-	if cursor.Limit > 50 {
-		cursor.Limit = 50
+	if page.Limit > 50 {
+		page.Limit = 50
 	}
 
-	if cursor.Page == 0 {
-		return nil, errs.New("page cannot be 0")
-	}
-
-	page := &console.APIKeyPage{
-		Search:         cursor.Search,
-		Limit:          cursor.Limit,
-		Offset:         uint64((cursor.Page - 1) * cursor.Limit),
-		Order:          cursor.Order,
-		OrderDirection: cursor.OrderDirection,
+	if page.Offset < 0 {
+		return nil, errs.New("page offset cannot be negative")
 	}
 
 	countQuery := keys.db.Rebind(`
@@ -75,7 +67,7 @@ func (keys *apikeys) GetPagedByProjectID(ctx context.Context, projectID uuid.UUI
 		FROM api_keys ak
 		WHERE ak.project_id = ?
 		AND lower(ak.name) LIKE ?
-		ORDER BY ` + sanitizedAPIKeyOrderColumnName(cursor.Order) + `
+		ORDER BY ` + sanitizedAPIKeyOrderColumnName(page.Order) + `
 		` + sanitizeOrderDirectionName(page.OrderDirection) + `
 		LIMIT ? OFFSET ?`)
 
@@ -115,14 +107,13 @@ func (keys *apikeys) GetPagedByProjectID(ctx context.Context, projectID uuid.UUI
 	}
 
 	page.APIKeys = apiKeys
-	page.Order = cursor.Order
 
-	page.PageCount = uint(page.TotalCount / uint64(cursor.Limit))
-	if page.TotalCount%uint64(cursor.Limit) != 0 {
+	page.PageCount = uint(page.TotalCount / uint64(page.Limit))
+	if page.TotalCount%uint64(page.Limit) != 0 {
 		page.PageCount++
 	}
 
-	page.CurrentPage = cursor.Page
+	page.CurrentPage = uint(page.Offset/uint64(page.Limit)) + 1
 
 	err = rows.Err()
 	if err != nil {

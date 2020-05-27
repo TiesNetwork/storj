@@ -20,6 +20,7 @@ import (
 	"storj.io/storj/private/lifecycle"
 	"storj.io/storj/private/version"
 	"storj.io/storj/private/version/checker"
+	"storj.io/storj/satellite/accounting"
 	"storj.io/storj/satellite/admin"
 	"storj.io/storj/satellite/metainfo"
 )
@@ -31,7 +32,6 @@ type Admin struct {
 	// core dependencies
 	Log      *zap.Logger
 	Identity *identity.FullIdentity
-	DB       DB
 
 	Servers  *lifecycle.Group
 	Services *lifecycle.Group
@@ -53,11 +53,11 @@ type Admin struct {
 func NewAdmin(log *zap.Logger, full *identity.FullIdentity, db DB,
 	pointerDB metainfo.PointerDB,
 	revocationDB extensions.RevocationDB,
+	accountingCache accounting.Cache,
 	versionInfo version.Info, config *Config) (*Admin, error) {
 	peer := &Admin{
 		Log:      log,
 		Identity: full,
-		DB:       db,
 
 		Servers:  lifecycle.NewGroup(log.Named("servers")),
 		Services: lifecycle.NewGroup(log.Named("services")),
@@ -96,14 +96,19 @@ func NewAdmin(log *zap.Logger, full *identity.FullIdentity, db DB,
 		})
 	}
 
-	{ // setup debug
+	{ // setup admin
 		var err error
 		peer.Admin.Listener, err = net.Listen("tcp", config.Admin.Address)
 		if err != nil {
 			return nil, err
 		}
-
-		peer.Admin.Server = admin.NewServer(log.Named("admin"), peer.Admin.Listener, config.Admin)
+		liveAccounting := accounting.NewService(
+			db.ProjectAccounting(),
+			accountingCache,
+			config.Rollup.MaxAlphaUsage,
+		)
+		service := admin.NewService(db.Console(), db.ProjectAccounting(), liveAccounting)
+		peer.Admin.Server = admin.NewServer(log.Named("admin"), peer.Admin.Listener, config.Admin, service)
 		peer.Servers.Add(lifecycle.Item{
 			Name:  "admin",
 			Run:   peer.Admin.Server.Run,

@@ -11,7 +11,8 @@ import (
 
 const (
 	// Query is immutable graphql request
-	Query = "query"
+	Query = "Query"
+
 	// TotalUsageQuery is a query name for total usage
 	TotalUsageQuery = "totalUsage"
 	// UserQuery is a query name for user

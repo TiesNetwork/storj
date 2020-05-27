@@ -11,7 +11,7 @@ import (
 
 const (
 	// Mutation is graphql request that modifies data
-	Mutation = "mutation"
+	Mutation = "Mutation"
 
 	// CreateUserMutation is a mutation name for user creation
 	CreateUserMutation = "createUser"

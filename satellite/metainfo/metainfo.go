@@ -2311,6 +2311,7 @@ func (endpoint *Endpoint) DeleteObjectPieces(
 	var (
 		nodesPieces = make(map[storj.NodeID][]storj.PieceID)
 		nodeIDs     storj.NodeIDList
+		piecesSize  int64
 	)
 
 	if !lastSegmentNotFound {
@@ -2349,6 +2350,8 @@ func (endpoint *Endpoint) DeleteObjectPieces(
 
 				nodesPieces[piece.NodeId] = append(pieces, pieceID)
 			}
+			segmentSize, _ := calculateSpaceUsed(pointer)
+			piecesSize += segmentSize
 		}
 	}
 
@@ -2396,6 +2399,9 @@ func (endpoint *Endpoint) DeleteObjectPieces(
 
 			nodesPieces[piece.NodeId] = append(pieces, pieceID)
 		}
+
+		segmentSize, _ := calculateSpaceUsed(pointer)
+		piecesSize += segmentSize
 	}
 
 	if len(nodeIDs) == 0 {
@@ -2422,7 +2428,23 @@ func (endpoint *Endpoint) DeleteObjectPieces(
 		})
 	}
 
-	return endpoint.deletePieces.DeletePieces(ctx, nodesPiecesList, deleteObjectPiecesSuccessThreshold)
+	err = endpoint.deletePieces.DeletePieces(ctx, nodesPiecesList, deleteObjectPiecesSuccessThreshold)
+	if nil != err {
+		return err
+	}
+
+	if piecesSize != 0 {
+		if err := endpoint.projectUsage.AddProjectStorageUsage(ctx, projectID, -piecesSize); err != nil {
+			endpoint.log.Error("Could not track new storage usage by project",
+				zap.Stringer("Project ID", projectID),
+				zap.Error(err),
+			)
+			// but continue. it's most likely our own fault that we couldn't track it, and the only thing
+			// that will be affected is our per-project bandwidth and storage limits.
+		}
+	}
+
+	return nil
 }
 
 // deletePointer deletes a pointer returning the deleted pointer.

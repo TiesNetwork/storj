@@ -108,7 +108,12 @@ func (client *Client) IncrBy(ctx context.Context, key storage.Key, value int64) 
 	if key.IsZero() {
 		return storage.ErrEmptyKey.New("")
 	}
-	_, err = client.db.IncrBy(key.String(), value).Result()
+	if 0 > value {
+		_, err = client.db.DecrBy(key.String(), -value).Result()
+	} else {
+		_, err = client.db.IncrBy(key.String(), value).Result()
+	}
+
 	return err
 }
 

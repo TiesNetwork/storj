@@ -221,6 +221,7 @@ for version in ${unique_versions}; do
         PATH=${bin_dir}:$PATH storj-sim -x --host="${STORJ_NETWORK_HOST4}" --postgres="${STORJ_SIM_POSTGRES}" --config-dir "${dir}/local-network" network setup > /dev/null 2>&1
         echo "Finished setting up. ${dir}/local-network:" $(ls ${dir}/local-network)
         echo "Binary shasums:"
+        shasum ${bin_dir}/storj-sim
         shasum ${bin_dir}/satellite
         shasum ${bin_dir}/storagenode
         shasum ${bin_dir}/uplink

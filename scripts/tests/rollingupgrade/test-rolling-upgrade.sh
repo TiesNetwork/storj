@@ -28,7 +28,7 @@ if [ ! -d ${main_cfg_dir}/uplink-old-api ]; then
     mkdir -p ${main_cfg_dir}/uplink-old-api
     access=$(storj-sim --config-dir=$main_cfg_dir network env GATEWAY_0_ACCESS)
     new_access=$(go run $update_access_script_path $(storj-sim --config-dir=$main_cfg_dir network env SATELLITE_0_DIR) $access)
-    sat_id=$(storj-sim --config-dir=$main_cfg_dir network env SATELLITE_0_ID)
+    sat_id=$(PATH=$test_dir/bin:$PATH storj-sim --config-dir=$main_cfg_dir network env SATELLITE_0_ID)
     storj-sim --config-dir=$main_cfg_dir network env
     old_sat_api_addr="$sat_id@127.0.0.1:30000"
     echo "========================"

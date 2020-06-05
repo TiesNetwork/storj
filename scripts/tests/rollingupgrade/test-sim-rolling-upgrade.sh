@@ -256,6 +256,7 @@ ln -f ${src_ul_version_dir}/bin/uplink $test_dir/bin/uplink
 # use test-versions.sh instead of test-rolling-upgrade.sh for upload step, since the setup for the two tests should be identical
 PATH=$test_dir/bin:$PATH storj-sim -x --host "${STORJ_NETWORK_HOST4}" --config-dir "${test_dir}/local-network" network test bash "${test_versions_path}" "${test_dir}/local-network" "upload" "${stage1_uplink_version}" "$update_access_script_path"
 
+cp -r $(version_dir ${stage2_sat_version}) ${test_dir}
 echo -e "\nSetting up stage 2 in ${test_dir}"
 setup_stage "${test_dir}" "${stage2_sat_version}" "${stage2_storagenode_versions}" "2"
 echo -e "\nRunning stage 2."

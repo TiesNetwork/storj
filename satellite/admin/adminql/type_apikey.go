@@ -34,19 +34,19 @@ func graphqlAPIKey() *graphql.Object {
 		Name: APIKeyType,
 		Fields: graphql.Fields{
 			FieldAPIKeyID: &graphql.Field{
-				Type: graphql.ID,
+				Type: graphql.NewNonNull(graphql.ID),
 			},
 			FieldProjectID: &graphql.Field{
-				Type: graphql.ID,
+				Type: graphql.NewNonNull(graphql.ID),
 			},
 			FieldPartnerID: &graphql.Field{
 				Type: graphql.ID,
 			},
 			FieldName: &graphql.Field{
-				Type: graphql.String,
+				Type: graphql.NewNonNull(graphql.String),
 			},
 			FieldCreatedAt: &graphql.Field{
-				Type: graphql.DateTime,
+				Type: graphql.NewNonNull(graphql.DateTime),
 			},
 		},
 	})
@@ -57,10 +57,10 @@ func graphqlAPIKeyCreate(types *TypeCreator) *graphql.Object {
 		Name: APIKeyCreateType,
 		Fields: graphql.Fields{
 			FieldToken: &graphql.Field{
-				Type: graphql.String,
+				Type: graphql.NewNonNull(graphql.String),
 			},
 			FieldAPIKey: &graphql.Field{
-				Type: types.apiKey,
+				Type: graphql.NewNonNull(types.apiKey),
 			},
 		},
 	})

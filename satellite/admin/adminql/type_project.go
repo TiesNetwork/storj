@@ -31,10 +31,10 @@ func graphqlProject(s *service.Service, types *TypeCreator) *graphql.Object {
 		Name: ProjectType,
 		Fields: graphql.Fields{
 			FieldProjectID: &graphql.Field{
-				Type: graphql.ID,
+				Type: graphql.NewNonNull(graphql.ID),
 			},
 			FieldName: &graphql.Field{
-				Type: graphql.String,
+				Type: graphql.NewNonNull(graphql.String),
 			},
 			FieldDescription: &graphql.Field{
 				Type: graphql.String,
@@ -43,21 +43,21 @@ func graphqlProject(s *service.Service, types *TypeCreator) *graphql.Object {
 				Type: graphql.ID,
 			},
 			FieldOwnerID: &graphql.Field{
-				Type: graphql.ID,
+				Type: graphql.NewNonNull(graphql.ID),
 			},
 			FieldRateLimit: &graphql.Field{
 				Type: graphql.Int,
 			},
 			FieldCreatedAt: &graphql.Field{
-				Type: graphql.DateTime,
+				Type: graphql.NewNonNull(graphql.DateTime),
 			},
 			FieldAPIKeys: &graphql.Field{
-				Type:    graphql.NewList(types.apiKey),
+				Type:    graphql.NewNonNull(graphql.NewList(graphql.NewNonNull(types.apiKey))),
 				Args:    graphqlProjectAPIKeysArgs(),
 				Resolve: graphqlProjectAPIKeysResolve(s),
 			},
 			FieldProjectUsage: &graphql.Field{
-				Type:    types.usageLimit,
+				Type:    graphql.NewNonNull(types.usageLimit),
 				Resolve: graphqlProjectUsageLimitResolve(s),
 			},
 		},

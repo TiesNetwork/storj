@@ -31,25 +31,25 @@ func graphqlUser(s *service.Service, types *TypeCreator) *graphql.Object {
 		Name: UserType,
 		Fields: graphql.Fields{
 			FieldUserID: &graphql.Field{
-				Type: graphql.String,
+				Type: graphql.NewNonNull(graphql.ID),
 			},
 			FieldEmail: &graphql.Field{
-				Type: graphql.String,
+				Type: graphql.NewNonNull(graphql.String),
 			},
 			FieldFullName: &graphql.Field{
-				Type: graphql.String,
+				Type: graphql.NewNonNull(graphql.String),
 			},
 			FieldShortName: &graphql.Field{
 				Type: graphql.String,
 			},
 			FieldCreatedAt: &graphql.Field{
-				Type: graphql.DateTime,
+				Type: graphql.NewNonNull(graphql.DateTime),
 			},
 			FieldPartnerID: &graphql.Field{
 				Type: graphql.String,
 			},
 			FieldProjects: &graphql.Field{
-				Type:    graphql.NewList(types.project),
+				Type:    graphql.NewNonNull(graphql.NewList(graphql.NewNonNull(types.project))),
 				Resolve: graphqlUserProjectsResolve(s),
 			},
 		},

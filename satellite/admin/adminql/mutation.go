@@ -33,7 +33,7 @@ func rootMutation(log *zap.Logger, service *service.Service, types *TypeCreator)
 		Name: Mutation,
 		Fields: graphql.Fields{
 			CreateUserMutation: &graphql.Field{
-				Type:    types.user,
+				Type:    graphql.NewNonNull(types.user),
 				Args:    graphqlCreateUserMutationArgs(),
 				Resolve: graphqlCreateUserMutationResolve(service),
 			},
@@ -43,7 +43,7 @@ func rootMutation(log *zap.Logger, service *service.Service, types *TypeCreator)
 				Resolve: graphqlUpdateUserMutationResolve(service),
 			},
 			CreateProjectMutation: &graphql.Field{
-				Type:    types.project,
+				Type:    graphql.NewNonNull(types.project),
 				Args:    graphqlCreateProjectMutationArgs(),
 				Resolve: graphqlCreateProjectMutationResolve(service),
 			},
@@ -53,12 +53,12 @@ func rootMutation(log *zap.Logger, service *service.Service, types *TypeCreator)
 				Resolve: graphqlUpdateUsageLimitMutationResolve(service),
 			},
 			CreateAPIKeyMutation: &graphql.Field{
-				Type:    types.apiKeyCreate,
+				Type:    graphql.NewNonNull(types.apiKeyCreate),
 				Args:    graphqlCreateAPIKeyMutationArgs(),
 				Resolve: graphqlCreateAPIKeyMutationResolve(service),
 			},
 			DeleteAPIKeyMutation: &graphql.Field{
-				Type:    graphql.NewList(types.apiKey),
+				Type:    graphql.NewNonNull(graphql.NewList(graphql.NewNonNull(types.apiKey))),
 				Args:    graphqlDeleteAPIKeyMutationArgs(),
 				Resolve: graphqlDeleteAPIKeyMutationResolve(service),
 			},

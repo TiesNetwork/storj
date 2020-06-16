@@ -33,22 +33,22 @@ func graphqlTotalUsage() *graphql.Object {
 		Name: TotalUsageType,
 		Fields: graphql.Fields{
 			FieldUserID: &graphql.Field{
-				Type: graphql.ID,
+				Type: graphql.NewNonNull(graphql.ID),
 			},
 			FieldSince: &graphql.Field{
-				Type: graphql.DateTime,
+				Type: graphql.NewNonNull(graphql.DateTime),
 			},
 			FieldBefore: &graphql.Field{
-				Type: graphql.DateTime,
+				Type: graphql.NewNonNull(graphql.DateTime),
 			},
 			FieldEgress: &graphql.Field{
-				Type: graphql.Float,
+				Type: graphql.NewNonNull(graphql.Float),
 			},
 			FieldObject: &graphql.Field{
-				Type: graphql.Float,
+				Type: graphql.NewNonNull(graphql.Float),
 			},
 			FieldStorage: &graphql.Field{
-				Type: graphql.Float,
+				Type: graphql.NewNonNull(graphql.Float),
 			},
 		},
 	})
@@ -60,16 +60,16 @@ func graphqlUsageLimit() *graphql.Object {
 		Name: UsageLimitType,
 		Fields: graphql.Fields{
 			FieldEgress: &graphql.Field{
-				Type: bigInt,
+				Type: graphql.NewNonNull(bigInt),
 			},
 			FieldEgressLimit: &graphql.Field{
-				Type: bigInt,
+				Type: graphql.NewNonNull(bigInt),
 			},
 			FieldStorage: &graphql.Field{
-				Type: bigInt,
+				Type: graphql.NewNonNull(bigInt),
 			},
 			FieldStorageLimit: &graphql.Field{
-				Type: bigInt,
+				Type: graphql.NewNonNull(bigInt),
 			},
 		},
 	})

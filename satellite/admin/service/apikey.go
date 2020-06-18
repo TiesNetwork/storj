@@ -10,6 +10,9 @@ import (
 	//"github.com/zeebo/errs"
 
 	"storj.io/common/macaroon"
+	"storj.io/common/pkcrypto"
+	"storj.io/common/storj"
+	"storj.io/storj/lib/uplink"
 	"storj.io/storj/satellite/console"
 )
 
@@ -139,6 +142,30 @@ func (s *Service) GetAPIKeysPageByProjectID(
 		return nil, err
 	}
 	return mapAPIKeys(page.APIKeys), nil
+}
+
+// APIKeyToGatewayAccessKey generates gateway access key from APIKey token
+func (s *Service) APIKeyToGatewayAccessKey(token string) (string, error) {
+	if len(token) <= 0 {
+		return "", errs.New(apiKeyTokenIsEmptuErrMsg)
+	}
+	defaultAPIKey, err := uplink.ParseAPIKey(token)
+	if nil != err {
+		return "", err
+	}
+	key, err := storj.NewKey(pkcrypto.SHA256Hash([]byte(token)))
+	if nil != err {
+		return "", err
+	}
+	accessKey, err := (&uplink.Scope{
+		SatelliteAddr:    s.GetFullAddress(),
+		APIKey:           defaultAPIKey,
+		EncryptionAccess: uplink.NewEncryptionAccessWithDefaultKey(*key),
+	}).Serialize()
+	if err != nil {
+		return "", err
+	}
+	return accessKey, nil
 }
 
 func unmapOrderDirection(order OrderDirection) console.OrderDirection {

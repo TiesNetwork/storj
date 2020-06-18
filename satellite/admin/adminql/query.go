@@ -23,6 +23,8 @@ const (
 	ProjectQuery = "project"
 	// APIKeyQuery is a query name for API key
 	APIKeyQuery = "apiKey"
+	// GatewayAccessKeyQuery is a query name for gateway access key
+	GatewayAccessKeyQuery = "gatewayAccessKey"
 	// UsageLimitQuery is a query name for usage limit
 	UsageLimitQuery = "usageLimit"
 )
@@ -56,6 +58,11 @@ func rootQuery(service *service.Service, types *TypeCreator) *graphql.Object {
 				Type:    types.apiKey,
 				Args:    graphqlAPIKeyQueryArgs(),
 				Resolve: graphqlAPIKeyQueryResolve(service),
+			},
+			GatewayAccessKeyQuery: &graphql.Field{
+				Type:    graphql.NewNonNull(graphql.String),
+				Args:    graphqlGatewayAccessKeyQueryArgs(),
+				Resolve: graphqlGatewayAccessKeyQueryResolve(service),
 			},
 			UsageLimitQuery: &graphql.Field{
 				Type:    types.usageLimit,

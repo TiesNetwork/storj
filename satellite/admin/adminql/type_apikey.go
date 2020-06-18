@@ -172,3 +172,18 @@ func graphqlAPIKeyQueryResolve(s *service.Service) func(graphql.ResolveParams) (
 		return s.GetAPIKey(p.Context, *apiKeyID)
 	}
 }
+
+func graphqlGatewayAccessKeyQueryArgs() graphql.FieldConfigArgument {
+	return graphql.FieldConfigArgument{
+		FieldToken: &graphql.ArgumentConfig{
+			Type: graphql.NewNonNull(graphql.String),
+		},
+	}
+}
+
+func graphqlGatewayAccessKeyQueryResolve(s *service.Service) func(graphql.ResolveParams) (interface{}, error) {
+	return func(p graphql.ResolveParams) (interface{}, error) {
+		token, _ := p.Args[FieldToken].(string)
+		return s.APIKeyToGatewayAccessKey(token)
+	}
+}

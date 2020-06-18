@@ -107,7 +107,10 @@ func NewAdmin(log *zap.Logger, full *identity.FullIdentity, db DB,
 			accountingCache,
 			config.Rollup.MaxAlphaUsage,
 		)
-		service := admin.NewService(db.Console(), db.ProjectAccounting(), liveAccounting)
+		service := admin.NewService(db.Console(), db.ProjectAccounting(), liveAccounting, &admin.ServiceConfig{
+			SatelliteNodeID:  &peer.Identity.ID,
+			SatelliteAddress: config.Server.Address,
+		})
 		peer.Admin.Server = admin.NewServer(log.Named("admin"), peer.Admin.Listener, config.Admin, service)
 		peer.Servers.Add(lifecycle.Item{
 			Name:  "admin",

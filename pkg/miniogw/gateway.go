@@ -489,7 +489,7 @@ func (layer *gatewayLayer) Shutdown(ctx context.Context) (err error) {
 	return nil
 }
 
-func (layer *gatewayLayer) StorageInfo(context.Context) minio.StorageInfo {
+func (layer *gatewayLayer) StorageInfo(_ context.Context) minio.StorageInfo {
 	return minio.StorageInfo{}
 }
 

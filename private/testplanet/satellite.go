@@ -604,7 +604,13 @@ func (planet *Planet) newAdmin(count int, identity *identity.FullIdentity, db sa
 	}
 	planet.databases = append(planet.databases, revocationDB)
 
-	return satellite.NewAdmin(log, identity, db, pointerDB, revocationDB, versionInfo, &config)
+	liveAccounting, err := live.NewCache(log.Named("live-accounting"), config.LiveAccounting)
+	if err != nil {
+		return nil, errs.Wrap(err)
+	}
+	planet.databases = append(planet.databases, liveAccounting)
+
+	return satellite.NewAdmin(log, identity, db, pointerDB, revocationDB, liveAccounting, versionInfo, &config)
 }
 
 func (planet *Planet) newRepairer(count int, identity *identity.FullIdentity, db satellite.DB, pointerDB metainfo.PointerDB, config satellite.Config, versionInfo version.Info) (*satellite.Repairer, error) {

@@ -21,6 +21,7 @@ type TypeCreator struct {
 	apiKey       *graphql.Object
 	apiKeyCreate *graphql.Object
 	usageLimit   *graphql.Object
+	storageNode  *graphql.Object
 
 	cursor *graphql.InputObject
 }
@@ -41,6 +42,10 @@ func (c *TypeCreator) Create(log *zap.Logger, s *service.Service) error {
 
 	c.apiKey = graphqlAPIKey()
 	if err := c.totalUsage.Error(); err != nil {
+		return err
+	}
+	c.storageNode = graphqlStorageNode()
+	if err := c.storageNode.Error(); err != nil {
 		return err
 	}
 

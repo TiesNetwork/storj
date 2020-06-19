@@ -34,8 +34,10 @@ var (
 //
 // architecture: Service
 type Service struct {
-	consoleDB    console.DB
-	accountingDB accounting.ProjectAccounting
+	consoleDB console.DB
+
+	nodesDB   Nodes
+	projectDB accounting.ProjectAccounting
 
 	projectUsage *accounting.Service
 
@@ -51,10 +53,11 @@ type Config struct {
 }
 
 // NewService returns new instance of Service.
-func NewService(consoleDB console.DB, accountingDB accounting.ProjectAccounting, projectUsage *accounting.Service, config *Config) *Service {
+func NewService(consoleDB console.DB, projectDB accounting.ProjectAccounting, nodesDB Nodes, projectUsage *accounting.Service, config *Config) *Service {
 	return &Service{
 		consoleDB:    consoleDB,
-		accountingDB: accountingDB,
+		nodesDB:      nodesDB,
+		projectDB:    projectDB,
 		projectUsage: projectUsage,
 		passwordCost: bcrypt.DefaultCost,
 		config:       config,

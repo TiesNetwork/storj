@@ -35,7 +35,7 @@ func (s *Service) UpdateUsageLimit(ctx context.Context, projectID uuid.UUID, lim
 	if err != nil {
 		return nil, errs.New(projectDoesNotExistErrMsg)
 	}
-	err = s.accountingDB.UpdateProjectUsageLimit(ctx, p.ID, memory.Size(limit))
+	err = s.projectDB.UpdateProjectUsageLimit(ctx, p.ID, memory.Size(limit))
 	if err != nil {
 		return nil, Error.Wrap(err)
 	}
@@ -88,7 +88,7 @@ func (s *Service) GetTotalUsageForUser(ctx context.Context, userID uuid.UUID, si
 		Before: before,
 	}
 	for _, project := range projects {
-		usage, err := s.accountingDB.GetProjectTotal(ctx, project.ID, since, before)
+		usage, err := s.projectDB.GetProjectTotal(ctx, project.ID, since, before)
 		if nil != err {
 			return nil, err
 		}

@@ -14,6 +14,7 @@ import (
 	"storj.io/storj/private/dbutil/pgutil"
 	"storj.io/storj/satellite"
 	"storj.io/storj/satellite/accounting"
+	"storj.io/storj/satellite/admin"
 	"storj.io/storj/satellite/attribution"
 	"storj.io/storj/satellite/audit"
 	"storj.io/storj/satellite/console"
@@ -46,6 +47,8 @@ type satelliteDB struct {
 
 	consoleDBOnce sync.Once
 	consoleDB     *ConsoleDB
+	adminDBOnce   sync.Once
+	adminDB       *AdminDB
 }
 
 // Options includes options for how a satelliteDB runs
@@ -145,6 +148,18 @@ func (db *satelliteDB) Console() console.DB {
 	})
 
 	return db.consoleDB
+}
+
+// Admin returns database for satellite administration
+func (db *satelliteDB) Admin() admin.DB {
+	db.adminDBOnce.Do(func() {
+		db.adminDB = &AdminDB{
+			db:      db,
+			methods: db,
+		}
+	})
+
+	return db.adminDB
 }
 
 // Rewards returns database for storing offers

@@ -80,7 +80,7 @@ func (db *ConsoleDB) WithTx(ctx context.Context, fn func(context.Context, consol
 	}
 
 	return db.db.WithTx(ctx, func(ctx context.Context, tx *dbx.Tx) error {
-		dbTx := &DBTx{
+		dbTx := &ConsoleDBTx{
 			ConsoleDB: &ConsoleDB{
 				apikeysLRUOptions: db.apikeysLRUOptions,
 
@@ -97,13 +97,13 @@ func (db *ConsoleDB) WithTx(ctx context.Context, fn func(context.Context, consol
 	})
 }
 
-// DBTx extends Database with transaction scope.
-type DBTx struct {
+// ConsoleDBTx extends Database with transaction scope.
+type ConsoleDBTx struct {
 	*ConsoleDB
 }
 
 // Commit is a method for committing and closing transaction.
-func (db *DBTx) Commit() error {
+func (db *ConsoleDBTx) Commit() error {
 	if db.tx == nil {
 		return errs.New("begin transaction before commit it!")
 	}
@@ -112,7 +112,7 @@ func (db *DBTx) Commit() error {
 }
 
 // Rollback is a method for rollback and closing transaction.
-func (db *DBTx) Rollback() error {
+func (db *ConsoleDBTx) Rollback() error {
 	if db.tx == nil {
 		return errs.New("begin transaction before rollback it!")
 	}

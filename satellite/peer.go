@@ -75,6 +75,8 @@ type DB interface {
 	Irreparable() irreparable.DB
 	// Console returns database for satellite console
 	Console() console.DB
+	// Admin returns database for satellite administration
+	Admin() admin.DB
 	// Rewards returns database for marketing admin GUI
 	Rewards() rewards.DB
 	// Orders returns database for orders

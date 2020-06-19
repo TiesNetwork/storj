@@ -192,6 +192,13 @@ read all (
 	select node.id
 )
 
+read all (
+	select node
+	where  node.wallet = ?
+	where  node.type = ?
+	orderby asc node.id
+)
+
 read limitoffset (
 	select node
 	where  node.id >= ?
@@ -1160,5 +1167,5 @@ read limitoffset (
     select credits_spending
     where credits_spending.created_at <= ?
     where credits_spending.status = ?
-    orderby desc credits_spending+.created_at
+    orderby desc credits_spending.created_at
 )

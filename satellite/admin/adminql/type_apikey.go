@@ -4,9 +4,6 @@ import (
 	"github.com/graphql-go/graphql"
 	"github.com/skyrings/skyring-common/tools/uuid"
 	"storj.io/storj/satellite/admin/service"
-	//"time"
-	// "github.com/graphql-go/graphql"
-	// "storj.io/storj/satellite/admin/service"
 )
 
 const (

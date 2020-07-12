@@ -8754,6 +8754,42 @@ func (obj *postgresImpl) All_AccountingRollup_By_StartTime_GreaterOrEqual(ctx co
 
 }
 
+func (obj *postgresImpl) All_AccountingRollup_By_NodeId_And_StartTime_GreaterOrEqual_And_StartTime_Less(ctx context.Context,
+	accounting_rollup_node_id AccountingRollup_NodeId_Field,
+	accounting_rollup_start_time_greater_or_equal AccountingRollup_StartTime_Field,
+	accounting_rollup_start_time_less AccountingRollup_StartTime_Field) (
+	rows []*AccountingRollup, err error) {
+	defer mon.Task()(&ctx)(&err)
+
+	var __embed_stmt = __sqlbundle_Literal("SELECT accounting_rollups.id, accounting_rollups.node_id, accounting_rollups.start_time, accounting_rollups.put_total, accounting_rollups.get_total, accounting_rollups.get_audit_total, accounting_rollups.get_repair_total, accounting_rollups.put_repair_total, accounting_rollups.at_rest_total FROM accounting_rollups WHERE accounting_rollups.node_id = ? AND accounting_rollups.start_time >= ? AND accounting_rollups.start_time < ?")
+
+	var __values []interface{}
+	__values = append(__values, accounting_rollup_node_id.value(), accounting_rollup_start_time_greater_or_equal.value(), accounting_rollup_start_time_less.value())
+
+	var __stmt = __sqlbundle_Render(obj.dialect, __embed_stmt)
+	obj.logStmt(__stmt, __values...)
+
+	__rows, err := obj.driver.QueryContext(ctx, __stmt, __values...)
+	if err != nil {
+		return nil, obj.makeErr(err)
+	}
+	defer __rows.Close()
+
+	for __rows.Next() {
+		accounting_rollup := &AccountingRollup{}
+		err = __rows.Scan(&accounting_rollup.Id, &accounting_rollup.NodeId, &accounting_rollup.StartTime, &accounting_rollup.PutTotal, &accounting_rollup.GetTotal, &accounting_rollup.GetAuditTotal, &accounting_rollup.GetRepairTotal, &accounting_rollup.PutRepairTotal, &accounting_rollup.AtRestTotal)
+		if err != nil {
+			return nil, obj.makeErr(err)
+		}
+		rows = append(rows, accounting_rollup)
+	}
+	if err := __rows.Err(); err != nil {
+		return nil, obj.makeErr(err)
+	}
+	return rows, nil
+
+}
+
 func (obj *postgresImpl) Get_Node_By_Id(ctx context.Context,
 	node_id Node_Id_Field) (
 	node *Node, err error) {
@@ -14586,6 +14622,42 @@ func (obj *cockroachImpl) All_AccountingRollup_By_StartTime_GreaterOrEqual(ctx c
 
 }
 
+func (obj *cockroachImpl) All_AccountingRollup_By_NodeId_And_StartTime_GreaterOrEqual_And_StartTime_Less(ctx context.Context,
+	accounting_rollup_node_id AccountingRollup_NodeId_Field,
+	accounting_rollup_start_time_greater_or_equal AccountingRollup_StartTime_Field,
+	accounting_rollup_start_time_less AccountingRollup_StartTime_Field) (
+	rows []*AccountingRollup, err error) {
+	defer mon.Task()(&ctx)(&err)
+
+	var __embed_stmt = __sqlbundle_Literal("SELECT accounting_rollups.id, accounting_rollups.node_id, accounting_rollups.start_time, accounting_rollups.put_total, accounting_rollups.get_total, accounting_rollups.get_audit_total, accounting_rollups.get_repair_total, accounting_rollups.put_repair_total, accounting_rollups.at_rest_total FROM accounting_rollups WHERE accounting_rollups.node_id = ? AND accounting_rollups.start_time >= ? AND accounting_rollups.start_time < ?")
+
+	var __values []interface{}
+	__values = append(__values, accounting_rollup_node_id.value(), accounting_rollup_start_time_greater_or_equal.value(), accounting_rollup_start_time_less.value())
+
+	var __stmt = __sqlbundle_Render(obj.dialect, __embed_stmt)
+	obj.logStmt(__stmt, __values...)
+
+	__rows, err := obj.driver.QueryContext(ctx, __stmt, __values...)
+	if err != nil {
+		return nil, obj.makeErr(err)
+	}
+	defer __rows.Close()
+
+	for __rows.Next() {
+		accounting_rollup := &AccountingRollup{}
+		err = __rows.Scan(&accounting_rollup.Id, &accounting_rollup.NodeId, &accounting_rollup.StartTime, &accounting_rollup.PutTotal, &accounting_rollup.GetTotal, &accounting_rollup.GetAuditTotal, &accounting_rollup.GetRepairTotal, &accounting_rollup.PutRepairTotal, &accounting_rollup.AtRestTotal)
+		if err != nil {
+			return nil, obj.makeErr(err)
+		}
+		rows = append(rows, accounting_rollup)
+	}
+	if err := __rows.Err(); err != nil {
+		return nil, obj.makeErr(err)
+	}
+	return rows, nil
+
+}
+
 func (obj *cockroachImpl) Get_Node_By_Id(ctx context.Context,
 	node_id Node_Id_Field) (
 	node *Node, err error) {
@@ -19105,6 +19177,18 @@ func (rx *Rx) Rollback() (err error) {
 	return err
 }
 
+func (rx *Rx) All_AccountingRollup_By_NodeId_And_StartTime_GreaterOrEqual_And_StartTime_Less(ctx context.Context,
+	accounting_rollup_node_id AccountingRollup_NodeId_Field,
+	accounting_rollup_start_time_greater_or_equal AccountingRollup_StartTime_Field,
+	accounting_rollup_start_time_less AccountingRollup_StartTime_Field) (
+	rows []*AccountingRollup, err error) {
+	var tx *Tx
+	if tx, err = rx.getTx(ctx); err != nil {
+		return
+	}
+	return tx.All_AccountingRollup_By_NodeId_And_StartTime_GreaterOrEqual_And_StartTime_Less(ctx, accounting_rollup_node_id, accounting_rollup_start_time_greater_or_equal, accounting_rollup_start_time_less)
+}
+
 func (rx *Rx) All_AccountingRollup_By_StartTime_GreaterOrEqual(ctx context.Context,
 	accounting_rollup_start_time_greater_or_equal AccountingRollup_StartTime_Field) (
 	rows []*AccountingRollup, err error) {
@@ -20898,6 +20982,12 @@ func (rx *Rx) Update_User_By_Id(ctx context.Context,
 }
 
 type Methods interface {
+	All_AccountingRollup_By_NodeId_And_StartTime_GreaterOrEqual_And_StartTime_Less(ctx context.Context,
+		accounting_rollup_node_id AccountingRollup_NodeId_Field,
+		accounting_rollup_start_time_greater_or_equal AccountingRollup_StartTime_Field,
+		accounting_rollup_start_time_less AccountingRollup_StartTime_Field) (
+		rows []*AccountingRollup, err error)
+
 	All_AccountingRollup_By_StartTime_GreaterOrEqual(ctx context.Context,
 		accounting_rollup_start_time_greater_or_equal AccountingRollup_StartTime_Field) (
 		rows []*AccountingRollup, err error)

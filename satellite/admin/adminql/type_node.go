@@ -2,6 +2,7 @@ package adminql
 
 import (
 	"errors"
+	"time"
 
 	"github.com/graphql-go/graphql"
 	"storj.io/storj/satellite/admin/service"
@@ -10,6 +11,8 @@ import (
 const (
 	// StorageNodeType is a graphql type for storage node
 	StorageNodeType = "StorageNode"
+	// StorageNodeUsageType is a graphql type for storage node usage
+	StorageNodeUsageType = "NodeUsage"
 
 	// FieldNodeID is a field name for storage node id
 	FieldNodeID = "nodeID"
@@ -69,9 +72,23 @@ const (
 	FieldNodeExitFinishedAt = "exitFinishedAt"
 	// FieldNodeExitSuccess is a field name for storage node exitSuccess
 	FieldNodeExitSuccess = "exitSuccess"
+	// FieldNodeUsage is a field name for for storage node usage
+	FieldNodeUsage = "usage"
+	// FieldNodePutTotal is a field name for for storage node putTotal
+	FieldNodePutTotal = "putTotal"
+	// FieldNodeGetTotal is a field name for for storage node getTotal
+	FieldNodeGetTotal = "getTotal"
+	// FieldNodeGetAuditTotal is a field name for for storage node getAuditTotal
+	FieldNodeGetAuditTotal = "getAuditTotal"
+	// FieldNodeGetRepairTotal is a field name for for storage node getRepairTotal
+	FieldNodeGetRepairTotal = "getRepairTotal"
+	// FieldNodePutRepairTotal is a field name for for storage node putRepairTotal
+	FieldNodePutRepairTotal = "putRepairTotal"
+	// FieldNodeAtRestTotal is a field name for for storage node atRestTotal
+	FieldNodeAtRestTotal = "atRestTotal"
 )
 
-func graphqlStorageNode() *graphql.Object {
+func graphqlStorageNode(s *service.Service, types *TypeCreator) *graphql.Object {
 	return graphql.NewObject(graphql.ObjectConfig{
 		Name: StorageNodeType,
 		Fields: graphql.Fields{
@@ -169,6 +186,11 @@ func graphqlStorageNode() *graphql.Object {
 					return nil != node.DisqualifiedAt, nil
 				},
 			},
+			FieldNodeUsage: &graphql.Field{
+				Type:    graphql.NewNonNull(types.storageNodeUsage),
+				Args:    graphqlStorageNodeInnerStorageNodeUsageQueryArgs(),
+				Resolve: graphqlStorageNodeInnerStorageNodeUsageQueryResolve(s),
+			},
 		},
 	})
 }
@@ -186,4 +208,90 @@ func graphqlStorageNodeQueryResolve(s *service.Service) func(graphql.ResolvePara
 		walletAddr, _ := p.Args[FieldNodeWallet].(string)
 		return s.GetNodesByWallet(p.Context, walletAddr)
 	}
+}
+
+func graphqlStorageNodeUsage() *graphql.Object {
+	return graphql.NewObject(graphql.ObjectConfig{
+		Name: StorageNodeUsageType,
+		Fields: graphql.Fields{
+			FieldNodeID: &graphql.Field{
+				Type: graphql.NewNonNull(graphql.ID),
+			},
+			FieldStartTime: &graphql.Field{
+				Type: graphql.NewNonNull(graphql.DateTime),
+			},
+			FieldEndTime: &graphql.Field{
+				Type: graphql.NewNonNull(graphql.DateTime),
+			},
+			FieldNodePutTotal: &graphql.Field{
+				Type: graphql.NewNonNull(bigInt),
+			},
+			FieldNodeGetTotal: &graphql.Field{
+				Type: graphql.NewNonNull(bigInt),
+			},
+			FieldNodeGetAuditTotal: &graphql.Field{
+				Type: graphql.NewNonNull(bigInt),
+			},
+			FieldNodePutRepairTotal: &graphql.Field{
+				Type: graphql.NewNonNull(bigInt),
+			},
+			FieldNodeGetRepairTotal: &graphql.Field{
+				Type: graphql.NewNonNull(bigInt),
+			},
+			FieldNodeAtRestTotal: &graphql.Field{
+				Type: graphql.NewNonNull(graphql.Float),
+			},
+		},
+	})
+}
+
+func graphqlStorageNodeUsageQueryArgs() graphql.FieldConfigArgument {
+	return graphql.FieldConfigArgument{
+		FieldNodeID: &graphql.ArgumentConfig{
+			Type: graphql.NewNonNull(graphql.ID),
+		},
+		FieldStartTime: &graphql.ArgumentConfig{
+			Type: graphql.NewNonNull(graphql.DateTime),
+		},
+		FieldEndTime: &graphql.ArgumentConfig{
+			Type: graphql.DateTime,
+		},
+	}
+}
+
+func graphqlStorageNodeUsageQueryResolve(s *service.Service) func(graphql.ResolveParams) (interface{}, error) {
+	return func(p graphql.ResolveParams) (interface{}, error) {
+		nodeIDString, _ := p.Args[FieldNodeID].(string)
+		return storageNodeUsageQueryResolveCommon(s, p, nodeIDString)
+	}
+}
+
+func graphqlStorageNodeInnerStorageNodeUsageQueryArgs() graphql.FieldConfigArgument {
+	return graphql.FieldConfigArgument{
+		FieldStartTime: &graphql.ArgumentConfig{
+			Type: graphql.NewNonNull(graphql.DateTime),
+		},
+		FieldEndTime: &graphql.ArgumentConfig{
+			Type: graphql.DateTime,
+		},
+	}
+}
+
+func graphqlStorageNodeInnerStorageNodeUsageQueryResolve(s *service.Service) func(graphql.ResolveParams) (interface{}, error) {
+	return func(p graphql.ResolveParams) (interface{}, error) {
+		node := p.Source.(*service.Node)
+		return storageNodeUsageQueryResolveCommon(s, p, node.ID.String())
+	}
+}
+
+func storageNodeUsageQueryResolveCommon(s *service.Service, p graphql.ResolveParams, nodeIDString string) (interface{}, error) {
+	start, _ := p.Args[FieldStartTime].(time.Time)
+	end, _ := p.Args[FieldEndTime].(time.Time)
+	if end.IsZero() {
+		end = time.Now()
+	}
+	if start.IsZero() {
+		start = end
+	}
+	return s.GetNodeUsage(p.Context, nodeIDString, start, end)
 }

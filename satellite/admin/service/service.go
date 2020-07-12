@@ -14,15 +14,16 @@ import (
 
 // Error messages
 const (
-	userDoesNotExistErrMsg     = "There is no account on this Satellite for id you have requested"
-	projectDoesNotExistErrMsg  = "There is no project on this Satellite for id you have requested"
-	apiKeyDoesNotExistErrMsg   = "There is no API key on this Satellite for id you have requested"
-	apiKeyWithNameExistsErrMsg = "An API Key with this name already exists in this project, please use a different name"
-	emailUsedErrMsg            = "This email is already in use, try another"
-	passwordIncorrectErrMsg    = "Your password needs at least %d characters long"
-	projLimitExceededErrMsg    = "Sorry, you have exceeded the number of projects you can create"
-	unauthorizedErrMsg         = "You are not authorized to perform this action"
-	apiKeyTokenIsEmptuErrMsg   = "API Key Token should not be empty"
+	userDoesNotExistErrMsg      = "There is no account on this Satellite for id you have requested"
+	projectDoesNotExistErrMsg   = "There is no project on this Satellite for id you have requested"
+	apiKeyDoesNotExistErrMsg    = "There is no API key on this Satellite for id you have requested"
+	apiKeyWithNameExistsErrMsg  = "An API Key with this name already exists in this project, please use a different name"
+	emailUsedErrMsg             = "This email is already in use, try another"
+	passwordIncorrectErrMsg     = "Your password needs at least %d characters long"
+	projLimitExceededErrMsg     = "Sorry, you have exceeded the number of projects you can create"
+	unauthorizedErrMsg          = "You are not authorized to perform this action"
+	apiKeyTokenIsEmptuErrMsg    = "API Key Token should not be empty"
+	timeStartNotBeforeEndErrMsg = "Time range is invalid. Start time should be before end time"
 )
 
 // Error describes internal console error.
@@ -36,8 +37,9 @@ var (
 type Service struct {
 	consoleDB console.DB
 
-	nodesDB   Nodes
-	projectDB accounting.ProjectAccounting
+	nodesDB       Nodes
+	projectDB     accounting.ProjectAccounting
+	storagenodeDB accounting.StoragenodeAccounting
 
 	projectUsage *accounting.Service
 
@@ -53,14 +55,15 @@ type Config struct {
 }
 
 // NewService returns new instance of Service.
-func NewService(consoleDB console.DB, projectDB accounting.ProjectAccounting, nodesDB Nodes, projectUsage *accounting.Service, config *Config) *Service {
+func NewService(consoleDB console.DB, projectDB accounting.ProjectAccounting, storagenodeDB accounting.StoragenodeAccounting, nodesDB Nodes, projectUsage *accounting.Service, config *Config) *Service {
 	return &Service{
-		consoleDB:    consoleDB,
-		nodesDB:      nodesDB,
-		projectDB:    projectDB,
-		projectUsage: projectUsage,
-		passwordCost: bcrypt.DefaultCost,
-		config:       config,
+		consoleDB:     consoleDB,
+		nodesDB:       nodesDB,
+		projectDB:     projectDB,
+		storagenodeDB: storagenodeDB,
+		projectUsage:  projectUsage,
+		passwordCost:  bcrypt.DefaultCost,
+		config:        config,
 	}
 }
 

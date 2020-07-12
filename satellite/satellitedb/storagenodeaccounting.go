@@ -153,6 +153,42 @@ func (db *StoragenodeAccounting) SaveRollup(ctx context.Context, latestRollup ti
 	return Error.Wrap(err)
 }
 
+// GetRollup retrieves tally and bandwidth rollup aggregations from the database
+func (db *StoragenodeAccounting) GetRollup(ctx context.Context, nodeID storj.NodeID, start time.Time, end time.Time) (r []accounting.Rollup, err error) {
+	defer mon.Task()(&ctx)(&err)
+	err = db.db.WithTx(ctx, func(ctx context.Context, tx *dbx.Tx) error {
+		nID := dbx.AccountingRollup_NodeId(nodeID.Bytes())
+		arStart := dbx.AccountingRollup_StartTime(start)
+		arEnd := dbx.AccountingRollup_StartTime(end)
+		ars, err := tx.All_AccountingRollup_By_NodeId_And_StartTime_GreaterOrEqual_And_StartTime_Less(
+			ctx,
+			nID,
+			arStart,
+			arEnd,
+		)
+		if err != nil {
+			return err
+		}
+		r = make([]accounting.Rollup, len(ars))
+		for i, ar := range ars {
+			arNodeID, _ := storj.NodeIDFromBytes(ar.NodeId)
+			r[i] = accounting.Rollup{
+				ID:             ar.Id,
+				NodeID:         arNodeID,
+				StartTime:      ar.StartTime,
+				PutTotal:       ar.PutTotal,
+				GetTotal:       ar.GetTotal,
+				GetAuditTotal:  ar.GetAuditTotal,
+				GetRepairTotal: ar.GetRepairTotal,
+				PutRepairTotal: ar.PutRepairTotal,
+				AtRestTotal:    ar.AtRestTotal,
+			}
+		}
+		return err
+	})
+	return r, Error.Wrap(err)
+}
+
 // LastTimestamp records the greatest last tallied time
 func (db *StoragenodeAccounting) LastTimestamp(ctx context.Context, timestampType string) (_ time.Time, err error) {
 	defer mon.Task()(&ctx)(&err)

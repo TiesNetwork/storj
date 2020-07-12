@@ -29,6 +29,8 @@ const (
 	UsageLimitQuery = "usageLimit"
 	// StorageNodesByWalletQuery is a query name for nodes by wallet address
 	StorageNodesByWalletQuery = "nodesByWallet"
+	// StorageNodeUsageQuery is a query name for node usage
+	StorageNodeUsageQuery = "nodeUsage"
 )
 
 // rootQuery creates query for graphql populated by AccountsClient
@@ -75,6 +77,11 @@ func rootQuery(service *service.Service, types *TypeCreator) *graphql.Object {
 				Type:    graphql.NewNonNull(graphql.NewList(graphql.NewNonNull(types.storageNode))),
 				Args:    graphqlStorageNodeQueryArgs(),
 				Resolve: graphqlStorageNodeQueryResolve(service),
+			},
+			StorageNodeUsageQuery: &graphql.Field{
+				Type:    graphql.NewNonNull(types.storageNodeUsage),
+				Args:    graphqlStorageNodeUsageQueryArgs(),
+				Resolve: graphqlStorageNodeUsageQueryResolve(service),
 			},
 		},
 	})

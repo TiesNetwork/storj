@@ -15,13 +15,14 @@ type TypeCreator struct {
 	query    *graphql.Object
 	mutation *graphql.Object
 
-	totalUsage   *graphql.Object
-	user         *graphql.Object
-	project      *graphql.Object
-	apiKey       *graphql.Object
-	apiKeyCreate *graphql.Object
-	usageLimit   *graphql.Object
-	storageNode  *graphql.Object
+	totalUsage       *graphql.Object
+	user             *graphql.Object
+	project          *graphql.Object
+	apiKey           *graphql.Object
+	apiKeyCreate     *graphql.Object
+	usageLimit       *graphql.Object
+	storageNode      *graphql.Object
+	storageNodeUsage *graphql.Object
 
 	cursor *graphql.InputObject
 }
@@ -44,8 +45,8 @@ func (c *TypeCreator) Create(log *zap.Logger, s *service.Service) error {
 	if err := c.totalUsage.Error(); err != nil {
 		return err
 	}
-	c.storageNode = graphqlStorageNode()
-	if err := c.storageNode.Error(); err != nil {
+	c.storageNodeUsage = graphqlStorageNodeUsage()
+	if err := c.storageNodeUsage.Error(); err != nil {
 		return err
 	}
 
@@ -62,6 +63,10 @@ func (c *TypeCreator) Create(log *zap.Logger, s *service.Service) error {
 	}
 	c.user = graphqlUser(s, c)
 	if err := c.user.Error(); err != nil {
+		return err
+	}
+	c.storageNode = graphqlStorageNode(s, c)
+	if err := c.storageNode.Error(); err != nil {
 		return err
 	}
 

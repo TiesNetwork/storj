@@ -10,6 +10,6 @@ import (
 type ServiceConfig service.Config
 
 // NewService returns new instance of Service.
-func NewService(consoleDB console.DB, projectDB accounting.ProjectAccounting, adminDB DB, projectUsage *accounting.Service, config *ServiceConfig) *service.Service {
-	return service.NewService(consoleDB, projectDB, adminDB.Nodes(), projectUsage, (*service.Config)(config))
+func NewService(consoleDB console.DB, projectDB accounting.ProjectAccounting, storagenodeDB accounting.StoragenodeAccounting, adminDB DB, projectUsage *accounting.Service, config *ServiceConfig) *service.Service {
+	return service.NewService(consoleDB, projectDB, storagenodeDB, adminDB.Nodes(), projectUsage, (*service.Config)(config))
 }

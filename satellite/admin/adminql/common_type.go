@@ -31,10 +31,14 @@ const (
 
 	// FieldCreatedAt is a field name for created at timestamp
 	FieldCreatedAt = "createdAt"
+	// FieldStartTime is a field name for for startTime
+	FieldStartTime = "startTime"
+	// FieldEndTime is a field name for for endTime
+	FieldEndTime = "endTime"
 	// FieldName is a field name for name
 	FieldName = "name"
-	// FieldPartnerID is a field name for partnerID
-	FieldPartnerID = "partnerId"
+	// FieldPartnerID is a field name for partner ID
+	FieldPartnerID = "partnerID"
 	// FieldSince is a field name for since
 	FieldSince = "since"
 	// FieldBefore is a field name for before

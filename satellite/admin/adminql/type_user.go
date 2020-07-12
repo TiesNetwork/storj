@@ -12,8 +12,8 @@ const (
 	// UserType is a graphql type for user
 	UserType = "User"
 
-	// FieldUserID is a field name for userId
-	FieldUserID = "userId"
+	// FieldUserID is a field name for user ID
+	FieldUserID = "userID"
 	// FieldEmail is a field name for email
 	FieldEmail = "email"
 	// FieldPassword is a field name for password

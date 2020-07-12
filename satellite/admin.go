@@ -107,7 +107,7 @@ func NewAdmin(log *zap.Logger, full *identity.FullIdentity, db DB,
 			accountingCache,
 			config.Rollup.MaxAlphaUsage,
 		)
-		service := admin.NewService(db.Console(), db.ProjectAccounting(), db.Admin(), liveAccounting, &admin.ServiceConfig{
+		service := admin.NewService(db.Console(), db.ProjectAccounting(), db.StoragenodeAccounting(), db.Admin(), liveAccounting, &admin.ServiceConfig{
 			SatelliteNodeID:  &peer.Identity.ID,
 			SatelliteAddress: config.Server.Address,
 		})

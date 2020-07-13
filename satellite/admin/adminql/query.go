@@ -13,8 +13,10 @@ const (
 	// Query is immutable graphql request
 	Query = "Query"
 
-	// TotalUsageQuery is a query name for total usage
-	TotalUsageQuery = "totalUsage"
+	// UserTotalUsageQuery is a query name for total usage for user
+	UserTotalUsageQuery = "userTotalUsage"
+	// ProjectTotalUsageQuery is a query name for total usage for Project
+	ProjectTotalUsageQuery = "projectTotalUsage"
 	// UserQuery is a query name for user
 	UserQuery = "user"
 	// UserByEmailQuery is a query name for user by email
@@ -38,10 +40,15 @@ func rootQuery(service *service.Service, types *TypeCreator) *graphql.Object {
 	return graphql.NewObject(graphql.ObjectConfig{
 		Name: Query,
 		Fields: graphql.Fields{
-			TotalUsageQuery: &graphql.Field{
-				Type:    types.totalUsage,
-				Args:    graphqlTotalUsageQueryArgs(),
-				Resolve: graphqlTotalUsageQueryResolve(service),
+			UserTotalUsageQuery: &graphql.Field{
+				Type:    types.userTotalUsage,
+				Args:    graphqlUserTotalUsageQueryArgs(),
+				Resolve: graphqlUserTotalUsageQueryResolve(service),
+			},
+			ProjectTotalUsageQuery: &graphql.Field{
+				Type:    types.projectTotalUsage,
+				Args:    graphqlProjectTotalUsageQueryArgs(),
+				Resolve: graphqlProjectTotalUsageQueryResolve(service),
 			},
 			UserQuery: &graphql.Field{
 				Type:    types.user,

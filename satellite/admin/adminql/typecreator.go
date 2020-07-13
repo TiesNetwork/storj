@@ -15,14 +15,16 @@ type TypeCreator struct {
 	query    *graphql.Object
 	mutation *graphql.Object
 
-	totalUsage       *graphql.Object
-	user             *graphql.Object
-	project          *graphql.Object
-	apiKey           *graphql.Object
-	apiKeyCreate     *graphql.Object
-	usageLimit       *graphql.Object
-	storageNode      *graphql.Object
-	storageNodeUsage *graphql.Object
+	userTotalUsage    *graphql.Object
+	projectTotalUsage *graphql.Object
+	totalUsage        *graphql.Object
+	user              *graphql.Object
+	project           *graphql.Object
+	apiKey            *graphql.Object
+	apiKeyCreate      *graphql.Object
+	usageLimit        *graphql.Object
+	storageNode       *graphql.Object
+	storageNodeUsage  *graphql.Object
 
 	cursor *graphql.InputObject
 }
@@ -42,7 +44,7 @@ func (c *TypeCreator) Create(log *zap.Logger, s *service.Service) error {
 	}
 
 	c.apiKey = graphqlAPIKey()
-	if err := c.totalUsage.Error(); err != nil {
+	if err := c.apiKey.Error(); err != nil {
 		return err
 	}
 	c.storageNodeUsage = graphqlStorageNodeUsage()
@@ -53,6 +55,14 @@ func (c *TypeCreator) Create(log *zap.Logger, s *service.Service) error {
 	// hierarchical entities
 	c.apiKeyCreate = graphqlAPIKeyCreate(c)
 	if err := c.apiKeyCreate.Error(); err != nil {
+		return err
+	}
+	c.userTotalUsage = graphqlUserTotalUsage(c)
+	if err := c.userTotalUsage.Error(); err != nil {
+		return err
+	}
+	c.projectTotalUsage = graphqlProjectTotalUsage(c)
+	if err := c.projectTotalUsage.Error(); err != nil {
 		return err
 	}
 

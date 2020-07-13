@@ -11,9 +11,20 @@ import (
 	"storj.io/storj/satellite/accounting"
 )
 
-// TotalUsage is an object that describes data usage aggregation for multiple projects
-type TotalUsage struct {
-	UserID  uuid.UUID `json:"userId"`
+// UserTotalUsage is an object that describes data usage aggregation for all projects of user
+type UserTotalUsage struct {
+	UserID uuid.UUID `json:"userId"`
+	Usage  Usage
+}
+
+// ProjectTotalUsage is an object that describes data usage aggregation for all projects of user
+type ProjectTotalUsage struct {
+	ProjectID uuid.UUID `json:"projectId"`
+	Usage     Usage
+}
+
+// Usage is an object that describes data usage aggregation
+type Usage struct {
 	Since   time.Time `json:"since"`
 	Before  time.Time `json:"before"`
 	Egress  int64     `json:"egress"`
@@ -77,27 +88,52 @@ func (s *Service) getUsageLimit(ctx context.Context, projectID uuid.UUID) (*Usag
 }
 
 // GetTotalUsageForUser aggregates data usage for all user projects
-func (s *Service) GetTotalUsageForUser(ctx context.Context, userID uuid.UUID, since time.Time, before time.Time) (*TotalUsage, error) {
+func (s *Service) GetTotalUsageForUser(ctx context.Context, userID uuid.UUID, since time.Time, before time.Time) (*UserTotalUsage, error) {
 	projects, err := s.consoleDB.Projects().GetByUserID(ctx, userID)
 	if nil != err {
 		return nil, err
 	}
-	total := TotalUsage{
+	total := UserTotalUsage{
 		UserID: userID,
-		Since:  since,
-		Before: before,
+		Usage: Usage{
+			Since:  since,
+			Before: before,
+		},
 	}
 	for _, project := range projects {
 		usage, err := s.projectDB.GetProjectTotal(ctx, project.ID, since, before)
 		if nil != err {
 			return nil, err
 		}
-		mergeUsage(&total, usage)
+		mergeUsage(&total.Usage, usage)
 	}
 	return &total, nil
 }
 
-func mergeUsage(t *TotalUsage, p *accounting.ProjectUsage) {
+// GetTotalUsageForProject aggregates data usage for project
+func (s *Service) GetTotalUsageForProject(ctx context.Context, projectID uuid.UUID, since time.Time, before time.Time) (*ProjectTotalUsage, error) {
+	total := ProjectTotalUsage{
+		ProjectID: projectID,
+		Usage: Usage{
+			Since:  since,
+			Before: before,
+		},
+	}
+	usage, err := s.projectDB.GetProjectTotal(ctx, projectID, since, before)
+	if nil != err {
+		return nil, err
+	}
+	mergeUsage(&total.Usage, usage)
+	return &total, nil
+}
+
+func mergeUsage(t *Usage, p *accounting.ProjectUsage) {
+	if t.Since.After(p.Since) {
+		t.Since = p.Since
+	}
+	if p.Before.After(t.Before) {
+		t.Before = p.Before
+	}
 	t.Egress += p.Egress
 	t.Object += p.ObjectCount
 	t.Storage += p.Storage

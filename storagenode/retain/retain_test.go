@@ -31,7 +31,7 @@ import (
 
 func TestRetainPieces(t *testing.T) {
 	storagenodedbtest.Run(t, func(ctx *testcontext.Context, t *testing.T, db storagenode.DB) {
-		store := pieces.NewStore(zaptest.NewLogger(t), db.Pieces(), db.V0PieceInfo(), db.PieceExpirationDB(), db.PieceSpaceUsedDB())
+		store := pieces.NewStore(zaptest.NewLogger(t), db.Pieces(), db.V0PieceInfo(), db.PieceExpirationDB(), db.PieceSpaceUsedDB(), pieces.DefaultConfig)
 		testStore := pieces.StoreForTest{Store: store}
 
 		const numPieces = 100
@@ -202,7 +202,7 @@ func getAllPieceIDs(ctx context.Context, store *pieces.Store, satellite storj.No
 	return pieceIDs, err
 }
 
-// generateTestIDs generates n piece ids
+// generateTestIDs generates n piece ids.
 func generateTestIDs(n int) []storj.PieceID {
 	ids := make([]storj.PieceID, n)
 	for i := range ids {

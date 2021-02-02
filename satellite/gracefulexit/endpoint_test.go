@@ -7,11 +7,9 @@ import (
 	"context"
 	"io"
 	"strconv"
-	"sync"
 	"testing"
 	"time"
 
-	"github.com/gogo/protobuf/proto"
 	"github.com/stretchr/testify/require"
 	"github.com/zeebo/errs"
 	"go.uber.org/zap"
@@ -25,16 +23,16 @@ import (
 	"storj.io/common/rpc/rpcstatus"
 	"storj.io/common/signing"
 	"storj.io/common/storj"
+	"storj.io/common/sync2"
 	"storj.io/common/testcontext"
 	"storj.io/common/testrand"
 	"storj.io/storj/private/testblobs"
 	"storj.io/storj/private/testplanet"
 	"storj.io/storj/satellite"
+	"storj.io/storj/satellite/metainfo/metabase"
 	"storj.io/storj/satellite/overlay"
-	"storj.io/storj/storage"
 	"storj.io/storj/storagenode"
 	"storj.io/storj/storagenode/gracefulexit"
-	"storj.io/storj/storagenode/pieces"
 )
 
 const numObjects = 6
@@ -46,7 +44,7 @@ type exitProcessClient interface {
 }
 
 func TestSuccess(t *testing.T) {
-	testTransfers(t, numObjects, func(t *testing.T, ctx *testcontext.Context, nodeFullIDs map[storj.NodeID]*identity.FullIdentity, satellite *testplanet.SatelliteSystem, processClient exitProcessClient, exitingNode *storagenode.Peer, numPieces int) {
+	testTransfers(t, numObjects, func(t *testing.T, ctx *testcontext.Context, nodeFullIDs map[storj.NodeID]*identity.FullIdentity, satellite *testplanet.Satellite, processClient exitProcessClient, exitingNode *storagenode.Peer, numPieces int) {
 		var pieceID storj.PieceID
 		failedCount := 0
 		deletedCount := 0
@@ -173,24 +171,30 @@ func TestConcurrentConnections(t *testing.T) {
 
 		var group errgroup.Group
 		concurrentCalls := 4
-		var wg sync.WaitGroup
-		wg.Add(1)
+
+		var mainStarted sync2.Fence
+		defer mainStarted.Release()
+
 		for i := 0; i < concurrentCalls; i++ {
 			group.Go(func() (err error) {
 				// connect to satellite so we initiate the exit.
-				conn, err := exitingNode.Dialer.DialAddressID(ctx, satellite.Addr(), satellite.Identity.ID)
+				conn, err := exitingNode.Dialer.DialNodeURL(ctx, satellite.NodeURL())
 				require.NoError(t, err)
 				defer func() {
 					err = errs.Combine(err, conn.Close())
 				}()
 
-				client := pb.NewDRPCSatelliteGracefulExitClient(conn.Raw())
+				client := pb.NewDRPCSatelliteGracefulExitClient(conn)
 
-				// wait for "main" call to begin
-				wg.Wait()
+				if !mainStarted.Wait(ctx) {
+					return ctx.Err()
+				}
 
 				c, err := client.Process(ctx)
 				require.NoError(t, err)
+				defer func() {
+					err = errs.Combine(err, c.Close())
+				}()
 
 				_, err = c.Recv()
 				require.Error(t, err)
@@ -200,34 +204,40 @@ func TestConcurrentConnections(t *testing.T) {
 		}
 
 		// connect to satellite so we initiate the exit ("main" call)
-		conn, err := exitingNode.Dialer.DialAddressID(ctx, satellite.Addr(), satellite.Identity.ID)
+		conn, err := exitingNode.Dialer.DialNodeURL(ctx, satellite.NodeURL())
 		require.NoError(t, err)
 		defer ctx.Check(conn.Close)
 
-		client := pb.NewDRPCSatelliteGracefulExitClient(conn.Raw())
-		// this connection will immediately return since graceful exit has not been initiated yet
-		c, err := client.Process(ctx)
-		require.NoError(t, err)
-		response, err := c.Recv()
-		require.NoError(t, err)
-		switch response.GetMessage().(type) {
-		case *pb.SatelliteMessage_NotReady:
-		default:
-			t.FailNow()
+		client := pb.NewDRPCSatelliteGracefulExitClient(conn)
+
+		{ // this connection will immediately return since graceful exit has not been initiated yet
+			c, err := client.Process(ctx)
+			require.NoError(t, err)
+			response, err := c.Recv()
+			require.NoError(t, err)
+			switch response.GetMessage().(type) {
+			case *pb.SatelliteMessage_NotReady:
+			default:
+				t.FailNow()
+			}
+			require.NoError(t, c.Close())
 		}
 
 		// wait for initial loop to start so we have pieces to transfer
 		satellite.GracefulExit.Chore.Loop.TriggerWait()
 
-		// this connection should not close immediately, since there are pieces to transfer
-		c, err = client.Process(ctx)
-		require.NoError(t, err)
+		{ // this connection should not close immediately, since there are pieces to transfer
+			c, err := client.Process(ctx)
+			require.NoError(t, err)
 
-		_, err = c.Recv()
-		require.NoError(t, err)
+			_, err = c.Recv()
+			require.NoError(t, err)
 
+			// deferring here to ensure that the other connections see the in-use connection.
+			defer ctx.Check(c.Close)
+		}
 		// start receiving from concurrent connections
-		wg.Done()
+		mainStarted.Release()
 
 		err = group.Wait()
 		require.NoError(t, err)
@@ -241,18 +251,25 @@ func TestRecvTimeout(t *testing.T) {
 		StorageNodeCount: successThreshold + 1,
 		UplinkCount:      1,
 		Reconfigure: testplanet.Reconfigure{
-			NewStorageNodeDB: func(index int, db storagenode.DB, log *zap.Logger) (storagenode.DB, error) {
+			StorageNodeDB: func(index int, db storagenode.DB, log *zap.Logger) (storagenode.DB, error) {
 				return testblobs.NewSlowDB(log.Named("slowdb"), db), nil
 			},
-			Satellite: func(logger *zap.Logger, index int, config *satellite.Config) {
-				// This config value will create a very short timeframe allowed for receiving
-				// data from storage nodes. This will cause context to cancel with timeout.
-				config.GracefulExit.RecvTimeout = 10 * time.Millisecond
-
-				config.Metainfo.RS.MinThreshold = 2
-				config.Metainfo.RS.RepairThreshold = 3
-				config.Metainfo.RS.SuccessThreshold = successThreshold
-				config.Metainfo.RS.TotalThreshold = successThreshold
+			Satellite: testplanet.Combine(
+				func(log *zap.Logger, index int, config *satellite.Config) {
+					// This config value will create a very short timeframe allowed for receiving
+					// data from storage nodes. This will cause context to cancel with timeout.
+					config.GracefulExit.RecvTimeout = 10 * time.Millisecond
+				},
+				testplanet.ReconfigureRS(2, 3, successThreshold, successThreshold),
+			),
+			StorageNode: func(index int, config *storagenode.Config) {
+				config.GracefulExit = gracefulexit.Config{
+					ChoreInterval:          2 * time.Minute,
+					NumWorkers:             2,
+					NumConcurrentTransfers: 2,
+					MinBytesPerSecond:      128,
+					MinDownloadTimeout:     2 * time.Minute,
+				}
 			},
 		},
 	}, func(t *testing.T, ctx *testcontext.Context, planet *testplanet.Planet) {
@@ -293,17 +310,9 @@ func TestRecvTimeout(t *testing.T) {
 		// make uploads on storage node slower than the timeout for transferring bytes to another node
 		delay := 200 * time.Millisecond
 		storageNodeDB.SetLatency(delay)
-		store := pieces.NewStore(zaptest.NewLogger(t), storageNodeDB.Pieces(), nil, nil, storageNodeDB.PieceSpaceUsedDB())
 
 		// run the SN chore again to start processing transfers.
-		worker := gracefulexit.NewWorker(zaptest.NewLogger(t), store, exitingNode.DB.Satellites(), exitingNode.Dialer, satellite.ID(), satellite.Addr(),
-			gracefulexit.Config{
-				ChoreInterval:          0,
-				NumWorkers:             2,
-				NumConcurrentTransfers: 2,
-				MinBytesPerSecond:      128,
-				MinDownloadTimeout:     2 * time.Minute,
-			})
+		worker := gracefulexit.NewWorker(zaptest.NewLogger(t), exitingNode.GracefulExit.Service, exitingNode.PieceTransfer.Service, exitingNode.Dialer, satellite.NodeURL(), exitingNode.Config.GracefulExit)
 		defer ctx.Check(worker.Close)
 
 		err = worker.Run(ctx, func() {})
@@ -313,7 +322,7 @@ func TestRecvTimeout(t *testing.T) {
 }
 
 func TestInvalidStorageNodeSignature(t *testing.T) {
-	testTransfers(t, 1, func(t *testing.T, ctx *testcontext.Context, nodeFullIDs map[storj.NodeID]*identity.FullIdentity, satellite *testplanet.SatelliteSystem, processClient exitProcessClient, exitingNode *storagenode.Peer, numPieces int) {
+	testTransfers(t, 1, func(t *testing.T, ctx *testcontext.Context, nodeFullIDs map[storj.NodeID]*identity.FullIdentity, satellite *testplanet.Satellite, processClient exitProcessClient, exitingNode *storagenode.Peer, numPieces int) {
 		response, err := processClient.Recv()
 		require.NoError(t, err)
 
@@ -401,11 +410,11 @@ func TestExitDisqualifiedNodeFailOnStart(t *testing.T) {
 		err := satellite.DB.OverlayCache().DisqualifyNode(ctx, exitingNode.ID())
 		require.NoError(t, err)
 
-		conn, err := exitingNode.Dialer.DialAddressID(ctx, satellite.Addr(), satellite.Identity.ID)
+		conn, err := exitingNode.Dialer.DialNodeURL(ctx, satellite.NodeURL())
 		require.NoError(t, err)
 		defer ctx.Check(conn.Close)
 
-		client := pb.NewDRPCSatelliteGracefulExitClient(conn.Raw())
+		client := pb.NewDRPCSatelliteGracefulExitClient(conn)
 		processClient, err := client.Process(ctx)
 		require.NoError(t, err)
 
@@ -413,6 +422,8 @@ func TestExitDisqualifiedNodeFailOnStart(t *testing.T) {
 		response, err := processClient.Recv()
 		require.True(t, errs2.IsRPC(err, rpcstatus.FailedPrecondition))
 		require.Nil(t, response)
+
+		require.NoError(t, processClient.Close())
 
 		// disqualified node should fail graceful exit
 		exitStatus, err := satellite.Overlay.DB.GetExitStatus(ctx, exitingNode.ID())
@@ -424,7 +435,7 @@ func TestExitDisqualifiedNodeFailOnStart(t *testing.T) {
 }
 
 func TestExitDisqualifiedNodeFailEventually(t *testing.T) {
-	testTransfers(t, numObjects, func(t *testing.T, ctx *testcontext.Context, nodeFullIDs map[storj.NodeID]*identity.FullIdentity, satellite *testplanet.SatelliteSystem, processClient exitProcessClient, exitingNode *storagenode.Peer, numPieces int) {
+	testTransfers(t, numObjects, func(t *testing.T, ctx *testcontext.Context, nodeFullIDs map[storj.NodeID]*identity.FullIdentity, satellite *testplanet.Satellite, processClient exitProcessClient, exitingNode *storagenode.Peer, numPieces int) {
 		var disqualifiedError error
 		isDisqualified := false
 		for {
@@ -512,7 +523,7 @@ func TestExitDisqualifiedNodeFailEventually(t *testing.T) {
 }
 
 func TestFailureHashMismatch(t *testing.T) {
-	testTransfers(t, 1, func(t *testing.T, ctx *testcontext.Context, nodeFullIDs map[storj.NodeID]*identity.FullIdentity, satellite *testplanet.SatelliteSystem, processClient exitProcessClient, exitingNode *storagenode.Peer, numPieces int) {
+	testTransfers(t, 1, func(t *testing.T, ctx *testcontext.Context, nodeFullIDs map[storj.NodeID]*identity.FullIdentity, satellite *testplanet.Satellite, processClient exitProcessClient, exitingNode *storagenode.Peer, numPieces int) {
 		response, err := processClient.Recv()
 		require.NoError(t, err)
 
@@ -590,7 +601,7 @@ func TestFailureHashMismatch(t *testing.T) {
 }
 
 func TestFailureUnknownError(t *testing.T) {
-	testTransfers(t, 1, func(t *testing.T, ctx *testcontext.Context, nodeFullIDs map[storj.NodeID]*identity.FullIdentity, satellite *testplanet.SatelliteSystem, processClient exitProcessClient, exitingNode *storagenode.Peer, numPieces int) {
+	testTransfers(t, 1, func(t *testing.T, ctx *testcontext.Context, nodeFullIDs map[storj.NodeID]*identity.FullIdentity, satellite *testplanet.Satellite, processClient exitProcessClient, exitingNode *storagenode.Peer, numPieces int) {
 		response, err := processClient.Recv()
 		require.NoError(t, err)
 
@@ -631,7 +642,7 @@ func TestFailureUnknownError(t *testing.T) {
 }
 
 func TestFailureUplinkSignature(t *testing.T) {
-	testTransfers(t, 1, func(t *testing.T, ctx *testcontext.Context, nodeFullIDs map[storj.NodeID]*identity.FullIdentity, satellite *testplanet.SatelliteSystem, processClient exitProcessClient, exitingNode *storagenode.Peer, numPieces int) {
+	testTransfers(t, 1, func(t *testing.T, ctx *testcontext.Context, nodeFullIDs map[storj.NodeID]*identity.FullIdentity, satellite *testplanet.Satellite, processClient exitProcessClient, exitingNode *storagenode.Peer, numPieces int) {
 		response, err := processClient.Recv()
 		require.NoError(t, err)
 
@@ -711,7 +722,7 @@ func TestFailureUplinkSignature(t *testing.T) {
 }
 
 func TestSuccessPointerUpdate(t *testing.T) {
-	testTransfers(t, 1, func(t *testing.T, ctx *testcontext.Context, nodeFullIDs map[storj.NodeID]*identity.FullIdentity, satellite *testplanet.SatelliteSystem, processClient exitProcessClient, exitingNode *storagenode.Peer, numPieces int) {
+	testTransfers(t, 1, func(t *testing.T, ctx *testcontext.Context, nodeFullIDs map[storj.NodeID]*identity.FullIdentity, satellite *testplanet.Satellite, processClient exitProcessClient, exitingNode *storagenode.Peer, numPieces int) {
 		var recNodeID storj.NodeID
 
 		response, err := processClient.Recv()
@@ -791,7 +802,7 @@ func TestSuccessPointerUpdate(t *testing.T) {
 		keys, err := satellite.Metainfo.Database.List(ctx, nil, 1)
 		require.NoError(t, err)
 
-		pointer, err := satellite.Metainfo.Service.Get(ctx, string(keys[0]))
+		pointer, err := satellite.Metainfo.Service.Get(ctx, metabase.SegmentKey(keys[0]))
 		require.NoError(t, err)
 
 		found := 0
@@ -808,7 +819,7 @@ func TestSuccessPointerUpdate(t *testing.T) {
 }
 
 func TestUpdatePointerFailure_DuplicatedNodeID(t *testing.T) {
-	testTransfers(t, 1, func(t *testing.T, ctx *testcontext.Context, nodeFullIDs map[storj.NodeID]*identity.FullIdentity, satellite *testplanet.SatelliteSystem, processClient exitProcessClient, exitingNode *storagenode.Peer, numPieces int) {
+	testTransfers(t, 1, func(t *testing.T, ctx *testcontext.Context, nodeFullIDs map[storj.NodeID]*identity.FullIdentity, satellite *testplanet.Satellite, processClient exitProcessClient, exitingNode *storagenode.Peer, numPieces int) {
 		response, err := processClient.Recv()
 		require.NoError(t, err)
 
@@ -862,8 +873,8 @@ func TestUpdatePointerFailure_DuplicatedNodeID(t *testing.T) {
 			// update pointer to include the new receiving node before responding to satellite
 			keys, err := satellite.Metainfo.Database.List(ctx, nil, 1)
 			require.NoError(t, err)
-			path := string(keys[0])
-			pointer, err := satellite.Metainfo.Service.Get(ctx, path)
+
+			pointer, err := satellite.Metainfo.Service.Get(ctx, metabase.SegmentKey(keys[0]))
 			require.NoError(t, err)
 			require.NotNil(t, pointer.GetRemote())
 			require.True(t, len(pointer.GetRemote().GetRemotePieces()) > 0)
@@ -884,7 +895,7 @@ func TestUpdatePointerFailure_DuplicatedNodeID(t *testing.T) {
 				NodeId:   firstRecNodeID,
 			}
 
-			_, err = satellite.Metainfo.Service.UpdatePieces(ctx, path, pointer, pieceToAdd, pieceToRemove)
+			_, err = satellite.Metainfo.Service.UpdatePieces(ctx, metabase.SegmentKey(keys[0]), pointer, pieceToAdd, pieceToRemove)
 			require.NoError(t, err)
 
 			err = processClient.Send(success)
@@ -908,8 +919,8 @@ func TestUpdatePointerFailure_DuplicatedNodeID(t *testing.T) {
 		// check exiting node is still in the pointer
 		keys, err := satellite.Metainfo.Database.List(ctx, nil, 1)
 		require.NoError(t, err)
-		path := string(keys[0])
-		pointer, err := satellite.Metainfo.Service.Get(ctx, path)
+
+		pointer, err := satellite.Metainfo.Service.Get(ctx, metabase.SegmentKey(keys[0]))
 		require.NoError(t, err)
 		require.NotNil(t, pointer.GetRemote())
 		require.True(t, len(pointer.GetRemote().GetRemotePieces()) > 0)
@@ -948,20 +959,19 @@ func TestExitDisabled(t *testing.T) {
 		require.Nil(t, satellite.GracefulExit.Chore)
 		require.Nil(t, satellite.GracefulExit.Endpoint)
 
-		conn, err := exitingNode.Dialer.DialAddressID(ctx, satellite.Addr(), satellite.Identity.ID)
+		conn, err := exitingNode.Dialer.DialNodeURL(ctx, satellite.NodeURL())
 		require.NoError(t, err)
 		defer ctx.Check(conn.Close)
 
-		client := pb.NewDRPCSatelliteGracefulExitClient(conn.Raw())
+		client := pb.NewDRPCSatelliteGracefulExitClient(conn)
 		processClient, err := client.Process(ctx)
 		require.NoError(t, err)
 
 		// Process endpoint should return immediately if GE is disabled
 		response, err := processClient.Recv()
 		require.Error(t, err)
-		// grpc will return "Unimplemented", drpc will return "Unknown"
-		unimplementedOrUnknown := errs2.IsRPC(err, rpcstatus.Unimplemented) || errs2.IsRPC(err, rpcstatus.Unknown)
-		require.True(t, unimplementedOrUnknown)
+		// drpc will return "Unknown"
+		require.True(t, errs2.IsRPC(err, rpcstatus.Unknown))
 		require.Nil(t, response)
 	})
 }
@@ -1025,11 +1035,11 @@ func TestPointerChangedOrDeleted(t *testing.T) {
 		require.NoError(t, err)
 
 		// reconnect to the satellite.
-		conn, err := exitingNode.Dialer.DialAddressID(ctx, satellite.Addr(), satellite.Identity.ID)
+		conn, err := exitingNode.Dialer.DialNodeURL(ctx, satellite.NodeURL())
 		require.NoError(t, err)
 		defer ctx.Check(conn.Close)
 
-		client := pb.NewDRPCSatelliteGracefulExitClient(conn.Raw())
+		client := pb.NewDRPCSatelliteGracefulExitClient(conn)
 
 		c, err := client.Process(ctx)
 		require.NoError(t, err)
@@ -1059,8 +1069,8 @@ func TestPointerChangedOrDeleted(t *testing.T) {
 	})
 }
 
-func TestFailureNotFoundPieceHashVerified(t *testing.T) {
-	testTransfers(t, 1, func(t *testing.T, ctx *testcontext.Context, nodeFullIDs map[storj.NodeID]*identity.FullIdentity, satellite *testplanet.SatelliteSystem, processClient exitProcessClient, exitingNode *storagenode.Peer, numPieces int) {
+func TestFailureNotFound(t *testing.T) {
+	testTransfers(t, 1, func(t *testing.T, ctx *testcontext.Context, nodeFullIDs map[storj.NodeID]*identity.FullIdentity, satellite *testplanet.Satellite, processClient exitProcessClient, exitingNode *storagenode.Peer, numPieces int) {
 		response, err := processClient.Recv()
 		require.NoError(t, err)
 
@@ -1104,7 +1114,7 @@ func TestFailureNotFoundPieceHashVerified(t *testing.T) {
 
 		var pointer *pb.Pointer
 		for _, key := range keys {
-			p, err := satellite.Metainfo.Service.Get(ctx, string(key))
+			p, err := satellite.Metainfo.Service.Get(ctx, metabase.SegmentKey(key))
 			require.NoError(t, err)
 
 			if p.GetRemote() != nil {
@@ -1127,99 +1137,6 @@ func TestFailureNotFoundPieceHashVerified(t *testing.T) {
 
 }
 
-func TestFailureNotFoundPieceHashUnverified(t *testing.T) {
-	testTransfers(t, 1, func(t *testing.T, ctx *testcontext.Context, nodeFullIDs map[storj.NodeID]*identity.FullIdentity, satellite *testplanet.SatelliteSystem, processClient exitProcessClient, exitingNode *storagenode.Peer, numPieces int) {
-		// retrieve remote segment
-		keys, err := satellite.Metainfo.Database.List(ctx, nil, -1)
-		require.NoError(t, err)
-
-		var oldPointer *pb.Pointer
-		var path []byte
-		for _, key := range keys {
-			p, err := satellite.Metainfo.Service.Get(ctx, string(key))
-			require.NoError(t, err)
-
-			if p.GetRemote() != nil {
-				oldPointer = p
-				path = key
-				break
-			}
-		}
-
-		// replace pointer with non-piece-hash-verified pointer
-		require.NotNil(t, oldPointer)
-		oldPointerBytes, err := proto.Marshal(oldPointer)
-		require.NoError(t, err)
-		newPointer := &pb.Pointer{}
-		err = proto.Unmarshal(oldPointerBytes, newPointer)
-		require.NoError(t, err)
-		newPointer.PieceHashesVerified = false
-		newPointerBytes, err := proto.Marshal(newPointer)
-		require.NoError(t, err)
-		err = satellite.Metainfo.Database.CompareAndSwap(ctx, storage.Key(path), oldPointerBytes, newPointerBytes)
-		require.NoError(t, err)
-
-		// begin processing graceful exit messages
-		response, err := processClient.Recv()
-		require.NoError(t, err)
-
-		switch m := response.GetMessage().(type) {
-		case *pb.SatelliteMessage_TransferPiece:
-			require.NotNil(t, m)
-
-			message := &pb.StorageNodeMessage{
-				Message: &pb.StorageNodeMessage_Failed{
-					Failed: &pb.TransferFailed{
-						OriginalPieceId: m.TransferPiece.OriginalPieceId,
-						Error:           pb.TransferFailed_NOT_FOUND,
-					},
-				},
-			}
-			err = processClient.Send(message)
-			require.NoError(t, err)
-		default:
-			require.FailNow(t, "should not reach this case: %#v", m)
-		}
-
-		response, err = processClient.Recv()
-		require.NoError(t, err)
-
-		switch m := response.GetMessage().(type) {
-		case *pb.SatelliteMessage_ExitCompleted:
-			require.NotNil(t, m)
-		default:
-			require.FailNow(t, "should not reach this case: %#v", m)
-		}
-
-		// check that node is no longer in the pointer
-		keys, err = satellite.Metainfo.Database.List(ctx, nil, -1)
-		require.NoError(t, err)
-
-		var pointer *pb.Pointer
-		for _, key := range keys {
-			p, err := satellite.Metainfo.Service.Get(ctx, string(key))
-			require.NoError(t, err)
-
-			if p.GetRemote() != nil {
-				pointer = p
-				break
-			}
-		}
-		require.NotNil(t, pointer)
-		for _, piece := range pointer.GetRemote().GetRemotePieces() {
-			require.NotEqual(t, piece.NodeId, exitingNode.ID())
-		}
-
-		// check that the exit has completed and we have the correct transferred/failed values
-		progress, err := satellite.DB.GracefulExit().GetProgress(ctx, exitingNode.ID())
-		require.NoError(t, err)
-
-		require.Equal(t, int64(0), progress.PiecesTransferred)
-		require.Equal(t, int64(0), progress.PiecesFailed)
-	})
-
-}
-
 func TestFailureStorageNodeIgnoresTransferMessages(t *testing.T) {
 	var maxOrderLimitSendCount = 3
 	testplanet.Run(t, testplanet.Config{
@@ -1227,17 +1144,15 @@ func TestFailureStorageNodeIgnoresTransferMessages(t *testing.T) {
 		StorageNodeCount: 5,
 		UplinkCount:      1,
 		Reconfigure: testplanet.Reconfigure{
-			Satellite: func(logger *zap.Logger, index int, config *satellite.Config) {
-				// We don't care whether a node gracefully exits or not in this test,
-				// so we set the max failures percentage extra high.
-				config.GracefulExit.OverallMaxFailuresPercentage = 101
-				config.GracefulExit.MaxOrderLimitSendCount = maxOrderLimitSendCount
-
-				config.Metainfo.RS.MinThreshold = 2
-				config.Metainfo.RS.RepairThreshold = 3
-				config.Metainfo.RS.SuccessThreshold = 4
-				config.Metainfo.RS.TotalThreshold = 4
-			},
+			Satellite: testplanet.Combine(
+				func(log *zap.Logger, index int, config *satellite.Config) {
+					// We don't care whether a node gracefully exits or not in this test,
+					// so we set the max failures percentage extra high.
+					config.GracefulExit.OverallMaxFailuresPercentage = 101
+					config.GracefulExit.MaxOrderLimitSendCount = maxOrderLimitSendCount
+				},
+				testplanet.ReconfigureRS(2, 3, 4, 4),
+			),
 		},
 	}, func(t *testing.T, ctx *testcontext.Context, planet *testplanet.Planet) {
 		uplinkPeer := planet.Uplinks[0]
@@ -1262,11 +1177,11 @@ func TestFailureStorageNodeIgnoresTransferMessages(t *testing.T) {
 		require.NoError(t, err)
 
 		// connect to satellite so we initiate the exit.
-		conn, err := exitingNode.Dialer.DialAddressID(ctx, satellite.Addr(), satellite.Identity.ID)
+		conn, err := exitingNode.Dialer.DialNodeURL(ctx, satellite.NodeURL())
 		require.NoError(t, err)
 		defer ctx.Check(conn.Close)
 
-		client := pb.NewDRPCSatelliteGracefulExitClient(conn.Raw())
+		client := pb.NewDRPCSatelliteGracefulExitClient(conn)
 
 		c, err := client.Process(ctx)
 		require.NoError(t, err)
@@ -1357,15 +1272,13 @@ func TestIneligibleNodeAge(t *testing.T) {
 		StorageNodeCount: 5,
 		UplinkCount:      1,
 		Reconfigure: testplanet.Reconfigure{
-			Satellite: func(logger *zap.Logger, index int, config *satellite.Config) {
-				// Set the required node age to 1 month.
-				config.GracefulExit.NodeMinAgeInMonths = 1
-
-				config.Metainfo.RS.MinThreshold = 2
-				config.Metainfo.RS.RepairThreshold = 3
-				config.Metainfo.RS.SuccessThreshold = 4
-				config.Metainfo.RS.TotalThreshold = 4
-			},
+			Satellite: testplanet.Combine(
+				func(log *zap.Logger, index int, config *satellite.Config) {
+					// Set the required node age to 1 month.
+					config.GracefulExit.NodeMinAgeInMonths = 1
+				},
+				testplanet.ReconfigureRS(2, 3, 4, 4),
+			),
 		},
 	}, func(t *testing.T, ctx *testcontext.Context, planet *testplanet.Planet) {
 		uplinkPeer := planet.Uplinks[0]
@@ -1390,11 +1303,11 @@ func TestIneligibleNodeAge(t *testing.T) {
 		require.NoError(t, err)
 
 		// connect to satellite so we initiate the exit.
-		conn, err := exitingNode.Dialer.DialAddressID(ctx, satellite.Addr(), satellite.Identity.ID)
+		conn, err := exitingNode.Dialer.DialNodeURL(ctx, satellite.NodeURL())
 		require.NoError(t, err)
 		defer ctx.Check(conn.Close)
 
-		client := pb.NewDRPCSatelliteGracefulExitClient(conn.Raw())
+		client := pb.NewDRPCSatelliteGracefulExitClient(conn)
 
 		c, err := client.Process(ctx)
 		require.NoError(t, err)
@@ -1414,7 +1327,7 @@ func TestIneligibleNodeAge(t *testing.T) {
 	})
 }
 
-func testTransfers(t *testing.T, objects int, verifier func(t *testing.T, ctx *testcontext.Context, nodeFullIDs map[storj.NodeID]*identity.FullIdentity, satellite *testplanet.SatelliteSystem, processClient exitProcessClient, exitingNode *storagenode.Peer, numPieces int)) {
+func testTransfers(t *testing.T, objects int, verifier func(t *testing.T, ctx *testcontext.Context, nodeFullIDs map[storj.NodeID]*identity.FullIdentity, satellite *testplanet.Satellite, processClient exitProcessClient, exitingNode *storagenode.Peer, numPieces int)) {
 	const successThreshold = 4
 	testplanet.Run(t, testplanet.Config{
 		SatelliteCount:   1,
@@ -1448,11 +1361,11 @@ func testTransfers(t *testing.T, objects int, verifier func(t *testing.T, ctx *t
 		require.NoError(t, err)
 
 		// connect to satellite so we initiate the exit.
-		conn, err := exitingNode.Dialer.DialAddressID(ctx, satellite.Addr(), satellite.Identity.ID)
+		conn, err := exitingNode.Dialer.DialNodeURL(ctx, satellite.NodeURL())
 		require.NoError(t, err)
 		defer ctx.Check(conn.Close)
 
-		client := pb.NewDRPCSatelliteGracefulExitClient(conn.Raw())
+		client := pb.NewDRPCSatelliteGracefulExitClient(conn)
 
 		c, err := client.Process(ctx)
 		require.NoError(t, err)
@@ -1487,11 +1400,11 @@ func testTransfers(t *testing.T, objects int, verifier func(t *testing.T, ctx *t
 		require.NoError(t, err)
 		defer ctx.Check(c.CloseSend)
 
-		verifier(t, ctx, nodeFullIDs, satellite, c, exitingNode, len(incompleteTransfers))
+		verifier(t, ctx, nodeFullIDs, satellite, c, exitingNode.Peer, len(incompleteTransfers))
 	})
 }
 
-func findNodeToExit(ctx context.Context, planet *testplanet.Planet, objects int) (*storagenode.Peer, error) {
+func findNodeToExit(ctx context.Context, planet *testplanet.Planet, objects int) (*testplanet.StorageNode, error) {
 	satellite := planet.Satellites[0]
 	keys, err := satellite.Metainfo.Database.List(ctx, nil, objects)
 	if err != nil {
@@ -1499,12 +1412,12 @@ func findNodeToExit(ctx context.Context, planet *testplanet.Planet, objects int)
 	}
 
 	pieceCountMap := make(map[storj.NodeID]int, len(planet.StorageNodes))
-	for _, sn := range planet.StorageNodes {
-		pieceCountMap[sn.ID()] = 0
+	for _, node := range planet.StorageNodes {
+		pieceCountMap[node.ID()] = 0
 	}
 
 	for _, key := range keys {
-		pointer, err := satellite.Metainfo.Service.Get(ctx, string(key))
+		pointer, err := satellite.Metainfo.Service.Get(ctx, metabase.SegmentKey(key))
 		if err != nil {
 			return nil, err
 		}
@@ -1528,11 +1441,5 @@ func findNodeToExit(ctx context.Context, planet *testplanet.Planet, objects int)
 		}
 	}
 
-	for _, sn := range planet.StorageNodes {
-		if sn.ID() == exitingNodeID {
-			return sn, nil
-		}
-	}
-
-	return nil, nil
+	return planet.FindNode(exitingNodeID), nil
 }

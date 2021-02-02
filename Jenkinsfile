@@ -10,7 +10,7 @@ node('node') {
 
       echo "Current build result: ${currentBuild.result}"
     }
-    if (env.BRANCH_NAME == "master") {
+    if (env.BRANCH_NAME == "main") {
         stage('Run Versions Test') {
             lastStage = env.STAGE_NAME
             try {
@@ -21,7 +21,7 @@ node('node') {
 
               echo "STORJ_SIM_POSTGRES: $STORJ_SIM_POSTGRES"
               echo "STORJ_SIM_REDIS: $STORJ_SIM_REDIS"
-              sh 'docker run --rm -d --name postgres-$BUILD_NUMBER postgres:9.6'
+              sh 'docker run --rm -d -e POSTGRES_HOST_AUTH_METHOD=trust --name postgres-$BUILD_NUMBER postgres:12.3'
               sh 'docker run --rm -d --name redis-$BUILD_NUMBER redis:latest'
 
               sh '''until $(docker logs postgres-$BUILD_NUMBER | grep "database system is ready to accept connections" > /dev/null)
@@ -30,9 +30,9 @@ node('node') {
                     done
                 '''
               sh 'docker exec postgres-$BUILD_NUMBER createdb -U postgres teststorj'
-              // fetch the remote master branch
-              sh 'git fetch --no-tags --progress -- https://github.com/storj/storj.git +refs/heads/master:refs/remotes/origin/master'
-              sh 'docker run -u $(id -u):$(id -g) --rm -i -v $PWD:$PWD -w $PWD --entrypoint $PWD/scripts/tests/testversions/test-sim-versions.sh -e STORJ_SIM_POSTGRES -e STORJ_SIM_REDIS --link redis-$BUILD_NUMBER:redis --link postgres-$BUILD_NUMBER:postgres -e CC=gcc storjlabs/golang:1.13.7'
+              // fetch the remote main branch
+              sh 'git fetch --no-tags --progress -- https://github.com/storj/storj.git +refs/heads/main:refs/remotes/origin/main'
+              sh 'docker run -u $(id -u):$(id -g) --rm -i -v $PWD:$PWD -w $PWD --entrypoint $PWD/scripts/tests/testversions/test-sim-versions.sh -e STORJ_SIM_POSTGRES -e STORJ_SIM_REDIS --link redis-$BUILD_NUMBER:redis --link postgres-$BUILD_NUMBER:postgres -e CC=gcc storjlabs/golang:1.16'
             }
             catch(err){
                 throw err
@@ -56,7 +56,7 @@ node('node') {
 
           echo "STORJ_SIM_POSTGRES: $STORJ_SIM_POSTGRES"
           echo "STORJ_SIM_REDIS: $STORJ_SIM_REDIS"
-          sh 'docker run --rm -d --name postgres-$BUILD_NUMBER postgres:9.6'
+          sh 'docker run --rm -d -e POSTGRES_HOST_AUTH_METHOD=trust --name postgres-$BUILD_NUMBER postgres:12.3'
           sh 'docker run --rm -d --name redis-$BUILD_NUMBER redis:latest'
 
           sh '''until $(docker logs postgres-$BUILD_NUMBER | grep "database system is ready to accept connections" > /dev/null)
@@ -65,9 +65,9 @@ node('node') {
                 done
             '''
           sh 'docker exec postgres-$BUILD_NUMBER createdb -U postgres teststorj'
-          // fetch the remote master branch
-          sh 'git fetch --no-tags --progress -- https://github.com/storj/storj.git +refs/heads/master:refs/remotes/origin/master'
-          sh 'docker run -u $(id -u):$(id -g) --rm -i -v $PWD:$PWD -w $PWD --entrypoint $PWD/scripts/tests/rollingupgrade/test-sim-rolling-upgrade.sh -e STORJ_SIM_POSTGRES -e STORJ_SIM_REDIS --link redis-$BUILD_NUMBER:redis --link postgres-$BUILD_NUMBER:postgres -e CC=gcc storjlabs/golang:1.13.7'
+          // fetch the remote main branch
+          sh 'git fetch --no-tags --progress -- https://github.com/storj/storj.git +refs/heads/main:refs/remotes/origin/main'
+          sh 'docker run -u $(id -u):$(id -g) --rm -i -v $PWD:$PWD -w $PWD --entrypoint $PWD/scripts/tests/rollingupgrade/test-sim-rolling-upgrade.sh -e BRANCH_NAME -e STORJ_SIM_POSTGRES -e STORJ_SIM_REDIS --link redis-$BUILD_NUMBER:redis --link postgres-$BUILD_NUMBER:postgres -e CC=gcc storjlabs/golang:1.16'
         }
         catch(err){
             throw err

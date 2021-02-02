@@ -20,10 +20,6 @@ import (
 	"storj.io/storj/storage/filestore"
 )
 
-const (
-	preallocSize = 4 * memory.MiB
-)
-
 var (
 	// Error is the default error class.
 	Error = errs.Class("pieces error")
@@ -44,7 +40,7 @@ type Info struct {
 	UplinkPieceHash *pb.PieceHash
 }
 
-// ExpiredInfo is a fully namespaced piece id
+// ExpiredInfo is a fully namespaced piece id.
 type ExpiredInfo struct {
 	SatelliteID storj.NodeID
 	PieceID     storj.PieceID
@@ -107,7 +103,7 @@ type V0PieceInfoDBForTest interface {
 	Add(context.Context, *Info) error
 }
 
-// PieceSpaceUsedDB stores the most recent totals from the space used cache
+// PieceSpaceUsedDB stores the most recent totals from the space used cache.
 //
 // architecture: Database
 type PieceSpaceUsedDB interface {
@@ -150,17 +146,29 @@ type StoredPieceAccess interface {
 	ModTime(ctx context.Context) (time.Time, error)
 }
 
-// SatelliteUsage contains information of how much space is used by a satellite
+// SatelliteUsage contains information of how much space is used by a satellite.
 type SatelliteUsage struct {
 	Total       int64 // the total space used (including headers)
 	ContentSize int64 // only content size used (excluding things like headers)
+}
+
+// Config is configuration for Store.
+type Config struct {
+	WritePreallocSize memory.Size `help:"file preallocated for uploading" default:"4MiB"`
+}
+
+// DefaultConfig is the default value for the Config.
+var DefaultConfig = Config{
+	WritePreallocSize: 4 * memory.MiB,
 }
 
 // Store implements storing pieces onto a blob storage implementation.
 //
 // architecture: Database
 type Store struct {
-	log            *zap.Logger
+	log    *zap.Logger
+	config Config
+
 	blobs          storage.Blobs
 	v0PieceInfo    V0PieceInfoDB
 	expirationInfo PieceExpirationDB
@@ -168,20 +176,34 @@ type Store struct {
 }
 
 // StoreForTest is a wrapper around Store to be used only in test scenarios. It enables writing
-// pieces with older storage formats
+// pieces with older storage formats.
 type StoreForTest struct {
 	*Store
 }
 
-// NewStore creates a new piece store
-func NewStore(log *zap.Logger, blobs storage.Blobs, v0PieceInfo V0PieceInfoDB, expirationInfo PieceExpirationDB, pieceSpaceUsedDB PieceSpaceUsedDB) *Store {
+// NewStore creates a new piece store.
+func NewStore(log *zap.Logger, blobs storage.Blobs, v0PieceInfo V0PieceInfoDB,
+	expirationInfo PieceExpirationDB, pieceSpaceUsedDB PieceSpaceUsedDB, config Config) *Store {
+
 	return &Store{
 		log:            log,
+		config:         config,
 		blobs:          blobs,
 		v0PieceInfo:    v0PieceInfo,
 		expirationInfo: expirationInfo,
 		spaceUsedDB:    pieceSpaceUsedDB,
 	}
+}
+
+// CreateVerificationFile creates a file to be used for storage directory verification.
+func (store *Store) CreateVerificationFile(id storj.NodeID) error {
+	return store.blobs.CreateVerificationFile(id)
+}
+
+// VerifyStorageDir verifies that the storage directory is correct by checking for the existence and validity
+// of the verification file.
+func (store *Store) VerifyStorageDir(id storj.NodeID) error {
+	return store.blobs.VerifyStorageDir(id)
 }
 
 // Writer returns a new piece writer.
@@ -190,7 +212,7 @@ func (store *Store) Writer(ctx context.Context, satellite storj.NodeID, pieceID 
 	blobWriter, err := store.blobs.Create(ctx, storage.BlobRef{
 		Namespace: satellite.Bytes(),
 		Key:       pieceID.Bytes(),
-	}, preallocSize.Int64())
+	}, store.config.WritePreallocSize.Int64())
 	if err != nil {
 		return nil, Error.Wrap(err)
 	}
@@ -202,7 +224,9 @@ func (store *Store) Writer(ctx context.Context, satellite storj.NodeID, pieceID 
 // WriterForFormatVersion allows opening a piece writer with a specified storage format version.
 // This is meant to be used externally only in test situations (thus the StoreForTest receiver
 // type).
-func (store StoreForTest) WriterForFormatVersion(ctx context.Context, satellite storj.NodeID, pieceID storj.PieceID, formatVersion storage.FormatVersion) (_ *Writer, err error) {
+func (store StoreForTest) WriterForFormatVersion(ctx context.Context, satellite storj.NodeID,
+	pieceID storj.PieceID, formatVersion storage.FormatVersion) (_ *Writer, err error) {
+
 	defer mon.Task()(&ctx)(&err)
 
 	blobRef := storage.BlobRef{
@@ -220,7 +244,7 @@ func (store StoreForTest) WriterForFormatVersion(ctx context.Context, satellite 
 		}
 		blobWriter, err = fStore.TestCreateV0(ctx, blobRef)
 	case filestore.FormatV1:
-		blobWriter, err = store.blobs.Create(ctx, blobRef, preallocSize.Int64())
+		blobWriter, err = store.blobs.Create(ctx, blobRef, store.config.WritePreallocSize.Int64())
 	default:
 		return nil, Error.New("please teach me how to make V%d pieces", formatVersion)
 	}
@@ -251,7 +275,9 @@ func (store *Store) Reader(ctx context.Context, satellite storj.NodeID, pieceID 
 
 // ReaderWithStorageFormat returns a new piece reader for a located piece, which avoids the
 // potential need to check multiple storage formats to find the right blob.
-func (store *Store) ReaderWithStorageFormat(ctx context.Context, satellite storj.NodeID, pieceID storj.PieceID, formatVersion storage.FormatVersion) (_ *Reader, err error) {
+func (store *Store) ReaderWithStorageFormat(ctx context.Context, satellite storj.NodeID,
+	pieceID storj.PieceID, formatVersion storage.FormatVersion) (_ *Reader, err error) {
+
 	defer mon.Task()(&ctx)(&err)
 	ref := storage.BlobRef{Namespace: satellite.Bytes(), Key: pieceID.Bytes()}
 	blob, err := store.blobs.OpenWithStorageFormat(ctx, ref, formatVersion)
@@ -286,6 +312,17 @@ func (store *Store) Delete(ctx context.Context, satellite storj.NodeID, pieceID 
 		err = errs.Combine(err, store.v0PieceInfo.Delete(ctx, satellite, pieceID))
 	}
 
+	store.log.Debug("deleted piece", zap.String("Satellite ID", satellite.String()),
+		zap.String("Piece ID", pieceID.String()))
+
+	return Error.Wrap(err)
+}
+
+// DeleteSatelliteBlobs deletes blobs folder of specific satellite after successful GE.
+func (store *Store) DeleteSatelliteBlobs(ctx context.Context, satellite storj.NodeID) (err error) {
+	defer mon.Task()(&ctx)(&err)
+
+	err = store.blobs.DeleteNamespace(ctx, satellite.Bytes())
 	return Error.Wrap(err)
 }
 
@@ -322,7 +359,7 @@ func (store *Store) Trash(ctx context.Context, satellite storj.NodeID, pieceID s
 	return Error.Wrap(err)
 }
 
-// EmptyTrash deletes pieces in the trash that have been in there longer than trashExpiryInterval
+// EmptyTrash deletes pieces in the trash that have been in there longer than trashExpiryInterval.
 func (store *Store) EmptyTrash(ctx context.Context, satelliteID storj.NodeID, trashedBefore time.Time) (err error) {
 	defer mon.Task()(&ctx)(&err)
 
@@ -342,7 +379,7 @@ func (store *Store) EmptyTrash(ctx context.Context, satelliteID storj.NodeID, tr
 	return Error.Wrap(err)
 }
 
-// RestoreTrash restores all pieces in the trash
+// RestoreTrash restores all pieces in the trash.
 func (store *Store) RestoreTrash(ctx context.Context, satelliteID storj.NodeID) (err error) {
 	defer mon.Task()(&ctx)(&err)
 
@@ -356,10 +393,10 @@ func (store *Store) RestoreTrash(ctx context.Context, satelliteID storj.NodeID) 
 // MigrateV0ToV1 will migrate a piece stored with storage format v0 to storage
 // format v1. If the piece is not stored as a v0 piece it will return an error.
 // The follow failures are possible:
-// - Fail to open or read v0 piece. In this case no artifacts remain.
-// - Fail to Write or Commit v1 piece. In this case no artifacts remain.
-// - Fail to Delete v0 piece. In this case v0 piece may remain, but v1 piece
-//   will exist and be preferred in future calls.
+//   - Fail to open or read v0 piece. In this case no artifacts remain.
+//   - Fail to Write or Commit v1 piece. In this case no artifacts remain.
+//   - Fail to Delete v0 piece. In this case v0 piece may remain,
+//     but v1 piece will exist and be preferred in future calls.
 func (store *Store) MigrateV0ToV1(ctx context.Context, satelliteID storj.NodeID, pieceID storj.PieceID) (err error) {
 	defer mon.Task()(&ctx)(&err)
 
@@ -476,7 +513,7 @@ func (store *Store) WalkSatellitePieces(ctx context.Context, satellite storj.Nod
 	return err
 }
 
-// GetExpired gets piece IDs that are expired and were created before the given time
+// GetExpired gets piece IDs that are expired and were created before the given time.
 func (store *Store) GetExpired(ctx context.Context, expiredAt time.Time, limit int64) (_ []ExpiredInfo, err error) {
 	defer mon.Task()(&ctx)(&err)
 
@@ -494,7 +531,7 @@ func (store *Store) GetExpired(ctx context.Context, expiredAt time.Time, limit i
 	return expired, nil
 }
 
-// SetExpiration records an expiration time for the specified piece ID owned by the specified satellite
+// SetExpiration records an expiration time for the specified piece ID owned by the specified satellite.
 func (store *Store) SetExpiration(ctx context.Context, satellite storj.NodeID, pieceID storj.PieceID, expiresAt time.Time) (err error) {
 	return store.expirationInfo.SetExpiration(ctx, satellite, pieceID, expiresAt)
 }
@@ -546,7 +583,7 @@ func (store *Store) SpaceUsedForTrash(ctx context.Context) (int64, error) {
 }
 
 // SpaceUsedForPiecesAndTrash returns the total space used by both active
-// pieces and the trash directory
+// pieces and the trash directory.
 func (store *Store) SpaceUsedForPiecesAndTrash(ctx context.Context) (int64, error) {
 	piecesTotal, _, err := store.SpaceUsedForPieces(ctx)
 	if err != nil {
@@ -605,7 +642,7 @@ func (store *Store) SpaceUsedBySatellite(ctx context.Context, satelliteID storj.
 	return piecesTotal, piecesContentSize, nil
 }
 
-// SpaceUsedTotalAndBySatellite adds up the space used by and for all satellites for blob storage
+// SpaceUsedTotalAndBySatellite adds up the space used by and for all satellites for blob storage.
 func (store *Store) SpaceUsedTotalAndBySatellite(ctx context.Context) (piecesTotal, piecesContentSize int64, totalBySatellite map[storj.NodeID]SatelliteUsage, err error) {
 	defer mon.Task()(&ctx)(&err)
 
@@ -669,6 +706,11 @@ func (store *Store) StorageStatus(ctx context.Context) (_ StorageStatus, err err
 	}, nil
 }
 
+// CheckWritability tests writability of the storage directory by creating and deleting a file.
+func (store *Store) CheckWritability() error {
+	return store.blobs.CheckWritability()
+}
+
 type storedPieceAccess struct {
 	storage.BlobInfo
 	store   *Store
@@ -687,17 +729,17 @@ func newStoredPieceAccess(store *Store, blobInfo storage.BlobInfo) (storedPieceA
 	}, nil
 }
 
-// PieceID returns the piece ID of the piece
+// PieceID returns the piece ID of the piece.
 func (access storedPieceAccess) PieceID() storj.PieceID {
 	return access.pieceID
 }
 
-// Satellite returns the satellite ID that owns the piece
+// Satellite returns the satellite ID that owns the piece.
 func (access storedPieceAccess) Satellite() (storj.NodeID, error) {
 	return storj.NodeIDFromBytes(access.BlobRef().Namespace)
 }
 
-// Size gives the size of the piece on disk, and the size of the content (not including the piece header, if applicable)
+// Size gives the size of the piece on disk, and the size of the content (not including the piece header, if applicable).
 func (access storedPieceAccess) Size(ctx context.Context) (size, contentSize int64, err error) {
 	defer mon.Task()(&ctx)(&err)
 	stat, err := access.Stat(ctx)

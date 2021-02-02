@@ -9,21 +9,21 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/boltdb/bolt"
 	"github.com/spacemonkeygo/monkit/v3"
 	"github.com/zeebo/errs"
+	"go.etcd.io/bbolt"
 
 	"storj.io/storj/storage"
 )
 
 var mon = monkit.Package()
 
-// Error is the default boltdb errs class
+// Error is the default boltdb errs class.
 var Error = errs.Class("boltdb error")
 
-// Client is the entrypoint into a bolt data store
+// Client is the entrypoint into a bolt data store.
 type Client struct {
-	db     *bolt.DB
+	db     *bbolt.DB
 	Path   string
 	Bucket []byte
 
@@ -32,19 +32,19 @@ type Client struct {
 }
 
 const (
-	// fileMode sets permissions so owner can read and write
+	// fileMode sets permissions so owner can read and write.
 	fileMode       = 0600
 	defaultTimeout = 1 * time.Second
 )
 
-// New instantiates a new BoltDB client given db file path, and a bucket name
+// New instantiates a new BoltDB client given db file path, and a bucket name.
 func New(path, bucket string) (*Client, error) {
-	db, err := bolt.Open(path, fileMode, &bolt.Options{Timeout: defaultTimeout})
+	db, err := bbolt.Open(path, fileMode, &bbolt.Options{Timeout: defaultTimeout})
 	if err != nil {
 		return nil, Error.Wrap(err)
 	}
 
-	err = Error.Wrap(db.Update(func(tx *bolt.Tx) error {
+	err = Error.Wrap(db.Update(func(tx *bbolt.Tx) error {
 		_, err = tx.CreateBucketIfNotExists([]byte(bucket))
 		return err
 	}))
@@ -73,20 +73,20 @@ func (client *Client) SetLookupLimit(v int) { client.lookupLimit = v }
 // LookupLimit returns the maximum limit that is allowed.
 func (client *Client) LookupLimit() int { return client.lookupLimit }
 
-func (client *Client) update(fn func(*bolt.Bucket) error) error {
-	return Error.Wrap(client.db.Update(func(tx *bolt.Tx) error {
+func (client *Client) update(fn func(*bbolt.Bucket) error) error {
+	return Error.Wrap(client.db.Update(func(tx *bbolt.Tx) error {
 		return fn(tx.Bucket(client.Bucket))
 	}))
 }
 
-func (client *Client) batch(fn func(*bolt.Bucket) error) error {
-	return Error.Wrap(client.db.Batch(func(tx *bolt.Tx) error {
+func (client *Client) batch(fn func(*bbolt.Bucket) error) error {
+	return Error.Wrap(client.db.Batch(func(tx *bbolt.Tx) error {
 		return fn(tx.Bucket(client.Bucket))
 	}))
 }
 
-func (client *Client) view(fn func(*bolt.Bucket) error) error {
-	return Error.Wrap(client.db.View(func(tx *bolt.Tx) error {
+func (client *Client) view(fn func(*bbolt.Bucket) error) error {
+	return Error.Wrap(client.db.View(func(tx *bbolt.Tx) error {
 		return fn(tx.Bucket(client.Bucket))
 	}))
 }
@@ -103,7 +103,7 @@ func (client *Client) Put(ctx context.Context, key storage.Key, value storage.Va
 		return storage.ErrEmptyKey.New("")
 	}
 
-	err = client.batch(func(bucket *bolt.Bucket) error {
+	err = client.batch(func(bucket *bbolt.Bucket) error {
 		return bucket.Put(key, value)
 	})
 	mon.IntVal("boltdb_batch_time_elapsed").Observe(int64(time.Since(start)))
@@ -117,7 +117,7 @@ func (client *Client) PutAndCommit(ctx context.Context, key storage.Key, value s
 		return storage.ErrEmptyKey.New("")
 	}
 
-	return client.update(func(bucket *bolt.Bucket) error {
+	return client.update(func(bucket *bbolt.Bucket) error {
 		return bucket.Put(key, value)
 	})
 }
@@ -130,7 +130,7 @@ func (client *Client) Get(ctx context.Context, key storage.Key) (_ storage.Value
 	}
 
 	var value storage.Value
-	err = client.view(func(bucket *bolt.Bucket) error {
+	err = client.view(func(bucket *bbolt.Bucket) error {
 		data := bucket.Get([]byte(key))
 		if len(data) == 0 {
 			return storage.ErrKeyNotFound.New("%q", key)
@@ -141,24 +141,24 @@ func (client *Client) Get(ctx context.Context, key storage.Key) (_ storage.Value
 	return value, err
 }
 
-// Delete deletes a key/value pair from boltdb, for a given the key
+// Delete deletes a key/value pair from boltdb, for a given the key.
 func (client *Client) Delete(ctx context.Context, key storage.Key) (err error) {
 	defer mon.Task()(&ctx)(&err)
 	if key.IsZero() {
 		return storage.ErrEmptyKey.New("")
 	}
 
-	return client.update(func(bucket *bolt.Bucket) error {
+	return client.update(func(bucket *bbolt.Bucket) error {
 		return bucket.Delete(key)
 	})
 }
 
-// DeleteMultiple deletes keys ignoring missing keys
+// DeleteMultiple deletes keys ignoring missing keys.
 func (client *Client) DeleteMultiple(ctx context.Context, keys []storage.Key) (_ storage.Items, err error) {
 	defer mon.Task()(&ctx, len(keys))(&err)
 
 	var items storage.Items
-	err = client.update(func(bucket *bolt.Bucket) error {
+	err = client.update(func(bucket *bbolt.Bucket) error {
 		for _, key := range keys {
 			value := bucket.Get(key)
 			if len(value) == 0 {
@@ -188,7 +188,7 @@ func (client *Client) List(ctx context.Context, first storage.Key, limit int) (_
 	return rv, Error.Wrap(err)
 }
 
-// Close closes a BoltDB client
+// Close closes a BoltDB client.
 func (client *Client) Close() (err error) {
 	if atomic.AddInt32(client.referenceCount, -1) == 0 {
 		return Error.Wrap(client.db.Close())
@@ -201,11 +201,11 @@ func (client *Client) Close() (err error) {
 func (client *Client) GetAll(ctx context.Context, keys storage.Keys) (_ storage.Values, err error) {
 	defer mon.Task()(&ctx)(&err)
 	if len(keys) > client.lookupLimit {
-		return nil, storage.ErrLimitExceeded
+		return nil, storage.ErrLimitExceeded.New("lookup limit exceeded")
 	}
 
 	vals := make(storage.Values, 0, len(keys))
-	err = client.view(func(bucket *bolt.Bucket) error {
+	err = client.view(func(bucket *bbolt.Bucket) error {
 		for _, key := range keys {
 			val := bucket.Get([]byte(key))
 			if val == nil {
@@ -219,7 +219,7 @@ func (client *Client) GetAll(ctx context.Context, keys storage.Keys) (_ storage.
 	return vals, err
 }
 
-// Iterate iterates over items based on opts
+// Iterate iterates over items based on opts.
 func (client *Client) Iterate(ctx context.Context, opts storage.IterateOptions, fn func(context.Context, storage.Iterator) error) (err error) {
 	defer mon.Task()(&ctx)(&err)
 
@@ -227,7 +227,14 @@ func (client *Client) Iterate(ctx context.Context, opts storage.IterateOptions, 
 		opts.Limit = client.lookupLimit
 	}
 
-	return client.view(func(bucket *bolt.Bucket) error {
+	return client.IterateWithoutLookupLimit(ctx, opts, fn)
+}
+
+// IterateWithoutLookupLimit calls the callback with an iterator over the keys, but doesn't enforce default limit on opts.
+func (client *Client) IterateWithoutLookupLimit(ctx context.Context, opts storage.IterateOptions, fn func(context.Context, storage.Iterator) error) (err error) {
+	defer mon.Task()(&ctx)(&err)
+
+	return client.view(func(bucket *bbolt.Bucket) error {
 		var cursor advancer = forward{bucket.Cursor()}
 
 		start := true
@@ -286,7 +293,7 @@ type advancer interface {
 }
 
 type forward struct {
-	*bolt.Cursor
+	*bbolt.Cursor
 }
 
 func (cursor forward) PositionToFirst(prefix, first storage.Key) (key, value []byte) {
@@ -304,14 +311,14 @@ func (cursor forward) Advance() (key, value []byte) {
 	return cursor.Next()
 }
 
-// CompareAndSwap atomically compares and swaps oldValue with newValue
+// CompareAndSwap atomically compares and swaps oldValue with newValue.
 func (client *Client) CompareAndSwap(ctx context.Context, key storage.Key, oldValue, newValue storage.Value) (err error) {
 	defer mon.Task()(&ctx)(&err)
 	if key.IsZero() {
 		return storage.ErrEmptyKey.New("")
 	}
 
-	return client.update(func(bucket *bolt.Bucket) error {
+	return client.update(func(bucket *bbolt.Bucket) error {
 		data := bucket.Get([]byte(key))
 		if len(data) == 0 {
 			if oldValue != nil {

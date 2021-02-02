@@ -8,7 +8,6 @@ import (
 	"context"
 	"io"
 	"math/rand"
-	"sync"
 	"time"
 
 	"github.com/spacemonkeygo/monkit/v3"
@@ -25,24 +24,25 @@ import (
 	"storj.io/common/rpc/rpcstatus"
 	"storj.io/common/storj"
 	"storj.io/storj/satellite/metainfo"
+	"storj.io/storj/satellite/metainfo/metabase"
 	"storj.io/storj/satellite/orders"
 	"storj.io/storj/satellite/overlay"
-	"storj.io/uplink/eestream"
-	"storj.io/uplink/piecestore"
+	"storj.io/uplink/private/eestream"
+	"storj.io/uplink/private/piecestore"
 )
 
 var (
 	mon = monkit.Package()
 
-	// ErrNotEnoughShares is the errs class for when not enough shares are available to do an audit
+	// ErrNotEnoughShares is the errs class for when not enough shares are available to do an audit.
 	ErrNotEnoughShares = errs.Class("not enough shares for successful audit")
-	// ErrSegmentDeleted is the errs class when the audited segment was deleted during the audit
+	// ErrSegmentDeleted is the errs class when the audited segment was deleted during the audit.
 	ErrSegmentDeleted = errs.Class("segment deleted during audit")
-	// ErrSegmentExpired is the errs class used when a segment to audit has already expired.
-	ErrSegmentExpired = errs.Class("segment expired before audit")
+	// ErrSegmentModified is the errs class used when a segment has been changed in any way.
+	ErrSegmentModified = errs.Class("segment has been modified")
 )
 
-// Share represents required information about an audited share
+// Share represents required information about an audited share.
 type Share struct {
 	Error    error
 	PieceNum int
@@ -50,7 +50,7 @@ type Share struct {
 	Data     []byte
 }
 
-// Verifier helps verify the correctness of a given stripe
+// Verifier helps verify the correctness of a given stripe.
 //
 // architecture: Worker
 type Verifier struct {
@@ -67,7 +67,7 @@ type Verifier struct {
 	OnTestingCheckSegmentAlteredHook func()
 }
 
-// NewVerifier creates a Verifier
+// NewVerifier creates a Verifier.
 func NewVerifier(log *zap.Logger, metainfo *metainfo.Service, dialer rpc.Dialer, overlay *overlay.Service, containment Containment, orders *orders.Service, id *identity.FullIdentity, minBytesPerSecond memory.Size, minDownloadTimeout time.Duration) *Verifier {
 	return &Verifier{
 		log:                log,
@@ -86,28 +86,18 @@ func NewVerifier(log *zap.Logger, metainfo *metainfo.Service, dialer rpc.Dialer,
 func (verifier *Verifier) Verify(ctx context.Context, path storj.Path, skip map[storj.NodeID]bool) (report Report, err error) {
 	defer mon.Task()(&ctx)(&err)
 
-	pointerBytes, pointer, err := verifier.metainfo.GetWithBytes(ctx, path)
+	pointerBytes, pointer, err := verifier.metainfo.GetWithBytes(ctx, metabase.SegmentKey(path))
 	if err != nil {
 		if storj.ErrObjectNotFound.Has(err) {
-			return Report{}, ErrSegmentDeleted.New("%q", path)
+			verifier.log.Debug("segment deleted before Verify")
+			return Report{}, nil
 		}
 		return Report{}, err
 	}
-	if pointer.ExpirationDate != (time.Time{}) && pointer.ExpirationDate.Before(time.Now().UTC()) {
-		errDelete := verifier.metainfo.Delete(ctx, path, pointerBytes)
-		if errDelete != nil {
-			return Report{}, Error.Wrap(errDelete)
-		}
-		return Report{}, ErrSegmentExpired.New("segment expired before Verify")
+	if !pointer.ExpirationDate.IsZero() && pointer.ExpirationDate.Before(time.Now()) {
+		verifier.log.Debug("segment expired before Verify")
+		return Report{}, nil
 	}
-
-	defer func() {
-		// if piece hashes have not been verified for this segment, do not mark nodes as failing audit
-		if !pointer.PieceHashesVerified {
-			report.PendingAudits = nil
-			report.Fails = nil
-		}
-	}()
 
 	randomIndex, err := GetRandomStripe(ctx, pointer)
 	if err != nil {
@@ -115,7 +105,10 @@ func (verifier *Verifier) Verify(ctx context.Context, path storj.Path, skip map[
 	}
 
 	shareSize := pointer.GetRemote().GetRedundancy().GetErasureShareSize()
-	bucketID := createBucketID(path)
+	segmentLocation, err := metabase.ParseSegmentKey(metabase.SegmentKey(path))
+	if err != nil {
+		return Report{}, err
+	}
 
 	var offlineNodes storj.NodeIDList
 	var failedNodes storj.NodeIDList
@@ -123,7 +116,7 @@ func (verifier *Verifier) Verify(ctx context.Context, path storj.Path, skip map[
 	containedNodes := make(map[int]storj.NodeID)
 	sharesToAudit := make(map[int]Share)
 
-	orderLimits, privateKey, err := verifier.orders.CreateAuditOrderLimits(ctx, bucketID, pointer, skip)
+	orderLimits, privateKey, cachedIPsAndPorts, err := verifier.orders.CreateAuditOrderLimits(ctx, segmentLocation.Bucket(), pointer, skip)
 	if err != nil {
 		return Report{}, err
 	}
@@ -133,20 +126,26 @@ func (verifier *Verifier) Verify(ctx context.Context, path storj.Path, skip map[
 	offlineNodes = getOfflineNodes(pointer, orderLimits, skip)
 	if len(offlineNodes) > 0 {
 		verifier.log.Debug("Verify: order limits not created for some nodes (offline/disqualified)",
-			zap.Bool("Piece Hash Verified", pointer.PieceHashesVerified),
-			zap.Binary("Segment", []byte(path)),
 			zap.Strings("Node IDs", offlineNodes.Strings()))
 	}
 
-	shares, err := verifier.DownloadShares(ctx, orderLimits, privateKey, randomIndex, shareSize)
+	shares, err := verifier.DownloadShares(ctx, orderLimits, privateKey, cachedIPsAndPorts, randomIndex, shareSize)
 	if err != nil {
 		return Report{
 			Offlines: offlineNodes,
 		}, err
 	}
 
-	_, err = verifier.checkIfSegmentAltered(ctx, path, pointer)
+	err = verifier.checkIfSegmentAltered(ctx, path, pointer, pointerBytes)
 	if err != nil {
+		if ErrSegmentDeleted.Has(err) {
+			verifier.log.Debug("segment deleted during Verify")
+			return Report{}, nil
+		}
+		if ErrSegmentModified.Has(err) {
+			verifier.log.Debug("segment modified during Verify")
+			return Report{}, nil
+		}
 		return Report{
 			Offlines: offlineNodes,
 		}, err
@@ -163,8 +162,6 @@ func (verifier *Verifier) Verify(ctx context.Context, path storj.Path, skip map[
 				// dial timeout
 				offlineNodes = append(offlineNodes, share.NodeID)
 				verifier.log.Debug("Verify: dial timeout (offline)",
-					zap.Bool("Piece Hash Verified", pointer.PieceHashesVerified),
-					zap.Binary("Segment", []byte(path)),
 					zap.Stringer("Node ID", share.NodeID),
 					zap.Error(share.Error))
 				continue
@@ -173,17 +170,13 @@ func (verifier *Verifier) Verify(ctx context.Context, path storj.Path, skip map[
 				// dial failed -- offline node
 				offlineNodes = append(offlineNodes, share.NodeID)
 				verifier.log.Debug("Verify: dial failed (offline)",
-					zap.Bool("Piece Hash Verified", pointer.PieceHashesVerified),
-					zap.Binary("Segment", []byte(path)),
 					zap.Stringer("Node ID", share.NodeID),
 					zap.Error(share.Error))
 				continue
 			}
 			// unknown transport error
 			unknownNodes = append(unknownNodes, share.NodeID)
-			verifier.log.Debug("Verify: unknown transport error (skipped)",
-				zap.Bool("Piece Hash Verified", pointer.PieceHashesVerified),
-				zap.Binary("Segment", []byte(path)),
+			verifier.log.Info("Verify: unknown transport error (skipped)",
 				zap.Stringer("Node ID", share.NodeID),
 				zap.Error(share.Error))
 			continue
@@ -192,9 +185,7 @@ func (verifier *Verifier) Verify(ctx context.Context, path storj.Path, skip map[
 		if errs2.IsRPC(share.Error, rpcstatus.NotFound) {
 			// missing share
 			failedNodes = append(failedNodes, share.NodeID)
-			verifier.log.Debug("Verify: piece not found (audit failed)",
-				zap.Bool("Piece Hash Verified", pointer.PieceHashesVerified),
-				zap.Binary("Segment", []byte(path)),
+			verifier.log.Info("Verify: piece not found (audit failed)",
 				zap.Stringer("Node ID", share.NodeID),
 				zap.Error(share.Error))
 			continue
@@ -203,9 +194,7 @@ func (verifier *Verifier) Verify(ctx context.Context, path storj.Path, skip map[
 		if errs2.IsRPC(share.Error, rpcstatus.DeadlineExceeded) {
 			// dial successful, but download timed out
 			containedNodes[pieceNum] = share.NodeID
-			verifier.log.Debug("Verify: download timeout (contained)",
-				zap.Bool("Piece Hash Verified", pointer.PieceHashesVerified),
-				zap.Binary("Segment", []byte(path)),
+			verifier.log.Info("Verify: download timeout (contained)",
 				zap.Stringer("Node ID", share.NodeID),
 				zap.Error(share.Error))
 			continue
@@ -213,23 +202,26 @@ func (verifier *Verifier) Verify(ctx context.Context, path storj.Path, skip map[
 
 		// unknown error
 		unknownNodes = append(unknownNodes, share.NodeID)
-		verifier.log.Debug("Verify: unknown error (skipped)",
-			zap.Bool("Piece Hash Verified", pointer.PieceHashesVerified),
-			zap.Binary("Segment", []byte(path)),
+		verifier.log.Info("Verify: unknown error (skipped)",
 			zap.Stringer("Node ID", share.NodeID),
 			zap.Error(share.Error))
 	}
+
+	mon.IntVal("verify_shares_downloaded_successfully").Observe(int64(len(sharesToAudit))) //mon:locked
 
 	required := int(pointer.Remote.Redundancy.GetMinReq())
 	total := int(pointer.Remote.Redundancy.GetTotal())
 
 	if len(sharesToAudit) < required {
+		mon.Counter("not_enough_shares_for_audit").Inc(1)
 		return Report{
 			Fails:    failedNodes,
 			Offlines: offlineNodes,
 			Unknown:  unknownNodes,
 		}, ErrNotEnoughShares.New("got %d, required %d", len(sharesToAudit), required)
 	}
+	// ensure we get values, even if only zero values, so that redash can have an alert based on this
+	mon.Counter("not_enough_shares_for_audit").Inc(0)
 
 	pieceNums, correctedShares, err := auditShares(ctx, required, total, sharesToAudit)
 	if err != nil {
@@ -267,27 +259,27 @@ func (verifier *Verifier) Verify(ctx context.Context, path storj.Path, skip map[
 		unknownPercentage = float64(numUnknown) / float64(totalAudited)
 	}
 
-	mon.Meter("audit_success_nodes_global").Mark(numSuccessful)        //locked
-	mon.Meter("audit_fail_nodes_global").Mark(numFailed)               //locked
-	mon.Meter("audit_offline_nodes_global").Mark(numOffline)           //locked
-	mon.Meter("audit_contained_nodes_global").Mark(numContained)       //locked
-	mon.Meter("audit_unknown_nodes_global").Mark(numUnknown)           //locked
-	mon.Meter("audit_total_nodes_global").Mark(totalAudited)           //locked
-	mon.Meter("audit_total_pointer_nodes_global").Mark(totalInPointer) //locked
+	mon.Meter("audit_success_nodes_global").Mark(numSuccessful)        //mon:locked
+	mon.Meter("audit_fail_nodes_global").Mark(numFailed)               //mon:locked
+	mon.Meter("audit_offline_nodes_global").Mark(numOffline)           //mon:locked
+	mon.Meter("audit_contained_nodes_global").Mark(numContained)       //mon:locked
+	mon.Meter("audit_unknown_nodes_global").Mark(numUnknown)           //mon:locked
+	mon.Meter("audit_total_nodes_global").Mark(totalAudited)           //mon:locked
+	mon.Meter("audit_total_pointer_nodes_global").Mark(totalInPointer) //mon:locked
 
-	mon.IntVal("audit_success_nodes").Observe(int64(numSuccessful))           //locked
-	mon.IntVal("audit_fail_nodes").Observe(int64(numFailed))                  //locked
-	mon.IntVal("audit_offline_nodes").Observe(int64(numOffline))              //locked
-	mon.IntVal("audit_contained_nodes").Observe(int64(numContained))          //locked
-	mon.IntVal("audit_unknown_nodes").Observe(int64(numUnknown))              //locked
-	mon.IntVal("audit_total_nodes").Observe(int64(totalAudited))              //locked
-	mon.IntVal("audit_total_pointer_nodes").Observe(int64(totalInPointer))    //locked
-	mon.FloatVal("audited_percentage").Observe(auditedPercentage)             //locked
-	mon.FloatVal("audit_offline_percentage").Observe(offlinePercentage)       //locked
-	mon.FloatVal("audit_successful_percentage").Observe(successfulPercentage) //locked
-	mon.FloatVal("audit_failed_percentage").Observe(failedPercentage)         //locked
-	mon.FloatVal("audit_contained_percentage").Observe(containedPercentage)   //locked
-	mon.FloatVal("audit_unknown_percentage").Observe(unknownPercentage)       //locked
+	mon.IntVal("audit_success_nodes").Observe(int64(numSuccessful))           //mon:locked
+	mon.IntVal("audit_fail_nodes").Observe(int64(numFailed))                  //mon:locked
+	mon.IntVal("audit_offline_nodes").Observe(int64(numOffline))              //mon:locked
+	mon.IntVal("audit_contained_nodes").Observe(int64(numContained))          //mon:locked
+	mon.IntVal("audit_unknown_nodes").Observe(int64(numUnknown))              //mon:locked
+	mon.IntVal("audit_total_nodes").Observe(int64(totalAudited))              //mon:locked
+	mon.IntVal("audit_total_pointer_nodes").Observe(int64(totalInPointer))    //mon:locked
+	mon.FloatVal("audited_percentage").Observe(auditedPercentage)             //mon:locked
+	mon.FloatVal("audit_offline_percentage").Observe(offlinePercentage)       //mon:locked
+	mon.FloatVal("audit_successful_percentage").Observe(successfulPercentage) //mon:locked
+	mon.FloatVal("audit_failed_percentage").Observe(failedPercentage)         //mon:locked
+	mon.FloatVal("audit_contained_percentage").Observe(containedPercentage)   //mon:locked
+	mon.FloatVal("audit_unknown_percentage").Observe(unknownPercentage)       //mon:locked
 
 	pendingAudits, err := createPendingAudits(ctx, containedNodes, correctedShares, pointer, randomIndex, path)
 	if err != nil {
@@ -308,8 +300,8 @@ func (verifier *Verifier) Verify(ctx context.Context, path storj.Path, skip map[
 	}, nil
 }
 
-// DownloadShares downloads shares from the nodes where remote pieces are located
-func (verifier *Verifier) DownloadShares(ctx context.Context, limits []*pb.AddressedOrderLimit, piecePrivateKey storj.PiecePrivateKey, stripeIndex int64, shareSize int32) (shares map[int]Share, err error) {
+// DownloadShares downloads shares from the nodes where remote pieces are located.
+func (verifier *Verifier) DownloadShares(ctx context.Context, limits []*pb.AddressedOrderLimit, piecePrivateKey storj.PiecePrivateKey, cachedIPsAndPorts map[storj.NodeID]string, stripeIndex int64, shareSize int32) (shares map[int]Share, err error) {
 	defer mon.Task()(&ctx)(&err)
 
 	shares = make(map[int]Share, len(limits))
@@ -321,8 +313,9 @@ func (verifier *Verifier) DownloadShares(ctx context.Context, limits []*pb.Addre
 			continue
 		}
 
+		ip := cachedIPsAndPorts[limit.Limit.StorageNodeId]
 		go func(i int, limit *pb.AddressedOrderLimit) {
-			share, err := verifier.GetShare(ctx, limit, piecePrivateKey, stripeIndex, shareSize, i)
+			share, err := verifier.GetShare(ctx, limit, piecePrivateKey, ip, stripeIndex, shareSize, i)
 			if err != nil {
 				share = Share{
 					Error:    err,
@@ -345,7 +338,7 @@ func (verifier *Verifier) DownloadShares(ctx context.Context, limits []*pb.Addre
 	return shares, nil
 }
 
-// Reverify reverifies the contained nodes in the stripe
+// Reverify reverifies the contained nodes in the stripe.
 func (verifier *Verifier) Reverify(ctx context.Context, path storj.Path) (report Report, err error) {
 	defer mon.Task()(&ctx)(&err)
 
@@ -357,6 +350,7 @@ func (verifier *Verifier) Reverify(ctx context.Context, path storj.Path) (report
 		failed
 		contained
 		unknown
+		remove
 		erred
 	)
 
@@ -367,46 +361,18 @@ func (verifier *Verifier) Reverify(ctx context.Context, path storj.Path) (report
 		err          error
 	}
 
-	pointerBytes, pointer, err := verifier.metainfo.GetWithBytes(ctx, path)
+	pointer, err := verifier.metainfo.Get(ctx, metabase.SegmentKey(path))
 	if err != nil {
 		if storj.ErrObjectNotFound.Has(err) {
-			return Report{}, ErrSegmentDeleted.New("%q", path)
+			verifier.log.Debug("segment deleted before Reverify")
+			return Report{}, nil
 		}
 		return Report{}, err
 	}
-	if pointer.ExpirationDate != (time.Time{}) && pointer.ExpirationDate.Before(time.Now().UTC()) {
-		errDelete := verifier.metainfo.Delete(ctx, path, pointerBytes)
-		if errDelete != nil {
-			return Report{}, Error.Wrap(errDelete)
-		}
-		return Report{}, ErrSegmentExpired.New("Segment expired before Reverify")
+	if !pointer.ExpirationDate.IsZero() && pointer.ExpirationDate.Before(time.Now()) {
+		verifier.log.Debug("Segment expired before Reverify")
+		return Report{}, nil
 	}
-
-	pieceHashesVerified := make(map[storj.NodeID]bool)
-	pieceHashesVerifiedMutex := &sync.Mutex{}
-	defer func() {
-		pieceHashesVerifiedMutex.Lock()
-
-		// for each node in Fails and PendingAudits, remove if piece hashes not verified for that segment
-		newFails := storj.NodeIDList{}
-		newPendingAudits := []*PendingAudit{}
-
-		for _, id := range report.Fails {
-			if pieceHashesVerified[id] {
-				newFails = append(newFails, id)
-			}
-		}
-		for _, pending := range report.PendingAudits {
-			if pieceHashesVerified[pending.NodeID] {
-				newPendingAudits = append(newPendingAudits, pending)
-			}
-		}
-
-		report.Fails = newFails
-		report.PendingAudits = newPendingAudits
-
-		pieceHashesVerifiedMutex.Unlock()
-	}()
 
 	pieces := pointer.GetRemote().GetRemotePieces()
 	ch := make(chan result, len(pieces))
@@ -420,54 +386,31 @@ func (verifier *Verifier) Reverify(ctx context.Context, path storj.Path) (report
 				continue
 			}
 			ch <- result{nodeID: piece.NodeId, status: erred, err: err}
-			verifier.log.Debug("Reverify: error getting from containment db", zap.Binary("Segment", []byte(path)), zap.Stringer("Node ID", piece.NodeId), zap.Error(err))
+			verifier.log.Debug("Reverify: error getting from containment db", zap.Stringer("Node ID", piece.NodeId), zap.Error(err))
 			continue
 		}
 		containedInSegment++
 
 		go func(pending *PendingAudit) {
-			pendingPointerBytes, pendingPointer, err := verifier.metainfo.GetWithBytes(ctx, pending.Path)
+			pendingPointerBytes, pendingPointer, err := verifier.metainfo.GetWithBytes(ctx, metabase.SegmentKey(pending.Path))
 			if err != nil {
 				if storj.ErrObjectNotFound.Has(err) {
-					// segment has been deleted since node was contained
-					_, errDelete := verifier.containment.Delete(ctx, pending.NodeID)
-					if errDelete != nil {
-						verifier.log.Debug("Error deleting node from containment db", zap.Binary("Segment", []byte(pending.Path)), zap.Stringer("Node ID", pending.NodeID), zap.Error(errDelete))
-					}
-					ch <- result{nodeID: pending.NodeID, status: skipped}
+					ch <- result{nodeID: pending.NodeID, status: remove}
 					return
 				}
 
 				ch <- result{nodeID: pending.NodeID, status: erred, err: err}
-				verifier.log.Debug("Reverify: error getting pending pointer from metainfo", zap.Binary("Segment", []byte(pending.Path)), zap.Stringer("Node ID", pending.NodeID), zap.Error(err))
+				verifier.log.Debug("Reverify: error getting pending pointer from metainfo", zap.Stringer("Node ID", pending.NodeID), zap.Error(err))
 				return
 			}
-			if pendingPointer.ExpirationDate != (time.Time{}) && pendingPointer.ExpirationDate.Before(time.Now().UTC()) {
-				errDelete := verifier.metainfo.Delete(ctx, pending.Path, pendingPointerBytes)
-				if errDelete != nil {
-					verifier.log.Debug("Reverify: error deleting expired segment", zap.Binary("Segment", []byte(pending.Path)), zap.Stringer("Node ID", pending.NodeID), zap.Error(errDelete))
-				}
-				_, errDelete = verifier.containment.Delete(ctx, pending.NodeID)
-				if errDelete != nil {
-					verifier.log.Debug("Error deleting node from containment db", zap.Binary("Segment", []byte(pending.Path)), zap.Stringer("Node ID", pending.NodeID), zap.Error(errDelete))
-				}
-				verifier.log.Debug("Reverify: segment already expired", zap.Binary("Segment", []byte(pending.Path)), zap.Stringer("Node ID", pending.NodeID))
-				ch <- result{nodeID: pending.NodeID, status: skipped}
+			if !pendingPointer.ExpirationDate.IsZero() && pendingPointer.ExpirationDate.Before(time.Now().UTC()) {
+				verifier.log.Debug("Reverify: segment already expired", zap.Stringer("Node ID", pending.NodeID))
+				ch <- result{nodeID: pending.NodeID, status: remove}
 				return
 			}
-
-			// set whether piece hashes have been verified for this segment so we know whether to report a failed or pending audit for this node
-			pieceHashesVerifiedMutex.Lock()
-			pieceHashesVerified[pending.NodeID] = pendingPointer.PieceHashesVerified
-			pieceHashesVerifiedMutex.Unlock()
 
 			if pendingPointer.GetRemote().RootPieceId != pending.PieceID {
-				// segment has changed since initial containment
-				_, errDelete := verifier.containment.Delete(ctx, pending.NodeID)
-				if errDelete != nil {
-					verifier.log.Debug("Error deleting node from containment db", zap.Binary("Segment", []byte(pending.Path)), zap.Stringer("Node ID", pending.NodeID), zap.Error(errDelete))
-				}
-				ch <- result{nodeID: pending.NodeID, status: skipped}
+				ch <- result{nodeID: pending.NodeID, status: remove}
 				return
 			}
 			var pieceNum int32
@@ -479,48 +422,58 @@ func (verifier *Verifier) Reverify(ctx context.Context, path storj.Path) (report
 				}
 			}
 			if !found {
-				// node is no longer in pointer, so remove from containment
-				_, errDelete := verifier.containment.Delete(ctx, pending.NodeID)
-				if errDelete != nil {
-					verifier.log.Debug("Error deleting node from containment db", zap.Binary("Segment", []byte(pending.Path)), zap.Stringer("Node ID", pending.NodeID), zap.Error(errDelete))
-				}
-				ch <- result{nodeID: pending.NodeID, status: skipped}
+				ch <- result{nodeID: pending.NodeID, status: remove}
 				return
 			}
 
-			limit, piecePrivateKey, err := verifier.orders.CreateAuditOrderLimit(ctx, createBucketID(pending.Path), pending.NodeID, pieceNum, pending.PieceID, pending.ShareSize)
+			segmentLocation, err := metabase.ParseSegmentKey(metabase.SegmentKey(pending.Path)) // TODO: this should be parsed in pending
+			if err != nil {
+				ch <- result{nodeID: pending.NodeID, status: remove}
+				return
+			}
+
+			limit, piecePrivateKey, cachedIPAndPort, err := verifier.orders.CreateAuditOrderLimit(ctx, segmentLocation.Bucket(), pending.NodeID, pieceNum, pending.PieceID, pending.ShareSize)
 			if err != nil {
 				if overlay.ErrNodeDisqualified.Has(err) {
 					_, errDelete := verifier.containment.Delete(ctx, pending.NodeID)
 					if errDelete != nil {
-						verifier.log.Debug("Error deleting disqualified node from containment db", zap.Binary("Segment", []byte(pending.Path)), zap.Stringer("Node ID", pending.NodeID), zap.Error(errDelete))
+						verifier.log.Debug("Error deleting disqualified node from containment db", zap.Stringer("Node ID", pending.NodeID), zap.Error(errDelete))
 					}
 					ch <- result{nodeID: pending.NodeID, status: erred, err: err}
-					verifier.log.Debug("Reverify: order limit not created (disqualified)", zap.Binary("Segment", []byte(pending.Path)), zap.Stringer("Node ID", pending.NodeID))
+					verifier.log.Debug("Reverify: order limit not created (disqualified)", zap.Stringer("Node ID", pending.NodeID))
+					return
+				}
+				if overlay.ErrNodeFinishedGE.Has(err) {
+					_, errDelete := verifier.containment.Delete(ctx, pending.NodeID)
+					if errDelete != nil {
+						verifier.log.Debug("Error deleting gracefully exited node from containment db", zap.Stringer("Node ID", pending.NodeID), zap.Error(errDelete))
+					}
+					ch <- result{nodeID: pending.NodeID, status: erred, err: err}
+					verifier.log.Debug("Reverify: order limit not created (completed graceful exit)", zap.Stringer("Node ID", pending.NodeID))
 					return
 				}
 				if overlay.ErrNodeOffline.Has(err) {
 					ch <- result{nodeID: pending.NodeID, status: offline}
-					verifier.log.Debug("Reverify: order limit not created (offline)", zap.Binary("Segment", []byte(pending.Path)), zap.Stringer("Node ID", pending.NodeID))
+					verifier.log.Debug("Reverify: order limit not created (offline)", zap.Stringer("Node ID", pending.NodeID))
 					return
 				}
 				ch <- result{nodeID: pending.NodeID, status: erred, err: err}
-				verifier.log.Debug("Reverify: error creating order limit", zap.Binary("Segment", []byte(pending.Path)), zap.Stringer("Node ID", pending.NodeID), zap.Error(err))
+				verifier.log.Debug("Reverify: error creating order limit", zap.Stringer("Node ID", pending.NodeID), zap.Error(err))
 				return
 			}
 
-			share, err := verifier.GetShare(ctx, limit, piecePrivateKey, pending.StripeIndex, pending.ShareSize, int(pieceNum))
+			share, err := verifier.GetShare(ctx, limit, piecePrivateKey, cachedIPAndPort, pending.StripeIndex, pending.ShareSize, int(pieceNum))
 
 			// check if the pending audit was deleted while downloading the share
 			_, getErr := verifier.containment.Get(ctx, pending.NodeID)
 			if getErr != nil {
 				if ErrContainedNotFound.Has(getErr) {
 					ch <- result{nodeID: pending.NodeID, status: skipped}
-					verifier.log.Debug("Reverify: pending audit deleted during reverification", zap.Binary("Segment", []byte(pending.Path)), zap.Stringer("Node ID", pending.NodeID), zap.Error(getErr))
+					verifier.log.Debug("Reverify: pending audit deleted during reverification", zap.Stringer("Node ID", pending.NodeID), zap.Error(getErr))
 					return
 				}
 				ch <- result{nodeID: pending.NodeID, status: erred, err: getErr}
-				verifier.log.Debug("Reverify: error getting from containment db", zap.Binary("Segment", []byte(pending.Path)), zap.Stringer("Node ID", pending.NodeID), zap.Error(getErr))
+				verifier.log.Debug("Reverify: error getting from containment db", zap.Stringer("Node ID", pending.NodeID), zap.Error(getErr))
 				return
 			}
 
@@ -530,56 +483,56 @@ func (verifier *Verifier) Reverify(ctx context.Context, path storj.Path) (report
 					if errs.Is(err, context.DeadlineExceeded) {
 						// dial timeout
 						ch <- result{nodeID: pending.NodeID, status: offline}
-						verifier.log.Debug("Reverify: dial timeout (offline)", zap.Binary("Segment", []byte(pending.Path)), zap.Stringer("Node ID", pending.NodeID), zap.Error(err))
+						verifier.log.Debug("Reverify: dial timeout (offline)", zap.Stringer("Node ID", pending.NodeID), zap.Error(err))
 						return
 					}
 					if errs2.IsRPC(err, rpcstatus.Unknown) {
 						// dial failed -- offline node
-						verifier.log.Debug("Reverify: dial failed (offline)", zap.Binary("Segment", []byte(pending.Path)), zap.Stringer("Node ID", pending.NodeID), zap.Error(err))
+						verifier.log.Debug("Reverify: dial failed (offline)", zap.Stringer("Node ID", pending.NodeID), zap.Error(err))
 						ch <- result{nodeID: pending.NodeID, status: offline}
 						return
 					}
 					// unknown transport error
 					ch <- result{nodeID: pending.NodeID, status: unknown, pendingAudit: pending}
-					verifier.log.Debug("Reverify: unknown transport error (skipped)", zap.Binary("Segment", []byte(pending.Path)), zap.Stringer("Node ID", pending.NodeID), zap.Error(err))
+					verifier.log.Info("Reverify: unknown transport error (skipped)", zap.Stringer("Node ID", pending.NodeID), zap.Error(err))
 					return
 				}
 				if errs2.IsRPC(err, rpcstatus.NotFound) {
 					// Get the original segment pointer in the metainfo
-					_, err := verifier.checkIfSegmentAltered(ctx, pending.Path, pendingPointer)
+					err := verifier.checkIfSegmentAltered(ctx, pending.Path, pendingPointer, pendingPointerBytes)
 					if err != nil {
-						ch <- result{nodeID: pending.NodeID, status: success}
-						verifier.log.Debug("Reverify: audit source deleted before reverification", zap.Binary("Segment", []byte(pending.Path)), zap.Stringer("Node ID", pending.NodeID), zap.Error(err))
+						ch <- result{nodeID: pending.NodeID, status: remove}
+						verifier.log.Debug("Reverify: audit source changed before reverification", zap.Stringer("Node ID", pending.NodeID), zap.Error(err))
 						return
 					}
 					// missing share
 					ch <- result{nodeID: pending.NodeID, status: failed}
-					verifier.log.Debug("Reverify: piece not found (audit failed)", zap.Binary("Segment", []byte(pending.Path)), zap.Stringer("Node ID", pending.NodeID), zap.Error(err))
+					verifier.log.Info("Reverify: piece not found (audit failed)", zap.Stringer("Node ID", pending.NodeID), zap.Error(err))
 					return
 				}
 				if errs2.IsRPC(err, rpcstatus.DeadlineExceeded) {
 					// dial successful, but download timed out
 					ch <- result{nodeID: pending.NodeID, status: contained, pendingAudit: pending}
-					verifier.log.Debug("Reverify: download timeout (contained)", zap.Binary("Segment", []byte(pending.Path)), zap.Stringer("Node ID", pending.NodeID), zap.Error(err))
+					verifier.log.Info("Reverify: download timeout (contained)", zap.Stringer("Node ID", pending.NodeID), zap.Error(err))
 					return
 				}
 				// unknown error
 				ch <- result{nodeID: pending.NodeID, status: unknown, pendingAudit: pending}
-				verifier.log.Debug("Reverify: unknown error (skipped)", zap.Binary("Segment", []byte(pending.Path)), zap.Stringer("Node ID", pending.NodeID), zap.Error(err))
+				verifier.log.Info("Reverify: unknown error (skipped)", zap.Stringer("Node ID", pending.NodeID), zap.Error(err))
 				return
 			}
 			downloadedHash := pkcrypto.SHA256Hash(share.Data)
 			if bytes.Equal(downloadedHash, pending.ExpectedShareHash) {
 				ch <- result{nodeID: pending.NodeID, status: success}
-				verifier.log.Debug("Reverify: hashes match (audit success)", zap.Binary("Segment", []byte(pending.Path)), zap.Stringer("Node ID", pending.NodeID))
+				verifier.log.Info("Reverify: hashes match (audit success)", zap.Stringer("Node ID", pending.NodeID))
 			} else {
-				_, err := verifier.checkIfSegmentAltered(ctx, pending.Path, pendingPointer)
+				err := verifier.checkIfSegmentAltered(ctx, pending.Path, pendingPointer, pendingPointerBytes)
 				if err != nil {
-					ch <- result{nodeID: pending.NodeID, status: success}
-					verifier.log.Debug("Reverify: audit source deleted before reverification", zap.Binary("Segment", []byte(pending.Path)), zap.Stringer("Node ID", pending.NodeID), zap.Error(err))
+					ch <- result{nodeID: pending.NodeID, status: remove}
+					verifier.log.Debug("Reverify: audit source changed before reverification", zap.Stringer("Node ID", pending.NodeID), zap.Error(err))
 					return
 				}
-				verifier.log.Debug("Reverify: hashes mismatch (audit failed)", zap.Binary("Segment", []byte(pending.Path)), zap.Stringer("Node ID", pending.NodeID),
+				verifier.log.Info("Reverify: hashes mismatch (audit failed)", zap.Stringer("Node ID", pending.NodeID),
 					zap.Binary("expected hash", pending.ExpectedShareHash), zap.Binary("downloaded hash", downloadedHash))
 				ch <- result{nodeID: pending.NodeID, status: failed}
 			}
@@ -589,6 +542,7 @@ func (verifier *Verifier) Reverify(ctx context.Context, path storj.Path) (report
 	for range pieces {
 		result := <-ch
 		switch result.status {
+		case skipped:
 		case success:
 			report.Successes = append(report.Successes, result.nodeID)
 		case offline:
@@ -599,31 +553,37 @@ func (verifier *Verifier) Reverify(ctx context.Context, path storj.Path) (report
 			report.PendingAudits = append(report.PendingAudits, result.pendingAudit)
 		case unknown:
 			report.Unknown = append(report.Unknown, result.nodeID)
+		case remove:
+			_, errDelete := verifier.containment.Delete(ctx, result.nodeID)
+			if errDelete != nil {
+				verifier.log.Debug("Error deleting node from containment db", zap.Stringer("Node ID", result.nodeID), zap.Error(errDelete))
+			}
 		case erred:
 			err = errs.Combine(err, result.err)
+		default:
 		}
 	}
 
-	mon.Meter("reverify_successes_global").Mark(len(report.Successes))     //locked
-	mon.Meter("reverify_offlines_global").Mark(len(report.Offlines))       //locked
-	mon.Meter("reverify_fails_global").Mark(len(report.Fails))             //locked
-	mon.Meter("reverify_contained_global").Mark(len(report.PendingAudits)) //locked
-	mon.Meter("reverify_unknown_global").Mark(len(report.Unknown))         //locked
+	mon.Meter("reverify_successes_global").Mark(len(report.Successes))     //mon:locked
+	mon.Meter("reverify_offlines_global").Mark(len(report.Offlines))       //mon:locked
+	mon.Meter("reverify_fails_global").Mark(len(report.Fails))             //mon:locked
+	mon.Meter("reverify_contained_global").Mark(len(report.PendingAudits)) //mon:locked
+	mon.Meter("reverify_unknown_global").Mark(len(report.Unknown))         //mon:locked
 
-	mon.IntVal("reverify_successes").Observe(int64(len(report.Successes)))     //locked
-	mon.IntVal("reverify_offlines").Observe(int64(len(report.Offlines)))       //locked
-	mon.IntVal("reverify_fails").Observe(int64(len(report.Fails)))             //locked
-	mon.IntVal("reverify_contained").Observe(int64(len(report.PendingAudits))) //locked
-	mon.IntVal("reverify_unknown").Observe(int64(len(report.Unknown)))         //locked
+	mon.IntVal("reverify_successes").Observe(int64(len(report.Successes)))     //mon:locked
+	mon.IntVal("reverify_offlines").Observe(int64(len(report.Offlines)))       //mon:locked
+	mon.IntVal("reverify_fails").Observe(int64(len(report.Fails)))             //mon:locked
+	mon.IntVal("reverify_contained").Observe(int64(len(report.PendingAudits))) //mon:locked
+	mon.IntVal("reverify_unknown").Observe(int64(len(report.Unknown)))         //mon:locked
 
-	mon.IntVal("reverify_contained_in_segment").Observe(containedInSegment) //locked
-	mon.IntVal("reverify_total_in_segment").Observe(int64(len(pieces)))     //locked
+	mon.IntVal("reverify_contained_in_segment").Observe(containedInSegment) //mon:locked
+	mon.IntVal("reverify_total_in_segment").Observe(int64(len(pieces)))     //mon:locked
 
 	return report, err
 }
 
-// GetShare use piece store client to download shares from nodes
-func (verifier *Verifier) GetShare(ctx context.Context, limit *pb.AddressedOrderLimit, piecePrivateKey storj.PiecePrivateKey, stripeIndex int64, shareSize int32, pieceNum int) (share Share, err error) {
+// GetShare use piece store client to download shares from nodes.
+func (verifier *Verifier) GetShare(ctx context.Context, limit *pb.AddressedOrderLimit, piecePrivateKey storj.PiecePrivateKey, cachedIPAndPort string, stripeIndex int64, shareSize int32, pieceNum int) (share Share, err error) {
 	defer mon.Task()(&ctx)(&err)
 
 	bandwidthMsgSize := shareSize
@@ -640,14 +600,34 @@ func (verifier *Verifier) GetShare(ctx context.Context, limit *pb.AddressedOrder
 		defer cancel()
 	}
 
-	storageNodeID := limit.GetLimit().StorageNodeId
-	log := verifier.log.Named(storageNodeID.String())
-	target := &pb.Node{Id: storageNodeID, Address: limit.GetStorageNodeAddress()}
+	targetNodeID := limit.GetLimit().StorageNodeId
+	log := verifier.log.Named(targetNodeID.String())
+	var ps *piecestore.Client
 
-	ps, err := piecestore.Dial(timedCtx, verifier.dialer, target, log, piecestore.DefaultConfig)
-	if err != nil {
-		return Share{}, Error.Wrap(err)
+	// if cached IP is given, try connecting there first
+	if cachedIPAndPort != "" {
+		nodeAddr := storj.NodeURL{
+			ID:      targetNodeID,
+			Address: cachedIPAndPort,
+		}
+		ps, err = piecestore.DialNodeURL(timedCtx, verifier.dialer, nodeAddr, log, piecestore.DefaultConfig)
+		if err != nil {
+			log.Debug("failed to connect to audit target node at cached IP", zap.String("cached-ip-and-port", cachedIPAndPort), zap.Error(err))
+		}
 	}
+
+	// if no cached IP was given, or connecting to cached IP failed, use node address
+	if ps == nil {
+		nodeAddr := storj.NodeURL{
+			ID:      targetNodeID,
+			Address: limit.GetStorageNodeAddress().Address,
+		}
+		ps, err = piecestore.DialNodeURL(timedCtx, verifier.dialer, nodeAddr, log, piecestore.DefaultConfig)
+		if err != nil {
+			return Share{}, Error.Wrap(err)
+		}
+	}
+
 	defer func() {
 		err := ps.Close()
 		if err != nil {
@@ -672,31 +652,35 @@ func (verifier *Verifier) GetShare(ctx context.Context, limit *pb.AddressedOrder
 	return Share{
 		Error:    nil,
 		PieceNum: pieceNum,
-		NodeID:   storageNodeID,
+		NodeID:   targetNodeID,
 		Data:     buf,
 	}, nil
 }
 
 // checkIfSegmentAltered checks if path's pointer has been altered since path was selected.
-func (verifier *Verifier) checkIfSegmentAltered(ctx context.Context, segmentPath string, oldPointer *pb.Pointer) (newPointer *pb.Pointer, err error) {
+func (verifier *Verifier) checkIfSegmentAltered(ctx context.Context, segmentKey string, oldPointer *pb.Pointer, oldPointerBytes []byte) (err error) {
 	defer mon.Task()(&ctx)(&err)
 
 	if verifier.OnTestingCheckSegmentAlteredHook != nil {
 		verifier.OnTestingCheckSegmentAlteredHook()
 	}
 
-	newPointer, err = verifier.metainfo.Get(ctx, segmentPath)
+	newPointerBytes, newPointer, err := verifier.metainfo.GetWithBytes(ctx, metabase.SegmentKey(segmentKey))
 	if err != nil {
 		if storj.ErrObjectNotFound.Has(err) {
-			return nil, ErrSegmentDeleted.New("%q", segmentPath)
+			return ErrSegmentDeleted.New("%q", segmentKey)
 		}
-		return nil, err
+		return err
 	}
 
 	if oldPointer != nil && oldPointer.CreationDate != newPointer.CreationDate {
-		return nil, ErrSegmentDeleted.New("%q", segmentPath)
+		return ErrSegmentDeleted.New("%q", segmentKey)
 	}
-	return newPointer, nil
+
+	if !bytes.Equal(oldPointerBytes, newPointerBytes) {
+		return ErrSegmentModified.New("%q", segmentKey)
+	}
+	return nil
 }
 
 // auditShares takes the downloaded shares and uses infectious's Correct function to check that they
@@ -727,7 +711,7 @@ func auditShares(ctx context.Context, required, total int, originals map[int]Sha
 	return pieceNums, copies, nil
 }
 
-// makeCopies takes in a map of audit Shares and deep copies their data to a slice of infectious Shares
+// makeCopies takes in a map of audit Shares and deep copies their data to a slice of infectious Shares.
 func makeCopies(ctx context.Context, originals map[int]Share) (copies []infectious.Share, err error) {
 	defer mon.Task()(&ctx)(&err)
 	copies = make([]infectious.Share, 0, len(originals))
@@ -760,7 +744,7 @@ func getOfflineNodes(pointer *pb.Pointer, limits []*pb.AddressedOrderLimit, skip
 	return offlines
 }
 
-// getSuccessNodes uses the failed nodes, offline nodes and contained nodes arrays to determine which nodes passed the audit
+// getSuccessNodes uses the failed nodes, offline nodes and contained nodes arrays to determine which nodes passed the audit.
 func getSuccessNodes(ctx context.Context, shares map[int]Share, failedNodes, offlineNodes, unknownNodes storj.NodeIDList, containedNodes map[int]storj.NodeID) (successNodes storj.NodeIDList) {
 	defer mon.Task()(&ctx)(nil)
 	fails := make(map[storj.NodeID]bool)
@@ -784,15 +768,6 @@ func getSuccessNodes(ctx context.Context, shares map[int]Share, failedNodes, off
 	}
 
 	return successNodes
-}
-
-func createBucketID(path storj.Path) []byte {
-	comps := storj.SplitPath(path)
-	if len(comps) < 3 {
-		return nil
-	}
-	// project_id/bucket_name
-	return []byte(storj.JoinPaths(comps[0], comps[2]))
 }
 
 func createPendingAudits(ctx context.Context, containedNodes map[int]storj.NodeID, correctedShares []infectious.Share, pointer *pb.Pointer, randomIndex int64, path storj.Path) (pending []*PendingAudit, err error) {

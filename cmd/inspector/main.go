@@ -5,6 +5,7 @@ package main
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/csv"
 	"encoding/json"
 	"flag"
@@ -12,45 +13,45 @@ import (
 	"os"
 	"strconv"
 	"strings"
-	"time"
 
-	prompt "github.com/segmentio/go-prompt"
 	"github.com/spf13/cobra"
 	"github.com/zeebo/errs"
 
 	"storj.io/common/identity"
-	"storj.io/common/pb"
 	"storj.io/common/rpc"
 	"storj.io/common/storj"
-	"storj.io/storj/pkg/process"
-	"storj.io/uplink/eestream"
+	"storj.io/private/process"
+	"storj.io/storj/private/prompt"
+	_ "storj.io/storj/private/version" // This attaches version information during release builds.
+	"storj.io/storj/satellite/internalpb"
+	"storj.io/uplink/private/eestream"
 )
 
 var (
-	// Addr is the address of peer from command flags
+	// Addr is the address of peer from command flags.
 	Addr = flag.String("address", "127.0.0.1:7778", "address of peer to inspect")
 
-	// IdentityPath is the path to the identity the inspector should use for network communication
+	// IdentityPath is the path to the identity the inspector should use for network communication.
 	IdentityPath = flag.String("identity-path", "", "path to the identity certificate for use on the network")
 
-	// CSVPath is the csv path where command output is written
+	// CSVPath is the csv path where command output is written.
 	CSVPath string
 
-	// ErrInspectorDial throws when there are errors dialing the inspector server
+	// ErrInspectorDial throws when there are errors dialing the inspector server.
 	ErrInspectorDial = errs.Class("error dialing inspector server:")
 
-	// ErrRequest is for gRPC request errors after dialing
+	// ErrRequest is for request errors after dialing.
 	ErrRequest = errs.Class("error processing request:")
 
-	// ErrIdentity is for errors during identity creation for this CLI
+	// ErrIdentity is for errors during identity creation for this CLI.
 	ErrIdentity = errs.Class("error creating identity:")
 
-	// ErrArgs throws when there are errors with CLI args
+	// ErrArgs throws when there are errors with CLI args.
 	ErrArgs = errs.Class("error with CLI args:")
 
 	irreparableLimit int32
 
-	// Commander CLI
+	// Commander CLI.
 	rootCmd = &cobra.Command{
 		Use:   "inspector",
 		Short: "CLI for interacting with Storj network",
@@ -80,47 +81,19 @@ var (
 		Args:  cobra.MinimumNArgs(4),
 		RunE:  SegmentHealth,
 	}
-	paymentsCmd = &cobra.Command{
-		Use:   "payments",
-		Short: "commands for payments",
-	}
-	prepareInvoiceRecordsCmd = &cobra.Command{
-		Use:   "prepare-invoice-records <period>",
-		Short: "Prepares invoice project records that will be used during invoice line items creation",
-		Args:  cobra.MinimumNArgs(1),
-		RunE:  prepareInvoiceRecords,
-	}
-	createInvoiceItemsCmd = &cobra.Command{
-		Use:   "create-invoice-items",
-		Short: "Creates stripe invoice line items for not consumed project records",
-		RunE:  createInvoiceItems,
-	}
-	createInvoiceCouponsCmd = &cobra.Command{
-		Use:   "create-invoice-coupons",
-		Short: "Creates stripe invoice line items for not consumed coupons",
-		RunE:  createInvoiceCoupons,
-	}
-	createInvoicesCmd = &cobra.Command{
-		Use:   "create-invoices",
-		Short: "Creates stripe invoices for all stripe customers known to satellite",
-		RunE:  createInvoices,
-	}
 )
 
 // Inspector gives access to overlay.
 type Inspector struct {
-	conn           *rpc.Conn
-	identity       *identity.FullIdentity
-	overlayclient  pb.DRPCOverlayInspectorClient
-	irrdbclient    pb.DRPCIrreparableInspectorClient
-	healthclient   pb.DRPCHealthInspectorClient
-	paymentsClient pb.DRPCPaymentsClient
+	conn          *rpc.Conn
+	identity      *identity.FullIdentity
+	overlayclient internalpb.DRPCOverlayInspectorClient
+	irrdbclient   internalpb.DRPCIrreparableInspectorClient
+	healthclient  internalpb.DRPCHealthInspectorClient
 }
 
-// NewInspector creates a new gRPC inspector client for access to overlay.
-func NewInspector(address, path string) (*Inspector, error) {
-	ctx := context.Background()
-
+// NewInspector creates a new inspector client for access to overlay.
+func NewInspector(ctx context.Context, address, path string) (*Inspector, error) {
 	id, err := identity.Config{
 		CertPath: fmt.Sprintf("%s/identity.cert", path),
 		KeyPath:  fmt.Sprintf("%s/identity.key", path),
@@ -135,23 +108,21 @@ func NewInspector(address, path string) (*Inspector, error) {
 	}
 
 	return &Inspector{
-		conn:           conn,
-		identity:       id,
-		overlayclient:  pb.NewDRPCOverlayInspectorClient(conn.Raw()),
-		irrdbclient:    pb.NewDRPCIrreparableInspectorClient(conn.Raw()),
-		healthclient:   pb.NewDRPCHealthInspectorClient(conn.Raw()),
-		paymentsClient: pb.NewDRPCPaymentsClient(conn.Raw()),
+		conn:          conn,
+		identity:      id,
+		overlayclient: internalpb.NewDRPCOverlayInspectorClient(conn),
+		irrdbclient:   internalpb.NewDRPCIrreparableInspectorClient(conn),
+		healthclient:  internalpb.NewDRPCHealthInspectorClient(conn),
 	}, nil
 }
 
 // Close closes the inspector.
 func (i *Inspector) Close() error { return i.conn.Close() }
 
-// ObjectHealth gets information about the health of an object on the network
+// ObjectHealth gets information about the health of an object on the network.
 func ObjectHealth(cmd *cobra.Command, args []string) (err error) {
-	ctx := context.Background()
-
-	i, err := NewInspector(*Addr, *IdentityPath)
+	ctx, _ := process.Ctx(cmd)
+	i, err := NewInspector(ctx, *Addr, *IdentityPath)
 	if err != nil {
 		return ErrArgs.Wrap(err)
 	}
@@ -182,11 +153,14 @@ func ObjectHealth(cmd *cobra.Command, args []string) (err error) {
 		fallthrough
 	default:
 	}
-
-	req := &pb.ObjectHealthRequest{
+	decodedPath, err := base64.URLEncoding.DecodeString(args[2])
+	if err != nil {
+		return err
+	}
+	req := &internalpb.ObjectHealthRequest{
 		ProjectId:         []byte(args[0]),
 		Bucket:            []byte(args[1]),
-		EncryptedPath:     []byte(args[2]),
+		EncryptedPath:     decodedPath,
 		StartAfterSegment: startAfterSegment,
 		EndBeforeSegment:  endBeforeSegment,
 		Limit:             int32(limit),
@@ -227,11 +201,10 @@ func ObjectHealth(cmd *cobra.Command, args []string) (err error) {
 	return nil
 }
 
-// SegmentHealth gets information about the health of a segment on the network
+// SegmentHealth gets information about the health of a segment on the network.
 func SegmentHealth(cmd *cobra.Command, args []string) (err error) {
-	ctx := context.Background()
-
-	i, err := NewInspector(*Addr, *IdentityPath)
+	ctx, _ := process.Ctx(cmd)
+	i, err := NewInspector(ctx, *Addr, *IdentityPath)
 	if err != nil {
 		return ErrArgs.Wrap(err)
 	}
@@ -242,7 +215,7 @@ func SegmentHealth(cmd *cobra.Command, args []string) (err error) {
 		return ErrRequest.Wrap(err)
 	}
 
-	req := &pb.SegmentHealthRequest{
+	req := &internalpb.SegmentHealthRequest{
 		ProjectId:     []byte(args[0]),
 		SegmentIndex:  segmentIndex,
 		Bucket:        []byte(args[2]),
@@ -277,7 +250,7 @@ func SegmentHealth(cmd *cobra.Command, args []string) (err error) {
 		return err
 	}
 
-	if err := printSegmentHealthAndNodeTables(w, redundancy, []*pb.SegmentHealth{resp.GetHealth()}); err != nil {
+	if err := printSegmentHealthAndNodeTables(w, redundancy, []*internalpb.SegmentHealth{resp.GetHealth()}); err != nil {
 		return err
 	}
 
@@ -292,7 +265,7 @@ func csvOutput() (*os.File, error) {
 	return os.Create(CSVPath)
 }
 
-func printSegmentHealthAndNodeTables(w *csv.Writer, redundancy eestream.RedundancyStrategy, segments []*pb.SegmentHealth) error {
+func printSegmentHealthAndNodeTables(w *csv.Writer, redundancy eestream.RedundancyStrategy, segments []*internalpb.SegmentHealth) error {
 	segmentTableHeader := []string{
 		"Segment Index", "Healthy Nodes", "Unhealthy Nodes", "Offline Nodes",
 	}
@@ -394,7 +367,8 @@ func getSegments(cmd *cobra.Command, args []string) error {
 		return ErrArgs.New("limit must be greater than 0")
 	}
 
-	i, err := NewInspector(*Addr, *IdentityPath)
+	ctx, _ := process.Ctx(cmd)
+	i, err := NewInspector(ctx, *Addr, *IdentityPath)
 	if err != nil {
 		return ErrInspectorDial.Wrap(err)
 	}
@@ -404,11 +378,11 @@ func getSegments(cmd *cobra.Command, args []string) error {
 
 	// query DB and paginate results
 	for {
-		req := &pb.ListIrreparableSegmentsRequest{
+		req := &internalpb.ListIrreparableSegmentsRequest{
 			Limit:               irreparableLimit,
 			LastSeenSegmentPath: lastSeenSegmentPath,
 		}
-		res, err := i.irrdbclient.ListIrreparableSegments(context.Background(), req)
+		res, err := i.irrdbclient.ListIrreparableSegments(ctx, req)
 		if err != nil {
 			return ErrRequest.Wrap(err)
 		}
@@ -429,7 +403,11 @@ func getSegments(cmd *cobra.Command, args []string) error {
 
 		length := int32(len(res.Segments))
 		if length >= irreparableLimit {
-			if !prompt.Confirm("\nNext page? (y/n)") {
+			confirmed, err := prompt.Confirm("\nNext page? [y/n]")
+			if err != nil {
+				return err
+			}
+			if !confirmed {
 				break
 			}
 		}
@@ -437,9 +415,9 @@ func getSegments(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-// sortSegments by the object they belong to
-func sortSegments(segments []*pb.IrreparableSegment) map[string][]*pb.IrreparableSegment {
-	objects := make(map[string][]*pb.IrreparableSegment)
+// sortSegments by the object they belong to.
+func sortSegments(segments []*internalpb.IrreparableSegment) map[string][]*internalpb.IrreparableSegment {
+	objects := make(map[string][]*internalpb.IrreparableSegment)
 	for _, seg := range segments {
 		pathElements := storj.SplitPath(string(seg.Path))
 
@@ -451,124 +429,13 @@ func sortSegments(segments []*pb.IrreparableSegment) map[string][]*pb.Irreparabl
 	return objects
 }
 
-func prepareInvoiceRecords(cmd *cobra.Command, args []string) error {
-	ctx, _ := process.Ctx(cmd)
-	i, err := NewInspector(*Addr, *IdentityPath)
-	if err != nil {
-		return ErrInspectorDial.Wrap(err)
-	}
-
-	defer func() { err = errs.Combine(err, i.Close()) }()
-
-	period, err := parseDateString(args[0])
-	if err != nil {
-		return ErrArgs.New("invalid period specified: %v", err)
-	}
-
-	_, err = i.paymentsClient.PrepareInvoiceRecords(ctx,
-		&pb.PrepareInvoiceRecordsRequest{
-			Period: period,
-		},
-	)
-	if err != nil {
-		return err
-	}
-
-	fmt.Println("successfully created invoice project records")
-	return nil
-}
-
-func createInvoiceItems(cmd *cobra.Command, args []string) error {
-	ctx, _ := process.Ctx(cmd)
-	i, err := NewInspector(*Addr, *IdentityPath)
-	if err != nil {
-		return ErrInspectorDial.Wrap(err)
-	}
-
-	defer func() { err = errs.Combine(err, i.Close()) }()
-
-	_, err = i.paymentsClient.ApplyInvoiceRecords(ctx, &pb.ApplyInvoiceRecordsRequest{})
-	if err != nil {
-		return err
-	}
-
-	fmt.Println("successfully created invoice line items")
-	return nil
-}
-
-func createInvoiceCoupons(cmd *cobra.Command, args []string) error {
-	ctx, _ := process.Ctx(cmd)
-	i, err := NewInspector(*Addr, *IdentityPath)
-	if err != nil {
-		return ErrInspectorDial.Wrap(err)
-	}
-
-	defer func() { err = errs.Combine(err, i.Close()) }()
-
-	_, err = i.paymentsClient.ApplyInvoiceCoupons(ctx, &pb.ApplyInvoiceCouponsRequest{})
-	if err != nil {
-		return err
-	}
-
-	fmt.Println("successfully created invoice coupon line items")
-	return nil
-}
-
-func createInvoices(cmd *cobra.Command, args []string) error {
-	i, err := NewInspector(*Addr, *IdentityPath)
-	if err != nil {
-		return ErrInspectorDial.Wrap(err)
-	}
-
-	defer func() { err = errs.Combine(err, i.Close()) }()
-
-	_, err = i.paymentsClient.CreateInvoices(context.Background(), &pb.CreateInvoicesRequest{})
-	if err != nil {
-		return err
-	}
-
-	fmt.Println("successfully created invoices")
-	return nil
-}
-
-// parseDateString parses provided date string and returns corresponding time.Time.
-func parseDateString(s string) (time.Time, error) {
-	values := strings.Split(s, "/")
-
-	if len(values) != 2 {
-		return time.Time{}, errs.New("invalid date format %s, use mm/yyyy", s)
-	}
-
-	month, err := strconv.ParseInt(values[0], 10, 64)
-	if err != nil {
-		return time.Time{}, errs.New("can not parse month: %v", err)
-	}
-	year, err := strconv.ParseInt(values[1], 10, 64)
-	if err != nil {
-		return time.Time{}, errs.New("can not parse year: %v", err)
-	}
-
-	date := time.Date(int(year), time.Month(month), 1, 0, 0, 0, 0, time.UTC)
-	if date.Year() != int(year) || date.Month() != time.Month(month) || date.Day() != 1 {
-		return date, errs.New("dates mismatch have %s result %s", s, date)
-	}
-
-	return date, nil
-}
-
 func init() {
 	rootCmd.AddCommand(statsCmd)
 	rootCmd.AddCommand(irreparableCmd)
 	rootCmd.AddCommand(healthCmd)
-	rootCmd.AddCommand(paymentsCmd)
 
 	healthCmd.AddCommand(objectHealthCmd)
 	healthCmd.AddCommand(segmentHealthCmd)
-
-	paymentsCmd.AddCommand(prepareInvoiceRecordsCmd)
-	paymentsCmd.AddCommand(createInvoiceItemsCmd)
-	paymentsCmd.AddCommand(createInvoiceCouponsCmd)
-	paymentsCmd.AddCommand(createInvoicesCmd)
 
 	objectHealthCmd.Flags().StringVar(&CSVPath, "csv-path", "stdout", "csv path where command output is written")
 

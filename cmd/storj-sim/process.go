@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"syscall"
@@ -19,37 +20,47 @@ import (
 	"github.com/zeebo/errs"
 	"golang.org/x/sync/errgroup"
 
+	"storj.io/common/processgroup"
 	"storj.io/common/sync2"
-	"storj.io/storj/private/processgroup"
 )
 
-// Processes contains list of processes
+// Processes contains list of processes.
 type Processes struct {
 	Output    *PrefixWriter
 	Directory string
 	List      []*Process
 
+	FailFast       bool
 	MaxStartupWait time.Duration
 }
 
-// NewProcesses returns a group of processes
-func NewProcesses(dir string) *Processes {
+const storjSimMaxLineLen = 10000
+
+// NewProcesses returns a group of processes.
+func NewProcesses(dir string, failfast bool) *Processes {
 	return &Processes{
-		Output:         NewPrefixWriter("sim", os.Stdout),
-		Directory:      dir,
-		List:           nil,
+		Output:    NewPrefixWriter("sim", storjSimMaxLineLen, os.Stdout),
+		Directory: dir,
+		List:      nil,
+
+		FailFast:       failfast,
 		MaxStartupWait: time.Minute,
 	}
 }
 
-// Exec executes a command on all processes
+// Exec executes a command on all processes.
 func (processes *Processes) Exec(ctx context.Context, command string) error {
-	var group errgroup.Group
-	processes.Start(ctx, &group, command)
+	var group *errgroup.Group
+	if processes.FailFast {
+		group, ctx = errgroup.WithContext(ctx)
+	} else {
+		group = &errgroup.Group{}
+	}
+	processes.Start(ctx, group, command)
 	return group.Wait()
 }
 
-// Start executes all processes using specified errgroup.Group
+// Start executes all processes using specified errgroup.Group.
 func (processes *Processes) Start(ctx context.Context, group *errgroup.Group, command string) {
 	for _, p := range processes.List {
 		process := p
@@ -59,7 +70,7 @@ func (processes *Processes) Start(ctx context.Context, group *errgroup.Group, co
 	}
 }
 
-// Env returns environment flags for other nodes
+// Env returns environment flags for other nodes.
 func (processes *Processes) Env() []string {
 	var env []string
 	for _, process := range processes.List {
@@ -68,7 +79,7 @@ func (processes *Processes) Env() []string {
 	return env
 }
 
-// Close closes all the processes and their resources
+// Close closes all the processes and their resources.
 func (processes *Processes) Close() error {
 	var errlist errs.Group
 	for _, process := range processes.List {
@@ -77,7 +88,7 @@ func (processes *Processes) Close() error {
 	return errlist.Err()
 }
 
-// Info represents public information about the process
+// Info represents public information about the process.
 type Info struct {
 	Name       string
 	Executable string
@@ -88,7 +99,7 @@ type Info struct {
 	Extra      []EnvVar
 }
 
-// EnvVar represents an environment variable like Key=Value
+// EnvVar represents an environment variable like Key=Value.
 type EnvVar struct {
 	Key   string
 	Value string
@@ -99,7 +110,7 @@ func (info *Info) AddExtra(key, value string) {
 	info.Extra = append(info.Extra, EnvVar{Key: key, Value: value})
 }
 
-// Env returns process flags
+// Env returns process flags.
 func (info *Info) Env() []string {
 	name := strings.ToUpper(info.Name)
 
@@ -135,10 +146,10 @@ func (info *Info) Env() []string {
 	return env
 }
 
-// Arguments contains arguments based on the main command
+// Arguments contains arguments based on the main command.
 type Arguments map[string][]string
 
-// Process is a type for monitoring the process
+// Process is a type for monitoring the process.
 type Process struct {
 	processes *Processes
 
@@ -158,7 +169,7 @@ type Process struct {
 	stderr io.Writer
 }
 
-// New creates a process which can be run in the specified directory
+// New creates a process which can be run in the specified directory.
 func (processes *Processes) New(info Info) *Process {
 	output := processes.Output.Prefixed(info.Name)
 
@@ -187,7 +198,7 @@ func (process *Process) WaitForExited(dependency *Process) {
 	process.Wait = append(process.Wait, &dependency.Status.Exited)
 }
 
-// Exec runs the process using the arguments for a given command
+// Exec runs the process using the arguments for a given command.
 func (process *Process) Exec(ctx context.Context, command string) (err error) {
 	// ensure that we always release all status fences
 	defer process.Status.Started.Release()
@@ -219,7 +230,7 @@ func (process *Process) Exec(ctx context.Context, command string) (err error) {
 	executable := process.Executable
 
 	// use executable inside the directory, if it exists
-	localExecutable := filepath.Join(process.Directory, executable)
+	localExecutable := exe(filepath.Join(process.Directory, executable))
 	if _, err := os.Lstat(localExecutable); !os.IsNotExist(err) {
 		executable = localExecutable
 	}
@@ -304,7 +315,7 @@ func (process *Process) Exec(ctx context.Context, command string) (err error) {
 func (process *Process) waitForAddress(maxStartupWait time.Duration) error {
 	start := time.Now()
 	for !process.Status.Started.Released() {
-		if process.tryConnect() {
+		if tryConnect(process.Info.Address) {
 			return nil
 		}
 
@@ -318,9 +329,9 @@ func (process *Process) waitForAddress(maxStartupWait time.Duration) error {
 	return nil
 }
 
-// tryConnect will try to connect to the process public address
-func (process *Process) tryConnect() bool {
-	conn, err := net.Dial("tcp", process.Info.Address)
+// tryConnect will try to connect to the process public address.
+func tryConnect(address string) bool {
+	conn, err := net.Dial("tcp", address)
 	if err != nil {
 		return false
 	}
@@ -331,5 +342,12 @@ func (process *Process) tryConnect() bool {
 	return true
 }
 
-// Close closes process resources
+// Close closes process resources.
 func (process *Process) Close() error { return nil }
+
+func exe(name string) string {
+	if runtime.GOOS == "windows" {
+		return name + ".exe"
+	}
+	return name
+}

@@ -17,8 +17,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/gogo/protobuf/proto"
-	"github.com/skyrings/skyring-common/tools/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -26,7 +24,9 @@ import (
 	"storj.io/common/storj"
 	"storj.io/common/testcontext"
 	"storj.io/common/testrand"
+	"storj.io/common/uuid"
 	"storj.io/storj/satellite/metainfo"
+	"storj.io/storj/satellite/metainfo/metabase"
 	"storj.io/storj/storage"
 	"storj.io/storj/storage/teststore"
 )
@@ -41,21 +41,19 @@ func TestObserver_processSegment(t *testing.T) {
 		ctx := testcontext.New(t)
 		defer ctx.Cleanup()
 
-		obsvr := &observer{
-			objects: make(bucketsObjects),
-		}
+		obsvr := &observer{objects: make(bucketsObjects)}
 
-		testdata1 := generateTestdataObjects(ctx, t, false, false)
+		testdata1 := generateTestdataObjects(ctx, t, false)
 		// Call processSegment with testadata objects of the first project
 		for _, objSeg := range testdata1.objSegments {
-			err := obsvr.processSegment(ctx, objSeg.path, objSeg.pointer)
+			err := obsvr.processSegment(ctx, objSeg)
 			require.NoError(t, err)
 		}
 
-		testdata2 := generateTestdataObjects(ctx, t, false, false)
+		testdata2 := generateTestdataObjects(ctx, t, false)
 		// Call processSegment with testadata objects of the second project
 		for _, objSeg := range testdata2.objSegments {
-			err := obsvr.processSegment(ctx, objSeg.path, objSeg.pointer)
+			err := obsvr.processSegment(ctx, objSeg)
 			require.NoError(t, err)
 		}
 
@@ -65,37 +63,24 @@ func TestObserver_processSegment(t *testing.T) {
 
 		// Assert that objserver keep track global stats of all the segments which
 		// have received through processSegment calls
-		assert.Equal(t,
-			testdata1.expectedInlineSegments+testdata2.expectedInlineSegments,
-			obsvr.inlineSegments,
-			"inlineSegments",
-		)
-		assert.Equal(t,
-			testdata1.expectedInlineSegments+testdata2.expectedInlineSegments,
-			obsvr.lastInlineSegments,
-			"lastInlineSegments",
-		)
-		assert.Equal(t,
-			testdata1.expectedRemoteSegments+testdata2.expectedRemoteSegments,
-			obsvr.remoteSegments,
-			"remoteSegments",
-		)
+		assert.Equal(t, testdata1.expectedInlineSegments+testdata2.expectedInlineSegments,
+			obsvr.inlineSegments, "inlineSegments")
+		assert.Equal(t, testdata1.expectedInlineSegments+testdata2.expectedInlineSegments,
+			obsvr.lastInlineSegments, "lastInlineSegments")
+		assert.Equal(t, testdata1.expectedRemoteSegments+testdata2.expectedRemoteSegments,
+			obsvr.remoteSegments, "remoteSegments")
 	})
 
 	t.Run("object without last segment", func(t *testing.T) {
 		ctx := testcontext.New(t)
 		defer ctx.Cleanup()
 
-		var (
-			testdata = generateTestdataObjects(ctx, t, true, false)
-			obsvr    = &observer{
-				objects: make(bucketsObjects),
-			}
-		)
+		var testdata = generateTestdataObjects(ctx, t, true)
+		var obsvr = &observer{objects: make(bucketsObjects)}
 
 		// Call processSegment with the testdata
 		for _, objSeg := range testdata.objSegments {
-			err := obsvr.processSegment(ctx, objSeg.path, objSeg.pointer)
+			err := obsvr.processSegment(ctx, objSeg)
 			require.NoError(t, err)
 		}
 
@@ -108,101 +93,19 @@ func TestObserver_processSegment(t *testing.T) {
 		assert.Equal(t, testdata.expectedRemoteSegments, obsvr.remoteSegments, "remoteSegments")
 	})
 
-	t.Run("object with 65 segments without expected number of segments", func(t *testing.T) {
+	t.Run("objects in the same project with a random number segments", func(t *testing.T) {
 		ctx := testcontext.New(t)
 		defer ctx.Cleanup()
 
 		var (
-			bucketName  = "test-bucket"
-			projectID   = testrand.UUID()
-			numSegments = 65
-			obsvr       = observer{
-				objects: make(bucketsObjects),
-			}
-			objPath, objSegmentsRefs = createNewObjectSegments(
-				ctx, t, numSegments, &projectID, bucketName, false, false,
-			)
-		)
-
-		for _, objSeg := range objSegmentsRefs {
-			err := obsvr.processSegment(ctx, objSeg.path, objSeg.pointer)
-			require.NoError(t, err)
-		}
-
-		// Assert observer internal state
-		assert.Equal(t, projectID.String(), obsvr.lastProjectID, "lastProjectID")
-		assert.Equal(t, 1, len(obsvr.objects), "objects number")
-		if assert.Contains(t, obsvr.objects, bucketName, "bucket in objects map") {
-			if assert.Equal(t, 1, len(obsvr.objects[bucketName]), "objects in object map") {
-				if assert.Contains(t, obsvr.objects[bucketName], objPath, "path in bucket objects map") {
-					obj := obsvr.objects[bucketName][objPath]
-					assert.Zero(t, obj.expectedNumberOfSegments, "Object.expectedNumSegments")
-					assert.True(t, obj.hasLastSegment, "Object.hasLastSegment")
-					assert.False(t, obj.skip, "Object.skip")
-				}
-			}
-		}
-
-		// Assert observer global stats
-		assert.Zero(t, obsvr.inlineSegments, "inlineSegments")
-		assert.Zero(t, obsvr.lastInlineSegments, "lastInlineSegments")
-		assert.Equal(t, numSegments, obsvr.remoteSegments, "remoteSegments")
-	})
-
-	t.Run("object with 65 segments with expected number of segments", func(t *testing.T) {
-		ctx := testcontext.New(t)
-		defer ctx.Cleanup()
-
-		var (
-			bucketName  = "test-bucket"
-			projectID   = testrand.UUID()
-			numSegments = 65
-			obsvr       = observer{
-				objects: make(bucketsObjects),
-			}
-			objPath, objSegmentsRefs = createNewObjectSegments(
-				ctx, t, numSegments, &projectID, bucketName, false, true,
-			)
-		)
-
-		for _, objSeg := range objSegmentsRefs {
-			err := obsvr.processSegment(ctx, objSeg.path, objSeg.pointer)
-			require.NoError(t, err)
-		}
-
-		// Assert observer internal state
-		assert.Equal(t, projectID.String(), obsvr.lastProjectID, "lastProjectID")
-		assert.Equal(t, 1, len(obsvr.objects), "objects number")
-		if assert.Contains(t, obsvr.objects, bucketName, "bucket in objects map") {
-			if assert.Equal(t, 1, len(obsvr.objects[bucketName]), "objects in object map") {
-				if assert.Contains(t, obsvr.objects[bucketName], objPath, "path in bucket objects map") {
-					obj := obsvr.objects[bucketName][objPath]
-					assert.Equal(t, numSegments, int(obj.expectedNumberOfSegments), "Object.expectedNumSegments")
-					assert.True(t, obj.hasLastSegment, "Object.hasLastSegment")
-					assert.False(t, obj.skip, "Object.skip")
-				}
-			}
-		}
-
-		// Assert observer global stats
-		assert.Zero(t, obsvr.inlineSegments, "inlineSegments")
-		assert.Zero(t, obsvr.lastInlineSegments, "lastInlineSegments")
-		assert.Equal(t, numSegments, obsvr.remoteSegments, "remoteSegments")
-	})
-
-	t.Run("objects with at least one has more than 65 segments", func(t *testing.T) {
-		ctx := testcontext.New(t)
-		defer ctx.Cleanup()
-
-		var (
-			testdata = generateTestdataObjects(ctx, t, false, true)
+			testdata = generateTestdataObjects(ctx, t, false)
 			obsvr    = &observer{
 				objects: make(bucketsObjects),
 			}
 		)
 
 		for _, objSeg := range testdata.objSegments {
-			err := obsvr.processSegment(ctx, objSeg.path, objSeg.pointer)
+			err := obsvr.processSegment(ctx, objSeg)
 			require.NoError(t, err)
 		}
 
@@ -213,44 +116,6 @@ func TestObserver_processSegment(t *testing.T) {
 		assert.Equal(t, testdata.expectedInlineSegments, obsvr.inlineSegments, "inlineSegments")
 		assert.Equal(t, testdata.expectedInlineSegments, obsvr.lastInlineSegments, "lastInlineSegments")
 		assert.Equal(t, testdata.expectedRemoteSegments, obsvr.remoteSegments, "remoteSegments")
-	})
-
-	t.Run("object with one segment before from", func(t *testing.T) {
-		ctx := testcontext.New(t)
-		defer ctx.Cleanup()
-
-		var (
-			to         = time.Now()
-			from       = to.Add(-time.Hour)
-			bucketName = "test-bucket"
-			projectID  = testrand.UUID()
-			obsvr      = observer{
-				objects: make(bucketsObjects),
-				from:    &from,
-				to:      &to,
-			}
-			objPath, objSegmentsRefs = createNewObjectSegments(ctx, t, 1, &projectID, bucketName, false, true)
-		)
-
-		objSegmentsRefs[0].pointer.CreationDate = from.Add(-time.Second)
-		err := obsvr.processSegment(ctx, objSegmentsRefs[0].path, objSegmentsRefs[0].pointer)
-		require.NoError(t, err)
-
-		// Assert observer internal state
-		assert.Equal(t, projectID.String(), obsvr.lastProjectID, "lastProjectID")
-		assert.Equal(t, 1, len(obsvr.objects), "objects number")
-		require.Contains(t, obsvr.objects, bucketName, "bucket in objects map")
-		require.Equal(t, 1, len(obsvr.objects[bucketName]), "objects in object map")
-		require.Contains(t, obsvr.objects[bucketName], objPath, "path in bucket objects map")
-		obj := obsvr.objects[bucketName][objPath]
-		assert.Equal(t, 1, int(obj.expectedNumberOfSegments), "Object.expectedNumSegments")
-		assert.True(t, obj.hasLastSegment, "Object.hasLastSegment")
-		assert.True(t, obj.skip, "Object.skip")
-
-		// Assert observer global stats
-		assert.Zero(t, obsvr.inlineSegments, "inlineSegments")
-		assert.Zero(t, obsvr.lastInlineSegments, "lastInlineSegments")
-		assert.Equal(t, 1, obsvr.remoteSegments, "remoteSegments")
 	})
 
 	t.Run("objects where one has segments before from", func(t *testing.T) {
@@ -281,19 +146,19 @@ func TestObserver_processSegment(t *testing.T) {
 				// Assign a creation date before the from
 				decrement := -time.Duration(rand.Int63n(math.MaxInt64-1) + 1)
 				creationDate := from.Add(decrement)
-				objSegmentsRefs[i].pointer.CreationDate = creationDate
+				objSegmentsRefs[i].CreationDate = creationDate
 				continue
 			}
 
 			// Assign a creation date between from and to (both included)
 			increment := time.Duration(rand.Int63n(int64(diffFromTo) + 1))
-			objSegmentsRefs[i].pointer.CreationDate = from.Add(increment)
+			objSegmentsRefs[i].CreationDate = from.Add(increment)
 		}
 
 		numSegmentsObjInDateRange := rand.Intn(50) + 15
-		var pathObjInDateRange storj.Path
+		var pathObjInDateRange metabase.ObjectKey
 		{ // Object with all the segments with creation date between the from/to range
-			var otherObjSegments []segmentRef
+			var otherObjSegments []*metainfo.Segment
 			pathObjInDateRange, otherObjSegments = createNewObjectSegments(
 				ctx, t, numSegmentsObjInDateRange, &projectID, bucketName, true, false,
 			)
@@ -307,12 +172,12 @@ func TestObserver_processSegment(t *testing.T) {
 		})
 
 		for _, objSeg := range objSegmentsRefs {
-			err := obsvr.processSegment(ctx, objSeg.path, objSeg.pointer)
+			err := obsvr.processSegment(ctx, objSeg)
 			require.NoError(t, err)
 		}
 
 		// Assert observer internal state
-		assert.Equal(t, projectID.String(), obsvr.lastProjectID, "lastProjectID")
+		assert.Equal(t, projectID, obsvr.lastProjectID, "lastProjectID")
 		assert.Equal(t, 1, len(obsvr.objects), "objects number")
 		require.Contains(t, obsvr.objects, bucketName, "bucket in objects map")
 		require.Equal(t, 2, len(obsvr.objects[bucketName]), "objects in object map")
@@ -332,44 +197,6 @@ func TestObserver_processSegment(t *testing.T) {
 		assert.Equal(t, 2, obsvr.inlineSegments, "inlineSegments")
 		assert.Equal(t, 2, obsvr.lastInlineSegments, "lastInlineSegments")
 		assert.Equal(t, totalSegments-2, obsvr.remoteSegments, "remoteSegments")
-	})
-
-	t.Run("object with one segment after to", func(t *testing.T) {
-		ctx := testcontext.New(t)
-		defer ctx.Cleanup()
-
-		var (
-			to         = time.Now()
-			from       = to.Add(-time.Hour)
-			bucketName = "test-bucket"
-			projectID  = testrand.UUID()
-			obsvr      = observer{
-				objects: make(bucketsObjects),
-				from:    &from,
-				to:      &to,
-			}
-			objPath, objSegmentsRefs = createNewObjectSegments(ctx, t, 1, &projectID, bucketName, false, true)
-		)
-
-		objSegmentsRefs[0].pointer.CreationDate = to.Add(time.Second)
-		err := obsvr.processSegment(ctx, objSegmentsRefs[0].path, objSegmentsRefs[0].pointer)
-		require.NoError(t, err)
-
-		// Assert observer internal state
-		assert.Equal(t, projectID.String(), obsvr.lastProjectID, "lastProjectID")
-		assert.Equal(t, 1, len(obsvr.objects), "objects number")
-		require.Contains(t, obsvr.objects, bucketName, "bucket in objects map")
-		require.Equal(t, 1, len(obsvr.objects[bucketName]), "objects in object map")
-		require.Contains(t, obsvr.objects[bucketName], objPath, "path in bucket objects map")
-		obj := obsvr.objects[bucketName][objPath]
-		assert.Equal(t, 1, int(obj.expectedNumberOfSegments), "Object.expectedNumSegments")
-		assert.True(t, obj.hasLastSegment, "Object.hasLastSegment")
-		assert.True(t, obj.skip, "Object.skip")
-
-		// Assert observer global stats
-		assert.Zero(t, obsvr.inlineSegments, "inlineSegments")
-		assert.Zero(t, obsvr.lastInlineSegments, "lastInlineSegments")
-		assert.Equal(t, 1, obsvr.remoteSegments, "remoteSegments")
 	})
 
 	t.Run("objects where one has segments after to", func(t *testing.T) {
@@ -400,19 +227,19 @@ func TestObserver_processSegment(t *testing.T) {
 				// Assign a creation date after the to
 				increment := time.Duration(rand.Int63n(math.MaxInt64-1) + 1)
 				creationDate := to.Add(increment)
-				objSegmentsRefs[i].pointer.CreationDate = creationDate
+				objSegmentsRefs[i].CreationDate = creationDate
 				continue
 			}
 
 			// Assign a creation date between from and to (both included)
 			increment := time.Duration(rand.Int63n(int64(diffFromTo) + 1))
-			objSegmentsRefs[i].pointer.CreationDate = from.Add(increment)
+			objSegmentsRefs[i].CreationDate = from.Add(increment)
 		}
 
 		numSegmentsObjInDateRange := rand.Intn(50) + 15
-		var pathObjInDateRange storj.Path
+		var pathObjInDateRange metabase.ObjectKey
 		{ // Object with all the segments with creation date between the from/to range
-			var otherObjSegments []segmentRef
+			var otherObjSegments []*metainfo.Segment
 			pathObjInDateRange, otherObjSegments = createNewObjectSegments(
 				ctx, t, numSegmentsObjInDateRange, &projectID, bucketName, false, true,
 			)
@@ -426,24 +253,24 @@ func TestObserver_processSegment(t *testing.T) {
 		})
 
 		for _, objSeg := range objSegmentsRefs {
-			err := obsvr.processSegment(ctx, objSeg.path, objSeg.pointer)
+			err := obsvr.processSegment(ctx, objSeg)
 			require.NoError(t, err)
 		}
 
 		// Assert observer internal state
-		assert.Equal(t, projectID.String(), obsvr.lastProjectID, "lastProjectID")
+		assert.Equal(t, projectID, obsvr.lastProjectID, "lastProjectID")
 		assert.Equal(t, 1, len(obsvr.objects), "objects number")
 		require.Contains(t, obsvr.objects, bucketName, "bucket in objects map")
 		require.Equal(t, 2, len(obsvr.objects[bucketName]), "objects in object map")
 		require.Contains(t, obsvr.objects[bucketName], pathObjOutDateRange, "path in bucket objects map")
 		obj := obsvr.objects[bucketName][pathObjOutDateRange]
-		assert.Equal(t, numSegmentsObjOutDateRange, int(obj.expectedNumberOfSegments), "Object.expectedNumSegments")
+		assert.Equal(t, numSegmentsObjOutDateRange, obj.expectedNumberOfSegments, "Object.expectedNumSegments")
 		assert.True(t, obj.hasLastSegment, "Object.hasLastSegment")
 		assert.True(t, obj.skip, "Object.skip")
 
 		require.Contains(t, obsvr.objects[bucketName], pathObjInDateRange, "path in bucket objects map")
 		obj = obsvr.objects[bucketName][pathObjInDateRange]
-		assert.Equal(t, numSegmentsObjInDateRange, int(obj.expectedNumberOfSegments), "Object.expectedNumSegments")
+		assert.Equal(t, numSegmentsObjInDateRange, obj.expectedNumberOfSegments, "Object.expectedNumSegments")
 		assert.True(t, obj.hasLastSegment, "Object.hasLastSegment")
 		assert.False(t, obj.skip, "Object.skip")
 
@@ -498,16 +325,16 @@ func TestObserver_processSegment_from_to(t *testing.T) {
 			from:    from,
 			to:      to,
 		}
-		path := metainfo.ScopedPath{
-			ProjectID:           testrand.UUID(),
-			Segment:             "l",
-			BucketName:          "bucket1",
-			EncryptedObjectPath: "path1",
-		}
-		pointer := &pb.Pointer{
+		objSeg := metainfo.Segment{
+			Location: metabase.SegmentLocation{
+				ProjectID:  testrand.UUID(),
+				BucketName: "bucket1",
+				Index:      metabase.LastSegmentIndex,
+				ObjectKey:  metabase.ObjectKey("path1"),
+			},
 			CreationDate: tt.pointerCreateDate,
 		}
-		err := observer.processSegment(ctx, path, pointer)
+		err := observer.processSegment(ctx, &objSeg)
 		require.NoError(t, err)
 
 		objectsMap, ok := observer.objects["bucket1"]
@@ -610,10 +437,10 @@ func TestObserver_processSegment_single_project(t *testing.T) {
 						streamMeta.NumberOfSegments = int64(ttObject.numberOfSegments)
 					}
 					path := storj.JoinPaths(project1, segmentIndex, ttObject.bucket, "path"+strconv.Itoa(i))
-					metadata, err := proto.Marshal(streamMeta)
+					metadata, err := pb.Marshal(streamMeta)
 					require.NoError(t, err)
 
-					pointerBytes, err := proto.Marshal(&pb.Pointer{
+					pointerBytes, err := pb.Marshal(&pb.Pointer{
 						Metadata: metadata,
 					})
 					require.NoError(t, err)
@@ -634,15 +461,15 @@ func TestObserver_processSegment_single_project(t *testing.T) {
 				objectsMap, ok := observer.objects[ttObject.bucket]
 				require.True(t, ok)
 
-				object, ok := objectsMap["path"+strconv.Itoa(i)]
+				object, ok := objectsMap[metabase.ObjectKey("path"+strconv.Itoa(i))]
 				require.True(t, ok)
 
 				expectedParts := strings.Split(ttObject.expected, "_")
 				expectedNumberOfSegments, err := strconv.Atoi(expectedParts[0])
 				require.NoError(t, err)
-				assert.Equal(t, expectedNumberOfSegments, int(object.expectedNumberOfSegments))
+				assert.Equal(t, expectedNumberOfSegments, object.expectedNumberOfSegments)
 
-				expectedSegments := bitmask(0)
+				expectedSegments := bitArray{}
 				for i, char := range expectedParts[1] {
 					if char == '_' {
 						break
@@ -661,7 +488,7 @@ func TestObserver_processSegment_single_project(t *testing.T) {
 	}
 }
 
-func TestObserver_analyzeProject(t *testing.T) {
+func TestObserver_findZombieSegments(t *testing.T) {
 	ctx := testcontext.New(t)
 	defer ctx.Cleanup()
 
@@ -669,7 +496,7 @@ func TestObserver_analyzeProject(t *testing.T) {
 
 	tests := []struct {
 		segments                 string
-		expectedNumberOfSegments byte
+		expectedNumberOfSegments int
 		segmentsAfter            string
 	}{
 		// this visualize which segments will be NOT selected as zombie segments
@@ -703,8 +530,8 @@ func TestObserver_analyzeProject(t *testing.T) {
 		tt := tt
 		t.Run("case_"+strconv.Itoa(testNum), func(t *testing.T) {
 			bucketObjects := make(bucketsObjects)
-			singleObjectMap := make(map[storj.Path]*object)
-			segments := bitmask(0)
+			singleObjectMap := make(map[metabase.ObjectKey]*object)
+			segments := bitArray{}
 			for i, char := range tt.segments {
 				if char == '_' {
 					break
@@ -725,8 +552,8 @@ func TestObserver_analyzeProject(t *testing.T) {
 
 			observer := &observer{
 				objects:       bucketObjects,
-				lastProjectID: testrand.UUID().String(),
-				zombieBuffer:  make([]int, 0, maxNumOfSegments),
+				lastProjectID: testrand.UUID(),
+				zombieBuffer:  make([]int, 0),
 			}
 			err := observer.findZombieSegments(object)
 			require.NoError(t, err)
@@ -746,13 +573,6 @@ func TestObserver_analyzeProject(t *testing.T) {
 	}
 }
 
-// segmentRef is an object segment reference to be used for simulating calls to
-// observer.processSegment
-type segmentRef struct {
-	path    metainfo.ScopedPath
-	pointer *pb.Pointer
-}
-
 // createNewObjectSegments creates a list of segment references which belongs to
 // a same object.
 //
@@ -764,71 +584,44 @@ type segmentRef struct {
 // It returns the object path and the list of object segment references.
 func createNewObjectSegments(
 	ctx context.Context, t *testing.T, numSegments int, projectID *uuid.UUID, bucketName string, inline bool, withNumSegments bool,
-) (objectPath string, _ []segmentRef) {
+) (objectKey metabase.ObjectKey, _ []*metainfo.Segment) {
 	t.Helper()
 
 	var (
-		objectID        = testrand.UUID().String()
-		projectIDString = projectID.String()
-		references      = make([]segmentRef, 0, numSegments)
-		encryptedPath   = fmt.Sprintf("%s-%s-%s", projectIDString, bucketName, objectID)
+		objectID   = metabase.ObjectKey(testrand.UUID().String())
+		references = make([]*metainfo.Segment, 0, numSegments)
 	)
 
 	for i := 0; i < (numSegments - 1); i++ {
-		raw, err := metainfo.CreatePath(ctx, *projectID, int64(i), []byte(bucketName), []byte(objectID))
-		require.NoError(t, err)
-
-		references = append(references, segmentRef{
-			path: metainfo.ScopedPath{
-				ProjectID:           *projectID,
-				ProjectIDString:     projectIDString,
-				BucketName:          bucketName,
-				Segment:             fmt.Sprintf("s%d", i),
-				EncryptedObjectPath: encryptedPath,
-				Raw:                 raw,
+		references = append(references, &metainfo.Segment{
+			Location: metabase.SegmentLocation{
+				ProjectID:  *projectID,
+				BucketName: bucketName,
+				Index:      int64(i),
+				ObjectKey:  objectID,
 			},
-			pointer: &pb.Pointer{
-				Type:         pb.Pointer_REMOTE,
-				CreationDate: time.Now(),
-			},
+			CreationDate: time.Now(),
 		})
 	}
 
-	pointerType := pb.Pointer_REMOTE
-	if inline {
-		pointerType = pb.Pointer_INLINE
-	}
-
-	var pointerNumSegments int64
+	var pointerNumSegments int
 	if withNumSegments {
-		pointerNumSegments = int64(numSegments)
+		pointerNumSegments = numSegments
 	}
 
-	metadata, err := proto.Marshal(&pb.StreamMeta{
-		NumberOfSegments: pointerNumSegments,
-	})
-	require.NoError(t, err)
-
-	raw, err := metainfo.CreatePath(ctx, *projectID, -1, []byte(bucketName), []byte(objectID))
-	require.NoError(t, err)
-
-	references = append(references, segmentRef{
-		path: metainfo.ScopedPath{
-			ProjectID:           *projectID,
-			ProjectIDString:     projectIDString,
-			BucketName:          bucketName,
-			Segment:             "l",
-			EncryptedObjectPath: encryptedPath,
-			Raw:                 raw,
+	references = append(references, &metainfo.Segment{
+		Location: metabase.SegmentLocation{
+			ProjectID:  *projectID,
+			BucketName: bucketName,
+			Index:      metabase.LastSegmentIndex,
+			ObjectKey:  objectID,
 		},
-		pointer: &pb.Pointer{
-			Type:         pointerType,
-			Metadata:     metadata,
-			CreationDate: time.Now(),
-		},
+		Inline:                   inline,
+		MetadataNumberOfSegments: pointerNumSegments,
+		CreationDate:             time.Now(),
 	})
 
-	return encryptedPath, references
+	return objectID, references
 }
 
 type testdataObjects struct {
@@ -839,7 +632,7 @@ type testdataObjects struct {
 	expectedObjects        bucketsObjects
 
 	// data used for calling processSegment
-	objSegments []segmentRef
+	objSegments []*metainfo.Segment
 	projectID   *uuid.UUID
 }
 
@@ -849,30 +642,19 @@ type testdataObjects struct {
 //
 // When withoutLastSegment is true, there will be objects without last segment,
 // otherwise all of them will have a last segment.
-//
-// When withMoreThanMaxNumSegments is true, there will be objects with more
-// segments than the maxNumOfSegments, otherwise all of them will have less or
-// equal than it.
 func generateTestdataObjects(
-	ctx context.Context, t *testing.T, withoutLastSegment bool, withMoreThanMaxNumSegments bool,
-) testdataObjects {
+	ctx context.Context, t *testing.T, withoutLastSegment bool) testdataObjects {
 	t.Helper()
 
 	var (
 		testdata = testdataObjects{
 			expectedObjects: make(bucketsObjects),
 		}
-		bucketName                      = "0"
-		numObjs                         = rand.Intn(10) + 2
-		projID                          = testrand.UUID()
-		withoutLastSegmentCount         = 0
-		withMoreThanMaxNumSegmentsCount = 0
-		numMaxGeneratedSegments         = 10
+		bucketName              = "0"
+		numObjs                 = rand.Intn(10) + 2
+		projID                  = testrand.UUID()
+		withoutLastSegmentCount = 0
 	)
-
-	if withMoreThanMaxNumSegments {
-		numMaxGeneratedSegments = 100
-	}
 
 	testdata.projectID = &projID
 
@@ -880,23 +662,8 @@ func generateTestdataObjects(
 		var (
 			inline          = (rand.Int() % 2) == 0
 			withNumSegments = (rand.Int() % 2) == 0
-			numSegments     = rand.Intn(numMaxGeneratedSegments) + 2
+			numSegments     = rand.Intn(1000) + 2
 		)
-
-		if numSegments > (maxNumOfSegments + 1) {
-			withMoreThanMaxNumSegmentsCount++
-		}
-
-		// If withMoreThanMaxNumSegments is true and all the objects created in all
-		// the previous iterations have less or equal than maximum number of segments
-		// and this is the last iteration then force that the object crated in this
-		// iteration has more segments than the maximum.
-		if withMoreThanMaxNumSegments &&
-			withMoreThanMaxNumSegmentsCount == 0 &&
-			i == (numObjs-1) {
-			numSegments += maxNumOfSegments
-			withMoreThanMaxNumSegmentsCount++
-		}
 
 		if rand.Int()%2 == 0 {
 			bucketName = fmt.Sprintf("bucket-%d", i)
@@ -908,15 +675,13 @@ func generateTestdataObjects(
 
 		expectedObj := findOrCreate(bucketName, objPath, testdata.expectedObjects)
 
-		// only create segments mask if the number of segments is less or equal than
-		// maxNumOfSegments + 1 because the last segment isn't in the bitmask
-		if numSegments <= (maxNumOfSegments + 1) {
-			// segments mask doesn't contain the last segment, hence we move 1 bit more
-			expectedObj.segments = math.MaxUint64 >> (maxNumOfSegments - numSegments + 1)
-			expectedObj.skip = false
-		} else {
-			expectedObj.skip = true
+		// segments mask doesn't contain the last segment, hence numSegments-1
+		b := make([]byte, ((numSegments-1)+8-1)/8)
+		for x := 0; x < numSegments-1; x++ {
+			bitIndex, byteIndex := x%8, x/8
+			b[byteIndex] |= byte(1) << bitIndex
 		}
+		expectedObj.segments = bitArray(b)
 
 		// If withoutLastSegment is true, then choose random objects without last
 		// segment or	force to remove it from the object generated in the last
@@ -940,7 +705,7 @@ func generateTestdataObjects(
 			}
 
 			if withNumSegments {
-				expectedObj.expectedNumberOfSegments = byte(numSegments)
+				expectedObj.expectedNumberOfSegments = numSegments
 			}
 		}
 
@@ -959,7 +724,7 @@ func generateTestdataObjects(
 func assertObserver(t *testing.T, obsvr *observer, testdata testdataObjects) {
 	t.Helper()
 
-	assert.Equal(t, testdata.projectID.String(), obsvr.lastProjectID, "lastProjectID")
+	assert.Equal(t, *testdata.projectID, obsvr.lastProjectID, "lastProjectID")
 	if assert.Equal(t, len(testdata.expectedObjects), len(obsvr.objects), "objects number") {
 		for bucket, bucketObjs := range obsvr.objects {
 			expBucketObjs, ok := testdata.expectedObjects[bucket]

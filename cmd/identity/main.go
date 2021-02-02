@@ -20,11 +20,12 @@ import (
 	"storj.io/common/peertls/tlsopts"
 	"storj.io/common/pkcrypto"
 	"storj.io/common/rpc"
+	"storj.io/private/cfgstruct"
+	"storj.io/private/process"
+	"storj.io/private/version"
 	"storj.io/storj/certificate/certificateclient"
-	"storj.io/storj/pkg/cfgstruct"
-	"storj.io/storj/pkg/process"
 	"storj.io/storj/pkg/revocation"
-	"storj.io/storj/private/version"
+	_ "storj.io/storj/private/version" // This attaches version information during release builds.
 	"storj.io/storj/private/version/checker"
 )
 
@@ -54,7 +55,6 @@ var (
 		Annotations: map[string]string{"type": "setup"},
 	}
 
-	//nolint
 	config struct {
 		Difficulty     uint64 `default:"36" help:"minimum difficulty for identity generation"`
 		Concurrency    uint   `default:"4" help:"number of concurrent workers for certificate authority generation"`
@@ -145,7 +145,7 @@ func cmdNewService(cmd *cobra.Command, args []string) error {
 	}
 
 	fmt.Printf("Unsigned identity is located in %q\n", serviceDir)
-	fmt.Println("Please *move* CA key to secure storage - it is only needed for identity management!")
+	fmt.Println("Please *move* CA key to secure storage - it is only needed for identity management and isn't needed to run a storage node!")
 	fmt.Printf("\t%s\n", caConfig.KeyPath)
 	return nil
 }
@@ -189,7 +189,7 @@ func cmdAuthorize(cmd *cobra.Command, args []string) (err error) {
 	// Ensure we dont enforce a signed Peer Identity
 	config.Signer.TLS.UsePeerCAWhitelist = false
 
-	revocationDB, err := revocation.NewDBFromCfg(config.Signer.TLS)
+	revocationDB, err := revocation.OpenDBFromCfg(ctx, config.Signer.TLS)
 	if err != nil {
 		return errs.New("error creating revocation database: %+v", err)
 	}

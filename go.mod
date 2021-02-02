@@ -2,55 +2,38 @@ module storj.io/storj
 
 go 1.13
 
-// force specific versions for minio
 require (
-	github.com/btcsuite/btcutil v0.0.0-20180706230648-ab6388e0c60a
-	github.com/garyburd/redigo v1.0.1-0.20170216214944-0d253a66e6e1 // indirect
-	github.com/graphql-go/graphql v0.7.9-0.20190403165646-199d20bbfed7
-	github.com/minio/minio v0.0.0-20180508161510-54cd29b51c38
-	github.com/segmentio/go-prompt v1.2.1-0.20161017233205-f0d19b6901ad
-)
-
-exclude gopkg.in/olivere/elastic.v5 v5.0.72 // buggy import, see https://github.com/olivere/elastic/pull/869
-
-replace google.golang.org/grpc => github.com/storj/grpc-go v1.23.1-0.20190918084400-1c4561bf5127
-
-require (
-	github.com/Shopify/go-lua v0.0.0-20181106184032-48449c60c0a9
-	github.com/alessio/shellescape v0.0.0-20190409004728-b115ca0f9053
-	github.com/alicebob/miniredis/v2 v2.11.1
-	github.com/armon/go-metrics v0.0.0-20180917152333-f0300d1749da // indirect
-	github.com/blang/semver v3.5.1+incompatible
-	github.com/boltdb/bolt v1.3.1
-	github.com/cheggaaa/pb v1.0.5-0.20160713104425-73ae1d68fe0b // indirect
-	github.com/cheggaaa/pb/v3 v3.0.1
-	github.com/djherbis/atime v1.0.0 // indirect
-	github.com/dustin/go-humanize v1.0.0 // indirect
-	github.com/eclipse/paho.mqtt.golang v1.1.1 // indirect
-	github.com/elazarl/go-bindata-assetfs v1.0.0 // indirect
-	github.com/fatih/color v1.7.0
-	github.com/fatih/structs v1.0.0 // indirect
-	github.com/go-ini/ini v1.38.2 // indirect
-	github.com/go-redis/redis v6.14.1+incompatible
-	github.com/gogo/protobuf v1.2.1
+	github.com/alessio/shellescape v1.2.2
+	github.com/alicebob/miniredis/v2 v2.13.3
+	github.com/btcsuite/btcutil v1.0.3-0.20201208143702-a53e38424cce
+	github.com/calebcase/tmpfile v1.0.2
+	github.com/cheggaaa/pb/v3 v3.0.5
+	github.com/fatih/color v1.9.0
+	github.com/go-redis/redis v6.15.9+incompatible
+	github.com/gogo/protobuf v1.3.2
 	github.com/golang-migrate/migrate/v4 v4.7.0
-	github.com/golang/protobuf v1.3.2
-	github.com/gomodule/redigo v2.0.0+incompatible // indirect
-	github.com/google/go-cmp v0.3.0
-	github.com/gopherjs/gopherjs v0.0.0-20181103185306-d547d1d9531e // indirect
-	github.com/gorilla/handlers v1.4.0 // indirect
-	github.com/gorilla/mux v1.7.1
-	github.com/gorilla/rpc v1.1.0 // indirect
-	github.com/gorilla/schema v1.1.0
-	github.com/hashicorp/go-immutable-radix v1.0.0 // indirect
-	github.com/hashicorp/go-msgpack v0.5.3 // indirect
-	github.com/hashicorp/raft v1.0.0 // indirect
-	github.com/howeyc/gopass v0.0.0-20170109162249-bf9dde6d0d2c // indirect
-	github.com/inconshreveable/go-update v0.0.0-20160112193335-8152e7eb6ccf // indirect
-	github.com/jackc/pgx v3.2.0+incompatible
-	github.com/jtolds/gls v4.2.1+incompatible // indirect
-	github.com/jtolds/go-luar v0.0.0-20170419063437-0786921db8c0
+	github.com/google/go-cmp v0.5.2
+	github.com/google/pprof v0.0.0-20200229191704-1ebb73c60ed3 // indirect
+	github.com/gorilla/mux v1.8.0
+	github.com/gorilla/schema v1.2.0
+	github.com/graphql-go/graphql v0.7.9
+	github.com/jackc/pgconn v1.8.0
+	github.com/jackc/pgtype v1.6.2
+	github.com/jackc/pgx/v4 v4.10.1
 	github.com/jtolds/monkit-hw/v2 v2.0.0-20191108235325-141a0da276b3
+	github.com/lucas-clemente/quic-go v0.7.1-0.20210131023823-622ca23d4eb4
+	github.com/mattn/go-sqlite3 v2.0.3+incompatible
+	github.com/nsf/jsondiff v0.0.0-20200515183724-f29ed568f4ce
+	github.com/nsf/termbox-go v0.0.0-20200418040025-38ba6e5628f1
+	github.com/shopspring/decimal v1.2.0
+	github.com/spacemonkeygo/monkit/v3 v3.0.7
+	github.com/spf13/cobra v1.0.0
+	github.com/spf13/pflag v1.0.5
+	github.com/spf13/viper v1.7.1
+	github.com/stretchr/testify v1.6.1
+	github.com/stripe/stripe-go v70.15.0+incompatible
+	github.com/vivint/infectious v0.0.0-20200605153912-25a574ae18a3
+	github.com/zeebo/assert v1.1.0
 	github.com/jtolds/tracetagger/v2 v2.0.0-rc2
 	github.com/klauspost/cpuid v0.0.0-20180405133222-e7e905edc00e // indirect
 	github.com/klauspost/reedsolomon v0.0.0-20180704173009-925cb01d6510 // indirect
@@ -95,20 +78,18 @@ require (
 	github.com/vivint/infectious v0.0.0-20190108171102-2455b059135b
 	github.com/zeebo/admission/v2 v2.0.0
 	github.com/zeebo/errs v1.2.2
-	github.com/zeebo/structs v1.0.2
-	go.uber.org/zap v1.10.0
-	golang.org/x/crypto v0.0.0-20191227163750-53104e6ec876
-	golang.org/x/sync v0.0.0-20190911185100-cd5d95a43a6e
-	golang.org/x/sys v0.0.0-20200107144601-ef85f5a75ddf
-	golang.org/x/time v0.0.0-20191024005414-555d28b269f0
-	google.golang.org/appengine v1.6.0 // indirect
-	google.golang.org/grpc v1.23.1
-	gopkg.in/Shopify/sarama.v1 v1.18.0 // indirect
-	gopkg.in/cheggaaa/pb.v1 v1.0.25 // indirect
-	gopkg.in/ini.v1 v1.38.2 // indirect
-	gopkg.in/olivere/elastic.v5 v5.0.76 // indirect
-	gopkg.in/yaml.v2 v2.2.4
-	storj.io/common v0.0.0-20200130005211-04afbf4cd6a5
-	storj.io/drpc v0.0.8
-	storj.io/uplink v0.0.0-20200131143957-f3b6350b4add
+	go.etcd.io/bbolt v1.3.5
+	go.uber.org/zap v1.16.0
+	golang.org/x/crypto v0.0.0-20201221181555-eec23a3978ad
+	golang.org/x/sync v0.0.0-20201207232520-09787c993a3a
+	golang.org/x/sys v0.0.0-20210124154548-22da62e12c0c
+	golang.org/x/term v0.0.0-20201117132131-f5c789dd3221
+	golang.org/x/time v0.0.0-20200630173020-3af7569d3a1e
+	google.golang.org/api v0.20.0 // indirect
+	google.golang.org/protobuf v1.25.0 // indirect
+	storj.io/common v0.0.0-20210217105242-970e119468ed
+	storj.io/drpc v0.0.16
+	storj.io/monkit-jaeger v0.0.0-20210205021559-85f08034688c
+	storj.io/private v0.0.0-20210203200143-9d2ec06f0d3c
+	storj.io/uplink v1.4.6-0.20210212112107-f7f8a3c8321a
 )

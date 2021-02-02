@@ -12,6 +12,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"runtime/pprof"
 	"sync"
 	"time"
 
@@ -21,29 +22,30 @@ import (
 
 	"storj.io/common/identity"
 	"storj.io/common/identity/testidentity"
+	"storj.io/common/pb"
 	"storj.io/common/storj"
-	"storj.io/storj/pkg/server"
 	"storj.io/storj/private/dbutil/pgutil"
 	"storj.io/storj/satellite/overlay"
 	"storj.io/storj/satellite/satellitedb/satellitedbtest"
-	"storj.io/storj/storagenode"
 	"storj.io/storj/versioncontrol"
 )
 
 const defaultInterval = 15 * time.Second
 
-// Peer represents one of StorageNode or Satellite
+// Peer represents one of StorageNode or Satellite.
 type Peer interface {
+	Label() string
+
 	ID() storj.NodeID
 	Addr() string
-	URL() storj.NodeURL
-	Local() overlay.NodeDossier
+	URL() string
+	NodeURL() storj.NodeURL
 
 	Run(context.Context) error
 	Close() error
 }
 
-// Config describes planet configuration
+// Config describes planet configuration.
 type Config struct {
 	SatelliteCount   int
 	StorageNodeCount int
@@ -52,7 +54,14 @@ type Config struct {
 	IdentityVersion *storj.IDVersion
 	Reconfigure     Reconfigure
 
-	Name string
+	Name        string
+	NonParallel bool
+}
+
+// DatabaseConfig defines connection strings for database.
+type DatabaseConfig struct {
+	SatelliteDB        string
+	SatellitePointerDB string
 }
 
 // Planet is a full storj system setup.
@@ -70,11 +79,9 @@ type Planet struct {
 	uplinks   []*Uplink
 
 	VersionControl *versioncontrol.Peer
-	Satellites     []*SatelliteSystem
-	StorageNodes   []*storagenode.Peer
+	Satellites     []*Satellite
+	StorageNodes   []*StorageNode
 	Uplinks        []*Uplink
-
-	ReferralManager *server.Server
 
 	identities    *testidentity.Identities
 	whitelistPath string // TODO: in-memory
@@ -86,39 +93,35 @@ type Planet struct {
 type closablePeer struct {
 	peer Peer
 
-	ctx    context.Context
-	cancel func()
+	ctx         context.Context
+	cancel      func()
+	runFinished chan struct{} // it is closed after peer.Run returns
 
-	close  sync.Once
-	closed chan error
-	err    error
+	close sync.Once
+	err   error
 }
 
 func newClosablePeer(peer Peer) closablePeer {
 	return closablePeer{
-		peer:   peer,
-		closed: make(chan error, 1),
+		peer:        peer,
+		runFinished: make(chan struct{}),
 	}
 }
 
 // Close closes safely the peer.
 func (peer *closablePeer) Close() error {
 	peer.cancel()
+
 	peer.close.Do(func() {
+		<-peer.runFinished // wait for Run to complete
 		peer.err = peer.peer.Close()
-		<-peer.closed
 	})
 
 	return peer.err
 }
 
 // NewCustom creates a new full system with the specified configuration.
-func NewCustom(log *zap.Logger, config Config) (*Planet, error) {
-	// Clear error in the beginning to avoid issues down the line.
-	if err := satellitedbtest.PostgresDefined(); err != nil {
-		return nil, err
-	}
-
+func NewCustom(ctx context.Context, log *zap.Logger, config Config, satelliteDatabases satellitedbtest.SatelliteDatabases) (*Planet, error) {
 	if config.IdentityVersion == nil {
 		version := storj.LatestIDVersion()
 		config.IdentityVersion = &version
@@ -153,27 +156,22 @@ func NewCustom(log *zap.Logger, config Config) (*Planet, error) {
 		return nil, errs.Combine(err, planet.Shutdown())
 	}
 
-	planet.ReferralManager, err = planet.newReferralManager()
-	if err != nil {
-		return nil, errs.Combine(err, planet.Shutdown())
-	}
-
-	planet.Satellites, err = planet.newSatellites(config.SatelliteCount)
+	planet.Satellites, err = planet.newSatellites(ctx, config.SatelliteCount, satelliteDatabases)
 	if err != nil {
 		return nil, errs.Combine(err, planet.Shutdown())
 	}
 
 	whitelistedSatellites := make(storj.NodeURLs, 0, len(planet.Satellites))
 	for _, satellite := range planet.Satellites {
-		whitelistedSatellites = append(whitelistedSatellites, satellite.URL())
+		whitelistedSatellites = append(whitelistedSatellites, satellite.NodeURL())
 	}
 
-	planet.StorageNodes, err = planet.newStorageNodes(config.StorageNodeCount, whitelistedSatellites)
+	planet.StorageNodes, err = planet.newStorageNodes(ctx, config.StorageNodeCount, whitelistedSatellites)
 	if err != nil {
 		return nil, errs.Combine(err, planet.Shutdown())
 	}
 
-	planet.Uplinks, err = planet.newUplinks("uplink", config.UplinkCount, config.StorageNodeCount)
+	planet.Uplinks, err = planet.newUplinks(ctx, "uplink", config.UplinkCount)
 	if err != nil {
 		return nil, errs.Combine(err, planet.Shutdown())
 	}
@@ -186,35 +184,34 @@ func (planet *Planet) Start(ctx context.Context) {
 	ctx, cancel := context.WithCancel(ctx)
 	planet.cancel = cancel
 
-	planet.run.Go(func() error {
-		return planet.VersionControl.Run(ctx)
-	})
-
-	if planet.ReferralManager != nil {
+	pprof.Do(ctx, pprof.Labels("peer", "version-control"), func(ctx context.Context) {
 		planet.run.Go(func() error {
-			return planet.ReferralManager.Run(ctx)
+			return planet.VersionControl.Run(ctx)
 		})
-	}
+	})
 
 	for i := range planet.peers {
 		peer := &planet.peers[i]
 		peer.ctx, peer.cancel = context.WithCancel(ctx)
-		planet.run.Go(func() error {
-			err := peer.peer.Run(peer.ctx)
-			peer.closed <- err
-			close(peer.closed)
+		pprof.Do(peer.ctx, pprof.Labels("peer", peer.peer.Label()), func(ctx context.Context) {
+			planet.run.Go(func() error {
+				defer close(peer.runFinished)
 
-			return err
+				err := peer.peer.Run(ctx)
+				return err
+			})
 		})
 	}
 
 	var group errgroup.Group
 	for _, peer := range planet.StorageNodes {
 		peer := peer
-		group.Go(func() error {
-			peer.Storage2.Monitor.Loop.TriggerWait()
-			peer.Contact.Chore.TriggerWait(ctx)
-			return nil
+		pprof.Do(ctx, pprof.Labels("peer", peer.Label(), "startup", "contact"), func(ctx context.Context) {
+			group.Go(func() error {
+				peer.Storage2.Monitor.Loop.TriggerWait()
+				peer.Contact.Chore.TriggerWait(ctx)
+				return nil
+			})
 		})
 	}
 	_ = group.Wait()
@@ -222,8 +219,11 @@ func (planet *Planet) Start(ctx context.Context) {
 	planet.started = true
 }
 
-// StopPeer stops a single peer in the planet
+// StopPeer stops a single peer in the planet.
 func (planet *Planet) StopPeer(peer Peer) error {
+	if peer == nil {
+		return errors.New("peer is nil")
+	}
 	for i := range planet.peers {
 		p := &planet.peers[i]
 		if p.peer == peer {
@@ -233,8 +233,45 @@ func (planet *Planet) StopPeer(peer Peer) error {
 	return errors.New("unknown peer")
 }
 
-// Size returns number of nodes in the network
+// StopNodeAndUpdate stops storage node and updates satellite overlay.
+func (planet *Planet) StopNodeAndUpdate(ctx context.Context, node *StorageNode) error {
+	err := planet.StopPeer(node)
+	if err != nil {
+		return err
+	}
+
+	for _, satellite := range planet.Satellites {
+		err := satellite.Overlay.Service.UpdateCheckIn(ctx, overlay.NodeCheckInInfo{
+			NodeID:  node.ID(),
+			Address: &pb.NodeAddress{Address: node.Addr()},
+			IsUp:    true,
+			Version: &pb.NodeVersion{
+				Version:    "v0.0.0",
+				CommitHash: "",
+				Timestamp:  time.Time{},
+				Release:    false,
+			},
+		}, time.Now().Add(-4*time.Hour))
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// Size returns number of nodes in the network.
 func (planet *Planet) Size() int { return len(planet.uplinks) + len(planet.peers) }
+
+// FindNode is a helper to retrieve a storage node record by its node ID.
+func (planet *Planet) FindNode(nodeID storj.NodeID) *StorageNode {
+	for _, node := range planet.StorageNodes {
+		if node.ID() == nodeID {
+			return node
+		}
+	}
+	return nil
+}
 
 // Shutdown shuts down all the nodes and deletes temporary directories.
 func (planet *Planet) Shutdown() error {
@@ -279,10 +316,6 @@ func (planet *Planet) Shutdown() error {
 		errlist.Add(db.Close())
 	}
 
-	if planet.ReferralManager != nil {
-		errlist.Add(planet.ReferralManager.Close())
-	}
-
 	errlist.Add(planet.VersionControl.Close())
 
 	errlist.Add(os.RemoveAll(planet.directory))
@@ -294,12 +327,12 @@ func (planet *Planet) Identities() *testidentity.Identities {
 	return planet.identities
 }
 
-// NewIdentity creates a new identity for a node
+// NewIdentity creates a new identity for a node.
 func (planet *Planet) NewIdentity() (*identity.FullIdentity, error) {
 	return planet.identities.NewIdentity()
 }
 
-// NewListener creates a new listener
+// NewListener creates a new listener.
 func (planet *Planet) NewListener() (net.Listener, error) {
 	return net.Listen("tcp", "127.0.0.1:0")
 }

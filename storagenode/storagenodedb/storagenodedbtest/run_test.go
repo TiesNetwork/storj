@@ -11,7 +11,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/skyrings/skyring-common/tools/uuid"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap/zaptest"
 
@@ -22,8 +21,10 @@ import (
 	"storj.io/common/storj"
 	"storj.io/common/testcontext"
 	"storj.io/common/testrand"
+	"storj.io/common/uuid"
+	"storj.io/storj/storage/filestore"
 	"storj.io/storj/storagenode"
-	"storj.io/storj/storagenode/orders"
+	"storj.io/storj/storagenode/orders/ordersfile"
 	"storj.io/storj/storagenode/storagenodedb"
 	"storj.io/storj/storagenode/storagenodedb/storagenodedbtest"
 )
@@ -34,8 +35,8 @@ func TestDatabase(t *testing.T) {
 		canceledCtx, cancel := context.WithCancel(ctx)
 		cancel()
 
-		serials := db.UsedSerials()
-		err := serials.Add(canceledCtx, testrand.NodeID(), testrand.SerialNumber(), time.Now().Add(time.Hour))
+		bw := db.Bandwidth()
+		err := bw.Add(canceledCtx, testrand.NodeID(), pb.PieceAction_GET, 0, time.Now())
 		require.True(t, errs2.IsCanceled(err), err)
 	})
 }
@@ -46,7 +47,7 @@ func TestFileConcurrency(t *testing.T) {
 
 	log := zaptest.NewLogger(t)
 
-	db, err := storagenodedb.New(log, storagenodedb.Config{
+	db, err := storagenodedb.OpenNew(ctx, log, storagenodedb.Config{
 		Pieces: ctx.Dir("storage"),
 		Info2:  ctx.Dir("storage") + "/info.db",
 	})
@@ -66,13 +67,14 @@ func TestInMemoryConcurrency(t *testing.T) {
 
 	storageDir := ctx.Dir("storage")
 	cfg := storagenodedb.Config{
-		Pieces:  storageDir,
-		Storage: storageDir,
-		Info:    filepath.Join(storageDir, "piecestore.db"),
-		Info2:   filepath.Join(storageDir, "info.db"),
+		Pieces:    storageDir,
+		Storage:   storageDir,
+		Info:      filepath.Join(storageDir, "piecestore.db"),
+		Info2:     filepath.Join(storageDir, "info.db"),
+		Filestore: filestore.DefaultConfig,
 	}
 
-	db, err := storagenodedb.New(log, cfg)
+	db, err := storagenodedb.OpenNew(ctx, log, cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -85,12 +87,12 @@ func testConcurrency(t *testing.T, ctx *testcontext.Context, db *storagenodedb.D
 	t.Run("Sqlite", func(t *testing.T) {
 		runtime.GOMAXPROCS(2)
 
-		err := db.CreateTables(ctx)
+		err := db.MigrateToLatest(ctx)
 		if err != nil {
 			t.Fatal(err)
 		}
 
-		ordersMap := make(map[string]orders.Info)
+		ordersMap := make(map[string]ordersfile.Info)
 		err = createOrders(t, ctx, ordersMap, 1000)
 		require.NoError(t, err)
 
@@ -102,7 +104,7 @@ func testConcurrency(t *testing.T, ctx *testcontext.Context, db *storagenodedb.D
 	})
 }
 
-func insertOrders(t *testing.T, ctx *testcontext.Context, db *storagenodedb.DB, ordersMap map[string]orders.Info) (err error) {
+func insertOrders(t *testing.T, ctx *testcontext.Context, db *storagenodedb.DB, ordersMap map[string]ordersfile.Info) (err error) {
 	var wg sync.WaitGroup
 	for _, order := range ordersMap {
 		wg.Add(1)
@@ -114,19 +116,18 @@ func insertOrders(t *testing.T, ctx *testcontext.Context, db *storagenodedb.DB, 
 	return nil
 }
 
-func insertOrder(t *testing.T, ctx *testcontext.Context, db *storagenodedb.DB, wg *sync.WaitGroup, order *orders.Info) {
+func insertOrder(t *testing.T, ctx *testcontext.Context, db *storagenodedb.DB, wg *sync.WaitGroup, order *ordersfile.Info) {
 	defer wg.Done()
 	err := db.Orders().Enqueue(ctx, order)
 	require.NoError(t, err)
 }
 
-func verifyOrders(t *testing.T, ctx *testcontext.Context, db *storagenodedb.DB, orders map[string]orders.Info) (err error) {
+func verifyOrders(t *testing.T, ctx *testcontext.Context, db *storagenodedb.DB, orders map[string]ordersfile.Info) (err error) {
 	dbOrders, _ := db.Orders().ListUnsent(ctx, 10000)
 	found := 0
 	for _, order := range orders {
 		for _, dbOrder := range dbOrders {
 			if order.Order.SerialNumber == dbOrder.Order.SerialNumber {
-				//fmt.Printf("Found %v\n", order.Order.SerialNumber)
 				found++
 			}
 		}
@@ -135,7 +136,7 @@ func verifyOrders(t *testing.T, ctx *testcontext.Context, db *storagenodedb.DB, 
 	return nil
 }
 
-func createOrders(t *testing.T, ctx *testcontext.Context, orders map[string]orders.Info, count int) (err error) {
+func createOrders(t *testing.T, ctx *testcontext.Context, orders map[string]ordersfile.Info, count int) (err error) {
 	for i := 0; i < count; i++ {
 		key, err := uuid.New()
 		if err != nil {
@@ -147,7 +148,7 @@ func createOrders(t *testing.T, ctx *testcontext.Context, orders map[string]orde
 	return nil
 }
 
-func createOrder(t *testing.T, ctx *testcontext.Context) (info *orders.Info) {
+func createOrder(t *testing.T, ctx *testcontext.Context) (info *ordersfile.Info) {
 	storageNodeIdentity := testidentity.MustPregeneratedSignedIdentity(0, storj.LatestIDVersion())
 	satelliteIdentity := testidentity.MustPregeneratedSignedIdentity(1, storj.LatestIDVersion())
 
@@ -177,7 +178,7 @@ func createOrder(t *testing.T, ctx *testcontext.Context) (info *orders.Info) {
 	})
 	require.NoError(t, err)
 
-	return &orders.Info{
+	return &ordersfile.Info{
 		Limit: limit,
 		Order: order,
 	}

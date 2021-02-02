@@ -10,11 +10,12 @@ import (
 	"net/url"
 	"strings"
 
-	"github.com/lib/pq"
 	"github.com/spacemonkeygo/monkit/v3"
 	"github.com/zeebo/errs"
 
+	"storj.io/common/context2"
 	"storj.io/storj/private/dbutil"
+	"storj.io/storj/private/dbutil/pgutil"
 	"storj.io/storj/private/tagsql"
 )
 
@@ -37,7 +38,7 @@ func OpenUnique(ctx context.Context, connStr string, schemaPrefix string) (db *d
 
 	schemaName := schemaPrefix + "-" + CreateRandomTestingSchemaName(8)
 
-	masterDB, err := tagsql.Open("cockroach", connStr)
+	masterDB, err := tagsql.Open(ctx, "cockroach", connStr)
 	if err != nil {
 		return nil, errs.Wrap(err)
 	}
@@ -50,13 +51,14 @@ func OpenUnique(ctx context.Context, connStr string, schemaPrefix string) (db *d
 		return nil, errs.New("Could not open masterDB at conn %q: %w", connStr, err)
 	}
 
-	_, err = masterDB.Exec(ctx, "CREATE DATABASE "+pq.QuoteIdentifier(schemaName))
+	_, err = masterDB.Exec(ctx, "CREATE DATABASE "+pgutil.QuoteIdentifier(schemaName))
 	if err != nil {
 		return nil, errs.Wrap(err)
 	}
 
 	cleanup := func(cleanupDB tagsql.DB) error {
-		_, err := cleanupDB.Exec(context.TODO(), "DROP DATABASE "+pq.QuoteIdentifier(schemaName))
+		ctx := context2.WithoutCancellation(ctx)
+		_, err := cleanupDB.Exec(ctx, "DROP DATABASE "+pgutil.QuoteIdentifier(schemaName))
 		return errs.Wrap(err)
 	}
 
@@ -65,12 +67,12 @@ func OpenUnique(ctx context.Context, connStr string, schemaPrefix string) (db *d
 		return nil, errs.Combine(err, cleanup(masterDB))
 	}
 
-	sqlDB, err := tagsql.Open("cockroach", modifiedConnStr)
+	sqlDB, err := tagsql.Open(ctx, "cockroach", modifiedConnStr)
 	if err != nil {
 		return nil, errs.Combine(errs.Wrap(err), cleanup(masterDB))
 	}
 
-	dbutil.Configure(sqlDB, mon)
+	dbutil.Configure(ctx, sqlDB, "tmp_cockroach", mon)
 	return &dbutil.TempDatabase{
 		DB:             sqlDB,
 		ConnStr:        modifiedConnStr,

@@ -9,7 +9,6 @@ import (
 	"github.com/spf13/cobra"
 
 	"storj.io/common/fpath"
-	"storj.io/storj/pkg/process"
 )
 
 func init() {
@@ -21,13 +20,13 @@ func init() {
 	}, RootCmd)
 }
 
-// putMain is the function executed when putCmd is called
+// putMain is the function executed when putCmd is called.
 func putMain(cmd *cobra.Command, args []string) (err error) {
 	if len(args) == 0 {
 		return fmt.Errorf("no object specified for copy")
 	}
 
-	ctx, _ := process.Ctx(cmd)
+	ctx, _ := withTelemetry(cmd)
 
 	dst, err := fpath.New(args[0])
 	if err != nil {

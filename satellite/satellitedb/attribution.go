@@ -6,12 +6,12 @@ package satellitedb
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"time"
 
-	"github.com/skyrings/skyring-common/tools/uuid"
 	"github.com/zeebo/errs"
 
-	"storj.io/storj/private/dbutil"
+	"storj.io/common/uuid"
 	"storj.io/storj/satellite/attribution"
 	"storj.io/storj/satellite/satellitedb/dbx"
 )
@@ -113,7 +113,7 @@ type attributionDB struct {
 	db *satelliteDB
 }
 
-// Get reads the partner info
+// Get reads the partner info.
 func (keys *attributionDB) Get(ctx context.Context, projectID uuid.UUID, bucketName []byte) (info *attribution.Info, err error) {
 	defer mon.Task()(&ctx)(&err)
 
@@ -121,7 +121,7 @@ func (keys *attributionDB) Get(ctx context.Context, projectID uuid.UUID, bucketN
 		dbx.ValueAttribution_ProjectId(projectID[:]),
 		dbx.ValueAttribution_BucketName(bucketName),
 	)
-	if err == sql.ErrNoRows {
+	if errors.Is(err, sql.ErrNoRows) {
 		return nil, attribution.ErrBucketNotAttributed.New("%q", bucketName)
 	}
 	if err != nil {
@@ -131,7 +131,7 @@ func (keys *attributionDB) Get(ctx context.Context, projectID uuid.UUID, bucketN
 	return attributionFromDBX(dbxInfo)
 }
 
-// Insert implements create partner info
+// Insert implements create partner info.
 func (keys *attributionDB) Insert(ctx context.Context, info *attribution.Info) (_ *attribution.Info, err error) {
 	defer mon.Task()(&ctx)(&err)
 
@@ -147,7 +147,7 @@ func (keys *attributionDB) Insert(ctx context.Context, info *attribution.Info) (
 	return attributionFromDBX(dbxInfo)
 }
 
-// QueryAttribution queries partner bucket attribution data
+// QueryAttribution queries partner bucket attribution data.
 func (keys *attributionDB) QueryAttribution(ctx context.Context, partnerID uuid.UUID, start time.Time, end time.Time) (_ []*attribution.CSVRow, err error) {
 	defer mon.Task()(&ctx)(&err)
 
@@ -170,11 +170,11 @@ func (keys *attributionDB) QueryAttribution(ctx context.Context, partnerID uuid.
 }
 
 func attributionFromDBX(info *dbx.ValueAttribution) (*attribution.Info, error) {
-	partnerID, err := dbutil.BytesToUUID(info.PartnerId)
+	partnerID, err := uuid.FromBytes(info.PartnerId)
 	if err != nil {
 		return nil, Error.Wrap(err)
 	}
-	projectID, err := dbutil.BytesToUUID(info.ProjectId)
+	projectID, err := uuid.FromBytes(info.ProjectId)
 	if err != nil {
 		return nil, Error.Wrap(err)
 	}

@@ -24,7 +24,7 @@ type Config struct {
 	TLS     tlsopts.Config
 }
 
-// Client implements pb.DRPCCertificatesClient
+// Client implements pb.DRPCCertificatesClient.
 type Client struct {
 	conn   *rpc.Conn
 	client pb.DRPCCertificatesClient
@@ -41,12 +41,12 @@ func New(ctx context.Context, dialer rpc.Dialer, address string) (_ *Client, err
 
 	return &Client{
 		conn:   conn,
-		client: pb.NewDRPCCertificatesClient(conn.Raw()),
+		client: pb.NewDRPCCertificatesClient(conn),
 	}, nil
 }
 
-// NewClientFrom creates a new certificate signing gRPC client from an existing
-// grpc cert signing client.
+// NewClientFrom creates a new certificate signing client from an existing
+// cert signing client.
 func NewClientFrom(client pb.DRPCCertificatesClient) *Client {
 	return &Client{
 		client: client,

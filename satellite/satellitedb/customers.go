@@ -6,11 +6,10 @@ package satellitedb
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"time"
 
-	"github.com/skyrings/skyring-common/tools/uuid"
-
-	"storj.io/storj/private/dbutil"
+	"storj.io/common/uuid"
 	"storj.io/storj/satellite/payments/stripecoinpayments"
 	"storj.io/storj/satellite/satellitedb/dbx"
 )
@@ -44,7 +43,7 @@ func (customers *customers) GetCustomerID(ctx context.Context, userID uuid.UUID)
 
 	idRow, err := customers.db.Get_StripeCustomer_CustomerId_By_UserId(ctx, dbx.StripeCustomer_UserId(userID[:]))
 	if err != nil {
-		if err == sql.ErrNoRows {
+		if errors.Is(err, sql.ErrNoRows) {
 			return "", stripecoinpayments.ErrNoCustomer
 		}
 
@@ -90,7 +89,7 @@ func (customers *customers) List(ctx context.Context, offset int64, limit int, b
 
 // fromDBXCustomer converts *dbx.StripeCustomer to *stripecoinpayments.Customer.
 func fromDBXCustomer(dbxCustomer *dbx.StripeCustomer) (*stripecoinpayments.Customer, error) {
-	userID, err := dbutil.BytesToUUID(dbxCustomer.UserId)
+	userID, err := uuid.FromBytes(dbxCustomer.UserId)
 	if err != nil {
 		return nil, err
 	}

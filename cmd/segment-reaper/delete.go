@@ -7,18 +7,18 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/csv"
+	"errors"
 	"io"
 	"os"
 	"time"
 
-	"github.com/gogo/protobuf/proto"
 	"github.com/spf13/cobra"
 	"github.com/zeebo/errs"
 	"go.uber.org/zap"
 
 	"storj.io/common/pb"
 	"storj.io/common/storj"
-	"storj.io/storj/pkg/process"
+	"storj.io/private/process"
 	"storj.io/storj/satellite/metainfo"
 	"storj.io/storj/storage"
 )
@@ -49,7 +49,7 @@ func cmdDelete(cmd *cobra.Command, args []string) (err error) {
 	ctx, _ := process.Ctx(cmd)
 
 	log := zap.L()
-	db, err := metainfo.NewStore(log.Named("pointerdb"), deleteCfg.DatabaseURL)
+	db, err := metainfo.OpenStore(ctx, log.Named("pointerdb"), deleteCfg.DatabaseURL, "satellite-reaper")
 	if err != nil {
 		return errs.New("error connecting database: %+v", err)
 	}
@@ -66,7 +66,7 @@ func cmdDelete(cmd *cobra.Command, args []string) (err error) {
 	}()
 
 	csvReader := csv.NewReader(inputFile)
-	csvReader.FieldsPerRecord = 5
+	csvReader.FieldsPerRecord = 6
 	csvReader.ReuseRecord = true
 
 	segmentsDeleted := 0
@@ -74,7 +74,7 @@ func cmdDelete(cmd *cobra.Command, args []string) (err error) {
 	segmentsSkipped := 0
 	for {
 		record, err := csvReader.Read()
-		if err == io.EOF {
+		if errors.Is(err, io.EOF) {
 			break
 		}
 		if err != nil {
@@ -131,7 +131,7 @@ func deleteSegment(ctx context.Context, db metainfo.PointerDB, path string, crea
 	}
 
 	pointer := &pb.Pointer{}
-	err = proto.Unmarshal(pointerBytes, pointer)
+	err = pb.Unmarshal(pointerBytes, pointer)
 	if err != nil {
 		return err
 	}

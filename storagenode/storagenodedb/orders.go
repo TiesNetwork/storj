@@ -6,15 +6,16 @@ package storagenodedb
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"time"
 
-	"github.com/gogo/protobuf/proto"
 	"github.com/zeebo/errs"
 
 	"storj.io/common/pb"
 	"storj.io/common/storj"
 	"storj.io/storj/private/tagsql"
 	"storj.io/storj/storagenode/orders"
+	"storj.io/storj/storagenode/orders/ordersfile"
 )
 
 // ErrOrders represents errors from the ordersdb database.
@@ -27,16 +28,16 @@ type ordersDB struct {
 	dbContainerImpl
 }
 
-// Enqueue inserts order to the unsent list
-func (db *ordersDB) Enqueue(ctx context.Context, info *orders.Info) (err error) {
+// Enqueue inserts order to the unsent list.
+func (db *ordersDB) Enqueue(ctx context.Context, info *ordersfile.Info) (err error) {
 	defer mon.Task()(&ctx)(&err)
 
-	limitSerialized, err := proto.Marshal(info.Limit)
+	limitSerialized, err := pb.Marshal(info.Limit)
 	if err != nil {
 		return ErrOrders.Wrap(err)
 	}
 
-	orderSerialized, err := proto.Marshal(info.Order)
+	orderSerialized, err := pb.Marshal(info.Order)
 	if err != nil {
 		return ErrOrders.Wrap(err)
 	}
@@ -61,7 +62,7 @@ func (db *ordersDB) Enqueue(ctx context.Context, info *orders.Info) (err error) 
 // which have not. In case of database or other system error, the method will
 // stop without any further processing and will return an error without any
 // order.
-func (db *ordersDB) ListUnsent(ctx context.Context, limit int) (_ []*orders.Info, err error) {
+func (db *ordersDB) ListUnsent(ctx context.Context, limit int) (_ []*ordersfile.Info, err error) {
 	defer mon.Task()(&ctx)(&err)
 
 	rows, err := db.QueryContext(ctx, `
@@ -70,7 +71,7 @@ func (db *ordersDB) ListUnsent(ctx context.Context, limit int) (_ []*orders.Info
 		LIMIT ?
 	`, limit)
 	if err != nil {
-		if err == sql.ErrNoRows {
+		if errors.Is(err, sql.ErrNoRows) {
 			return nil, nil
 		}
 		return nil, ErrOrders.Wrap(err)
@@ -79,7 +80,7 @@ func (db *ordersDB) ListUnsent(ctx context.Context, limit int) (_ []*orders.Info
 	var unmarshalErrors errs.Group
 	defer func() { err = errs.Combine(err, unmarshalErrors.Err(), rows.Close()) }()
 
-	var infos []*orders.Info
+	var infos []*ordersfile.Info
 	for rows.Next() {
 		var limitSerialized []byte
 		var orderSerialized []byte
@@ -89,17 +90,17 @@ func (db *ordersDB) ListUnsent(ctx context.Context, limit int) (_ []*orders.Info
 			return nil, ErrOrders.Wrap(err)
 		}
 
-		var info orders.Info
+		var info ordersfile.Info
 		info.Limit = &pb.OrderLimit{}
 		info.Order = &pb.Order{}
 
-		err = proto.Unmarshal(limitSerialized, info.Limit)
+		err = pb.Unmarshal(limitSerialized, info.Limit)
 		if err != nil {
 			unmarshalErrors.Add(ErrOrders.Wrap(err))
 			continue
 		}
 
-		err = proto.Unmarshal(orderSerialized, info.Order)
+		err = pb.Unmarshal(orderSerialized, info.Order)
 		if err != nil {
 			unmarshalErrors.Add(ErrOrders.Wrap(err))
 			continue
@@ -111,8 +112,8 @@ func (db *ordersDB) ListUnsent(ctx context.Context, limit int) (_ []*orders.Info
 	return infos, ErrOrders.Wrap(rows.Err())
 }
 
-// ListUnsentBySatellite returns orders that haven't been sent yet grouped by
-// satellite. Does not return uplink identity.
+// ListUnsentBySatellite returns orders that haven't been sent yet and are not expired.
+// The orders are ordered by the Satellite ID.
 //
 // If there is some unmarshal error while reading an order, the method proceed
 // with the following ones and the function will return the ones which have
@@ -120,16 +121,17 @@ func (db *ordersDB) ListUnsent(ctx context.Context, limit int) (_ []*orders.Info
 // which have not. In case of database or other system error, the method will
 // stop without any further processing and will return an error without any
 // order.
-func (db *ordersDB) ListUnsentBySatellite(ctx context.Context) (_ map[storj.NodeID][]*orders.Info, err error) {
+func (db *ordersDB) ListUnsentBySatellite(ctx context.Context) (_ map[storj.NodeID][]*ordersfile.Info, err error) {
 	defer mon.Task()(&ctx)(&err)
 	// TODO: add some limiting
 
 	rows, err := db.QueryContext(ctx, `
 		SELECT order_limit_serialized, order_serialized
 		FROM unsent_order
-	`)
+		WHERE order_limit_expiration >= $1
+	`, time.Now().UTC())
 	if err != nil {
-		if err == sql.ErrNoRows {
+		if errors.Is(err, sql.ErrNoRows) {
 			return nil, nil
 		}
 		return nil, ErrOrders.Wrap(err)
@@ -138,7 +140,7 @@ func (db *ordersDB) ListUnsentBySatellite(ctx context.Context) (_ map[storj.Node
 	var unmarshalErrors errs.Group
 	defer func() { err = errs.Combine(err, unmarshalErrors.Err(), rows.Close()) }()
 
-	infos := map[storj.NodeID][]*orders.Info{}
+	infos := map[storj.NodeID][]*ordersfile.Info{}
 	for rows.Next() {
 		var limitSerialized []byte
 		var orderSerialized []byte
@@ -148,17 +150,17 @@ func (db *ordersDB) ListUnsentBySatellite(ctx context.Context) (_ map[storj.Node
 			return nil, ErrOrders.Wrap(err)
 		}
 
-		var info orders.Info
+		var info ordersfile.Info
 		info.Limit = &pb.OrderLimit{}
 		info.Order = &pb.Order{}
 
-		err = proto.Unmarshal(limitSerialized, info.Limit)
+		err = pb.Unmarshal(limitSerialized, info.Limit)
 		if err != nil {
 			unmarshalErrors.Add(ErrOrders.Wrap(err))
 			continue
 		}
 
-		err = proto.Unmarshal(orderSerialized, info.Order)
+		err = pb.Unmarshal(orderSerialized, info.Order)
 		if err != nil {
 			unmarshalErrors.Add(ErrOrders.Wrap(err))
 			continue
@@ -178,6 +180,9 @@ func (db *ordersDB) ListUnsentBySatellite(ctx context.Context) (_ map[storj.Node
 // abort the operation, rolling back the transaction.
 func (db *ordersDB) Archive(ctx context.Context, archivedAt time.Time, requests ...orders.ArchiveRequest) (err error) {
 	defer mon.Task()(&ctx)(&err)
+
+	// change input parameter to UTC timezone before we send it to the database
+	archivedAt = archivedAt.UTC()
 
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
@@ -262,7 +267,7 @@ func (db *ordersDB) ListArchived(ctx context.Context, limit int) (_ []*orders.Ar
 		LIMIT ?
 	`, limit)
 	if err != nil {
-		if err == sql.ErrNoRows {
+		if errors.Is(err, sql.ErrNoRows) {
 			return nil, nil
 		}
 		return nil, ErrOrders.Wrap(err)
@@ -289,12 +294,12 @@ func (db *ordersDB) ListArchived(ctx context.Context, limit int) (_ []*orders.Ar
 		info.Status = orders.Status(status)
 		info.ArchivedAt = archivedAt
 
-		err = proto.Unmarshal(limitSerialized, info.Limit)
+		err = pb.Unmarshal(limitSerialized, info.Limit)
 		if err != nil {
 			return nil, ErrOrders.Wrap(err)
 		}
 
-		err = proto.Unmarshal(orderSerialized, info.Order)
+		err = pb.Unmarshal(orderSerialized, info.Order)
 		if err != nil {
 			return nil, ErrOrders.Wrap(err)
 		}
@@ -305,17 +310,16 @@ func (db *ordersDB) ListArchived(ctx context.Context, limit int) (_ []*orders.Ar
 	return infos, ErrOrders.Wrap(rows.Err())
 }
 
-// CleanArchive deletes all entries older than ttl
-func (db *ordersDB) CleanArchive(ctx context.Context, ttl time.Duration) (_ int, err error) {
+// CleanArchive deletes all entries older than ttl.
+func (db *ordersDB) CleanArchive(ctx context.Context, deleteBefore time.Time) (_ int, err error) {
 	defer mon.Task()(&ctx)(&err)
 
-	deleteBefore := time.Now().UTC().Add(-1 * ttl)
 	result, err := db.ExecContext(ctx, `
 		DELETE FROM order_archive_
 		WHERE archived_at <= ?
-	`, deleteBefore)
+	`, deleteBefore.UTC())
 	if err != nil {
-		if err == sql.ErrNoRows {
+		if errors.Is(err, sql.ErrNoRows) {
 			return 0, nil
 		}
 		return 0, ErrOrders.Wrap(err)

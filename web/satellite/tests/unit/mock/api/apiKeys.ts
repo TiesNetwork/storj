@@ -7,6 +7,7 @@ import { ApiKey, ApiKeyCursor, ApiKeysApi, ApiKeysPage } from '@/types/apiKeys';
  * Mock for ApiKeysApi
  */
 export class ApiKeysMock implements ApiKeysApi {
+    private readonly date = new Date(0);
     private mockApiKeysPage: ApiKeysPage;
 
     public setMockApiKeysPage(mockApiKeysPage: ApiKeysPage): void {
@@ -18,10 +19,10 @@ export class ApiKeysMock implements ApiKeysApi {
     }
 
     create(projectId: string, name: string): Promise<ApiKey> {
-        throw new Error('Method not implemented');
+        return Promise.resolve(new ApiKey('testId', 'testName', this.date, 'testKey'));
     }
 
     delete(ids: string[]): Promise<void> {
-        throw new Error('Method not implemented');
+        return Promise.resolve();
     }
 }

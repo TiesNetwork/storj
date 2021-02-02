@@ -395,7 +395,7 @@ func TestBandwidthDailyRollups(t *testing.T) {
 		require.NoError(t, err)
 
 		// last day add bandwidth that won't be rolled up
-		day := startDate.Add(time.Hour * 24 * time.Duration(days-1))
+		day := startDate.Add(time.Hour * 24 * (days - 1))
 
 		for _, satellite := range satellites {
 			usageRollup := &bandwidth.UsageRollup{
@@ -470,7 +470,7 @@ func TestCachedBandwidthMonthRollover(t *testing.T) {
 
 func TestBandwidthRollup(t *testing.T) {
 	storagenodedbtest.Run(t, func(ctx *testcontext.Context, t *testing.T, db storagenode.DB) {
-		err := db.CreateTables(ctx)
+		err := db.MigrateToLatest(ctx)
 		if err != nil {
 			t.Fatal(err)
 		}

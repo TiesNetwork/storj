@@ -8,11 +8,12 @@ import (
 	"github.com/zeebo/errs"
 	"go.uber.org/zap"
 
-	"storj.io/storj/pkg/process"
+	"storj.io/common/context2"
+	"storj.io/private/process"
+	"storj.io/private/version"
 	"storj.io/storj/pkg/revocation"
-	"storj.io/storj/private/context2"
-	"storj.io/storj/private/version"
 	"storj.io/storj/satellite"
+	"storj.io/storj/satellite/accounting"
 	"storj.io/storj/satellite/accounting/live"
 	"storj.io/storj/satellite/metainfo"
 	"storj.io/storj/satellite/orders"
@@ -27,11 +28,14 @@ func cmdAPIRun(cmd *cobra.Command, args []string) (err error) {
 
 	identity, err := runCfg.Identity.Load()
 	if err != nil {
-		zap.S().Fatal(err)
+		log.Error("Failed to load identity.", zap.Error(err))
+		return errs.New("Failed to load identity: %+v", err)
 	}
 
-	db, err := satellitedb.New(log.Named("db"), runCfg.Database, satellitedb.Options{
-		APIKeysLRUOptions: runCfg.APIKeysLRUOptions(),
+	db, err := satellitedb.Open(ctx, log.Named("db"), runCfg.Database, satellitedb.Options{
+		ApplicationName:      "satellite-api",
+		APIKeysLRUOptions:    runCfg.APIKeysLRUOptions(),
+		RevocationLRUOptions: runCfg.RevocationLRUOptions(),
 	})
 	if err != nil {
 		return errs.New("Error starting master database on satellite api: %+v", err)
@@ -40,15 +44,15 @@ func cmdAPIRun(cmd *cobra.Command, args []string) (err error) {
 		err = errs.Combine(err, db.Close())
 	}()
 
-	pointerDB, err := metainfo.NewStore(log.Named("pointerdb"), runCfg.Config.Metainfo.DatabaseURL)
+	pointerDB, err := metainfo.OpenStore(ctx, log.Named("pointerdb"), runCfg.Config.Metainfo.DatabaseURL, "satellite-api")
 	if err != nil {
-		return errs.New("Error creating metainfo database on satellite api: %+v", err)
+		return errs.New("Error creating metainfodb connection on satellite api: %+v", err)
 	}
 	defer func() {
 		err = errs.Combine(err, pointerDB.Close())
 	}()
 
-	revocationDB, err := revocation.NewDBFromCfg(runCfg.Config.Server.Config)
+	revocationDB, err := revocation.OpenDBFromCfg(ctx, runCfg.Config.Server.Config)
 	if err != nil {
 		return errs.New("Error creating revocation database on satellite api: %+v", err)
 	}
@@ -58,7 +62,13 @@ func cmdAPIRun(cmd *cobra.Command, args []string) (err error) {
 
 	accountingCache, err := live.NewCache(log.Named("live-accounting"), runCfg.LiveAccounting)
 	if err != nil {
-		return errs.New("Error creating live accounting cache on satellite api: %+v", err)
+		if !accounting.ErrSystemOrNetError.Has(err) || accountingCache == nil {
+			return errs.New("Error instantiating live accounting cache: %w", err)
+		}
+
+		log.Warn("Unable to connect to live accounting cache. Verify connection",
+			zap.Error(err),
+		)
 	}
 	defer func() {
 		err = errs.Combine(err, accountingCache.Close())
@@ -69,23 +79,28 @@ func cmdAPIRun(cmd *cobra.Command, args []string) (err error) {
 		err = errs.Combine(err, rollupsWriteCache.CloseAndFlush(context2.WithoutCancellation(ctx)))
 	}()
 
-	peer, err := satellite.NewAPI(log, identity, db, pointerDB, revocationDB, accountingCache, rollupsWriteCache, &runCfg.Config, version.Build)
+	peer, err := satellite.NewAPI(log, identity, db, pointerDB, revocationDB, accountingCache, rollupsWriteCache, &runCfg.Config, version.Build, process.AtomicLevel(cmd))
 	if err != nil {
 		return err
 	}
 
-	err = peer.Version.CheckVersion(ctx)
+	_, err = peer.Version.Service.CheckVersion(ctx)
 	if err != nil {
 		return err
 	}
 
-	if err := process.InitMetricsWithCertPath(ctx, log, nil, runCfg.Identity.CertPath); err != nil {
-		zap.S().Warn("Failed to initialize telemetry batcher on satellite api: ", err)
+	if err := process.InitMetricsWithHostname(ctx, log, nil); err != nil {
+		log.Warn("Failed to initialize telemetry batcher on satellite api", zap.Error(err))
+	}
+
+	err = pointerDB.MigrateToLatest(ctx)
+	if err != nil {
+		return errs.New("Error creating metainfodb tables on satellite api: %+v", err)
 	}
 
 	err = db.CheckVersion(ctx)
 	if err != nil {
-		zap.S().Fatal("failed satellite database version check: ", err)
+		log.Error("Failed satellite database version check.", zap.Error(err))
 		return errs.New("Error checking version for satellitedb: %+v", err)
 	}
 

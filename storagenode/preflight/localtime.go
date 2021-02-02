@@ -18,10 +18,10 @@ import (
 	"storj.io/storj/storagenode/trust"
 )
 
-// ErrClockOutOfSyncMinor is the error class for system clock is off by more than 10m
+// ErrClockOutOfSyncMinor is the error class for system clock is off by more than 10m.
 var ErrClockOutOfSyncMinor = errs.Class("system clock is off")
 
-// ErrClockOutOfSyncMajor is the error class for system clock is out of sync by more than 30m
+// ErrClockOutOfSyncMajor is the error class for system clock is out of sync by more than 30m.
 var ErrClockOutOfSyncMajor = errs.Class("system clock is out of sync")
 
 // LocalTime checks local system clock against all trusted satellites.
@@ -103,11 +103,11 @@ func (localTime *LocalTime) Check(ctx context.Context) (err error) {
 func (localTime *LocalTime) getSatelliteTime(ctx context.Context, satelliteID storj.NodeID) (_ *pb.GetTimeResponse, err error) {
 	defer mon.Task()(&ctx)(&err)
 
-	address, err := localTime.trust.GetAddress(ctx, satelliteID)
+	nodeurl, err := localTime.trust.GetNodeURL(ctx, satelliteID)
 	if err != nil {
 		return nil, err
 	}
-	conn, err := localTime.dialer.DialAddressID(ctx, address, satelliteID)
+	conn, err := localTime.dialer.DialNodeURL(ctx, nodeurl)
 	if err != nil {
 		return nil, err
 	}
@@ -115,7 +115,7 @@ func (localTime *LocalTime) getSatelliteTime(ctx context.Context, satelliteID st
 		err = errs.Combine(err, conn.Close())
 	}()
 
-	resp, err := pb.NewDRPCNodeClient(conn.Raw()).GetTime(ctx, &pb.GetTimeRequest{})
+	resp, err := pb.NewDRPCNodeClient(conn).GetTime(ctx, &pb.GetTimeRequest{})
 	if err != nil {
 		return nil, err
 	}

@@ -6,58 +6,65 @@ package satellite
 import (
 	"context"
 
+	hw "github.com/jtolds/monkit-hw/v2"
 	"github.com/spacemonkeygo/monkit/v3"
 
 	"storj.io/common/identity"
-	"storj.io/storj/pkg/debug"
+	"storj.io/private/debug"
 	"storj.io/storj/pkg/server"
 	version_checker "storj.io/storj/private/version/checker"
 	"storj.io/storj/satellite/accounting"
 	"storj.io/storj/satellite/accounting/live"
-	"storj.io/storj/satellite/accounting/reportedrollup"
+	"storj.io/storj/satellite/accounting/projectbwcleanup"
 	"storj.io/storj/satellite/accounting/rollup"
+	"storj.io/storj/satellite/accounting/rolluparchive"
 	"storj.io/storj/satellite/accounting/tally"
 	"storj.io/storj/satellite/admin"
 	"storj.io/storj/satellite/attribution"
 	"storj.io/storj/satellite/audit"
+	"storj.io/storj/satellite/compensation"
 	"storj.io/storj/satellite/console"
 	"storj.io/storj/satellite/console/consoleweb"
 	"storj.io/storj/satellite/contact"
-	"storj.io/storj/satellite/dbcleanup"
-	"storj.io/storj/satellite/downtime"
 	"storj.io/storj/satellite/gc"
 	"storj.io/storj/satellite/gracefulexit"
 	"storj.io/storj/satellite/mailservice"
-	"storj.io/storj/satellite/marketingweb"
 	"storj.io/storj/satellite/metainfo"
+	"storj.io/storj/satellite/metainfo/expireddeletion"
 	"storj.io/storj/satellite/metrics"
+	"storj.io/storj/satellite/nodeapiversion"
 	"storj.io/storj/satellite/orders"
 	"storj.io/storj/satellite/overlay"
+	"storj.io/storj/satellite/overlay/straynodes"
 	"storj.io/storj/satellite/payments/paymentsconfig"
 	"storj.io/storj/satellite/payments/stripecoinpayments"
-	"storj.io/storj/satellite/referrals"
 	"storj.io/storj/satellite/repair/checker"
 	"storj.io/storj/satellite/repair/irreparable"
 	"storj.io/storj/satellite/repair/queue"
 	"storj.io/storj/satellite/repair/repairer"
-	"storj.io/storj/satellite/rewards"
+	"storj.io/storj/satellite/revocation"
+	"storj.io/storj/satellite/snopayouts"
 )
 
 var mon = monkit.Package()
 
-// DB is the master database for the satellite
+func init() {
+	hw.Register(monkit.Default)
+}
+
+// DB is the master database for the satellite.
 //
 // architecture: Master Database
 type DB interface {
-	// CreateTables initializes the database
-	CreateTables(ctx context.Context) error
+	// MigrateToLatest initializes the database
+	MigrateToLatest(ctx context.Context) error
 	// CheckVersion checks the database is the correct version
 	CheckVersion(ctx context.Context) error
 	// Close closes the database
 	Close() error
 
-	// TestingCreateTables initializes the database for testplanet.
-	TestingCreateTables(ctx context.Context) error
+	// TestingMigrateToLatest initializes the database for testplanet.
+	TestingMigrateToLatest(ctx context.Context) error
 
 	// PeerIdentities returns a storage for peer identities
 	PeerIdentities() overlay.PeerIdentities
@@ -75,10 +82,6 @@ type DB interface {
 	Irreparable() irreparable.DB
 	// Console returns database for satellite console
 	Console() console.DB
-	// Admin returns database for satellite administration
-	Admin() admin.DB
-	// Rewards returns database for marketing admin GUI
-	Rewards() rewards.DB
 	// Orders returns database for orders
 	Orders() orders.DB
 	// Containment returns database for containment
@@ -89,11 +92,17 @@ type DB interface {
 	GracefulExit() gracefulexit.DB
 	// StripeCoinPayments returns stripecoinpayments database.
 	StripeCoinPayments() stripecoinpayments.DB
-	// DowntimeTracking returns database for downtime tracking
-	DowntimeTracking() downtime.DB
+	// SnoPayout returns database for payouts.
+	SNOPayouts() snopayouts.DB
+	// Compoensation tracks storage node compensation
+	Compensation() compensation.DB
+	// Revocation tracks revoked macaroons
+	Revocation() revocation.DB
+	// NodeAPIVersion tracks nodes observed api usage
+	NodeAPIVersion() nodeapiversion.DB
 }
 
-// Config is the global config satellite
+// Config is the global config satellite.
 type Config struct {
 	Identity identity.Config
 	Server   server.Config
@@ -101,8 +110,9 @@ type Config struct {
 
 	Admin admin.Config
 
-	Contact contact.Config
-	Overlay overlay.Config
+	Contact    contact.Config
+	Overlay    overlay.Config
+	StrayNodes straynodes.Config
 
 	Metainfo metainfo.Config
 	Orders   orders.Config
@@ -113,22 +123,19 @@ type Config struct {
 
 	GarbageCollection gc.Config
 
-	DBCleanup dbcleanup.Config
+	ExpiredDeletion expireddeletion.Config
 
-	Tally          tally.Config
-	Rollup         rollup.Config
-	LiveAccounting live.Config
-	ReportedRollup reportedrollup.Config
+	Tally            tally.Config
+	Rollup           rollup.Config
+	RollupArchive    rolluparchive.Config
+	LiveAccounting   live.Config
+	ProjectBWCleanup projectbwcleanup.Config
 
 	Mail mailservice.Config
 
 	Payments paymentsconfig.Config
 
-	Referrals referrals.Config
-
 	Console consoleweb.Config
-
-	Marketing marketingweb.Config
 
 	Version version_checker.Config
 
@@ -136,5 +143,7 @@ type Config struct {
 
 	Metrics metrics.Config
 
-	Downtime downtime.Config
+	Compensation compensation.Config
+
+	ProjectLimit accounting.ProjectLimitConfig
 }

@@ -6,6 +6,7 @@ package redisserver
 
 import (
 	"bufio"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -15,6 +16,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime/pprof"
 	"strconv"
 	"strings"
 	"time"
@@ -22,7 +24,7 @@ import (
 	"github.com/alicebob/miniredis/v2"
 	"github.com/go-redis/redis"
 
-	"storj.io/storj/private/processgroup"
+	"storj.io/common/processgroup"
 )
 
 const (
@@ -34,6 +36,13 @@ const (
 type Server interface {
 	Addr() string
 	Close() error
+	// TestingFastForward is a function for enforce the TTL of keys in
+	// implementations what they have not exercise the expiration by themselves
+	// (e.g. Minitredis). This method is a no-op in implementations which support
+	// the expiration as usual.
+	//
+	// All the keys whose TTL minus d become <= 0 will be removed.
+	TestingFastForward(d time.Duration)
 }
 
 func freeport() (addr string, port int) {
@@ -50,18 +59,18 @@ func freeport() (addr string, port int) {
 	return addr, port
 }
 
-// Start starts a redis-server when available, otherwise falls back to miniredis
-func Start() (Server, error) {
-	server, err := Process()
+// Start starts a redis-server when available, otherwise falls back to miniredis.
+func Start(ctx context.Context) (Server, error) {
+	server, err := Process(ctx)
 	if err != nil {
 		log.Println("failed to start redis-server: ", err)
-		return Mini()
+		return Mini(ctx)
 	}
 	return server, err
 }
 
-// Process starts a redis-server test process
-func Process() (Server, error) {
+// Process starts a redis-server test process.
+func Process(ctx context.Context) (Server, error) {
 	tmpdir, err := ioutil.TempDir("", "storj-redis")
 	if err != nil {
 		return nil, err
@@ -149,8 +158,16 @@ type process struct {
 	close func()
 }
 
-func (process *process) Addr() string { return process.addr }
-func (process *process) Close() error { process.close(); return nil }
+func (process *process) Addr() string {
+	return process.addr
+}
+
+func (process *process) Close() error {
+	process.close()
+	return nil
+}
+
+func (process *process) TestingFastForward(_ time.Duration) {}
 
 func pingServer(addr string) error {
 	client := redis.NewClient(&redis.Options{Addr: addr, DB: 1})
@@ -158,13 +175,18 @@ func pingServer(addr string) error {
 	return client.Ping().Err()
 }
 
-// Mini starts miniredis server
-func Mini() (Server, error) {
-	server, err := miniredis.Run()
+// Mini starts miniredis server.
+func Mini(ctx context.Context) (Server, error) {
+	var server *miniredis.Miniredis
+	var err error
+
+	pprof.Do(ctx, pprof.Labels("db", "miniredis"), func(ctx context.Context) {
+		server, err = miniredis.Run()
+	})
+
 	if err != nil {
 		return nil, err
 	}
-
 	return &miniserver{server}, nil
 }
 
@@ -172,8 +194,12 @@ type miniserver struct {
 	*miniredis.Miniredis
 }
 
-// Close closes the underlying miniredis server
+// Close closes the underlying miniredis server.
 func (s *miniserver) Close() error {
 	s.Miniredis.Close()
 	return nil
+}
+
+func (s *miniserver) TestingFastForward(d time.Duration) {
+	s.FastForward(d)
 }

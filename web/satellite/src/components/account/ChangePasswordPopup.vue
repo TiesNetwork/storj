@@ -53,7 +53,7 @@
                         width="205px"
                         height="48px"
                         :on-press="onCloseClick"
-                        is-white="true"
+                        is-transparent="true"
                     />
                     <VButton
                         label="Update"
@@ -82,7 +82,7 @@ import CloseCrossIcon from '@/../static/images/common/closeCross.svg';
 
 import { AuthHttpApi } from '@/api/auth';
 import { APP_STATE_ACTIONS } from '@/utils/constants/actionNames';
-import { validatePassword } from '@/utils/validation';
+import { Validator } from '@/utils/validation';
 
 @Component({
     components: {
@@ -97,12 +97,16 @@ export default class ChangePasswordPopup extends Vue {
     private oldPassword: string = '';
     private newPassword: string = '';
     private confirmationPassword: string = '';
+
     private oldPasswordError: string = '';
     private newPasswordError: string = '';
     private confirmationPasswordError: string = '';
 
     private readonly auth: AuthHttpApi = new AuthHttpApi();
 
+    /**
+     * Indicates if hint popup needs to be shown while creating new password.
+     */
     public isPasswordStrengthShown: boolean = false;
 
     public showPasswordStrength(): void {
@@ -128,6 +132,9 @@ export default class ChangePasswordPopup extends Vue {
         this.confirmationPasswordError = '';
     }
 
+    /**
+     * Validates inputs and if everything are correct tries to change password and close popup.
+     */
     public async onUpdateClick(): Promise<void> {
         let hasError = false;
         if (this.oldPassword.length < 6) {
@@ -135,7 +142,7 @@ export default class ChangePasswordPopup extends Vue {
             hasError = true;
         }
 
-        if (!validatePassword(this.newPassword)) {
+        if (!Validator.password(this.newPassword)) {
             this.newPasswordError = 'Invalid password. Use 6 or more characters';
             hasError = true;
         }
@@ -166,6 +173,9 @@ export default class ChangePasswordPopup extends Vue {
         this.$store.dispatch(APP_STATE_ACTIONS.TOGGLE_CHANGE_PASSWORD_POPUP);
     }
 
+    /**
+     * Closes popup.
+     */
     public onCloseClick(): void {
         this.$store.dispatch(APP_STATE_ACTIONS.TOGGLE_CHANGE_PASSWORD_POPUP);
     }

@@ -7,10 +7,12 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 
 	"github.com/zeebo/errs"
 
+	"storj.io/storj/private/tagsql"
 	"storj.io/storj/storage"
 )
 
@@ -20,7 +22,7 @@ type orderedPostgresIterator struct {
 	delimiter      byte
 	batchSize      int
 	curIndex       int
-	curRows        *sql.Rows
+	curRows        tagsql.Rows
 	skipPrefix     bool
 	lastKeySeen    storage.Key
 	largestKey     storage.Key
@@ -61,7 +63,9 @@ func newOrderedPostgresIterator(ctx context.Context, cli *Client, opts storage.I
 }
 
 func (opi *orderedPostgresIterator) Close() error {
-	return errs.Combine(opi.errEncountered, opi.curRows.Close())
+	defer mon.Task()(nil)(nil)
+
+	return errs.Combine(opi.curRows.Err(), opi.errEncountered, opi.curRows.Close())
 }
 
 // Next fills in info for the next item in an ongoing listing.
@@ -69,29 +73,46 @@ func (opi *orderedPostgresIterator) Next(ctx context.Context, item *storage.List
 	defer mon.Task()(&ctx)(nil)
 
 	for {
-		for !opi.curRows.Next() {
-			if err := opi.curRows.Err(); err != nil && err != sql.ErrNoRows {
-				opi.errEncountered = errs.Wrap(err)
-				return false
+		for {
+			nextTask := mon.TaskNamed("check_next_row")(nil)
+			next := opi.curRows.Next()
+			nextTask(nil)
+			if next {
+				break
 			}
-			if err := opi.curRows.Close(); err != nil {
-				opi.errEncountered = errs.Wrap(err)
-				return false
+
+			result := func() bool {
+				defer mon.TaskNamed("acquire_new_query")(nil)(nil)
+
+				if err := opi.curRows.Err(); err != nil && !errors.Is(err, sql.ErrNoRows) {
+					opi.errEncountered = errs.Wrap(err)
+					return false
+				}
+				if err := opi.curRows.Close(); err != nil {
+					opi.errEncountered = errs.Wrap(err)
+					return false
+				}
+				if opi.curIndex < opi.batchSize {
+					return false
+				}
+				newRows, err := opi.doNextQuery(ctx)
+				if err != nil {
+					opi.errEncountered = errs.Wrap(err)
+					return false
+				}
+				opi.curRows = newRows
+				opi.curIndex = 0
+				return true
+			}()
+			if !result {
+				return result
 			}
-			if opi.curIndex < opi.batchSize {
-				return false
-			}
-			newRows, err := opi.doNextQuery(ctx)
-			if err != nil {
-				opi.errEncountered = errs.Wrap(err)
-				return false
-			}
-			opi.curRows = newRows
-			opi.curIndex = 0
 		}
 
 		var k, v []byte
+		scanTask := mon.TaskNamed("scan_next_row")(nil)
 		err := opi.curRows.Scan(&k, &v)
+		scanTask(&err)
 		if err != nil {
 			opi.errEncountered = errs.Wrap(err)
 			return false
@@ -123,7 +144,7 @@ func (opi *orderedPostgresIterator) Next(ctx context.Context, item *storage.List
 	}
 }
 
-func (opi *orderedPostgresIterator) doNextQuery(ctx context.Context) (_ *sql.Rows, err error) {
+func (opi *orderedPostgresIterator) doNextQuery(ctx context.Context) (_ tagsql.Rows, err error) {
 	defer mon.Task()(&ctx)(&err)
 
 	gt := ">"
@@ -136,6 +157,13 @@ func (opi *orderedPostgresIterator) doNextQuery(ctx context.Context) (_ *sql.Row
 		start = storage.AfterPrefix(start)
 		gt = ">="
 	}
+	var endLimitKey = opi.largestKey
+	if endLimitKey == nil {
+		// jackc/pgx will treat nil as a NULL value, while lib/pq treats it as
+		// an empty string. We'll remove the ambiguity by making it a zero-length
+		// byte slice instead
+		endLimitKey = []byte{}
+	}
 
 	return opi.client.db.Query(ctx, fmt.Sprintf(`
 		SELECT pd.fullpath, pd.metadata
@@ -144,5 +172,5 @@ func (opi *orderedPostgresIterator) doNextQuery(ctx context.Context) (_ *sql.Row
 			AND ($2::BYTEA = ''::BYTEA OR pd.fullpath < $2::BYTEA)
 		ORDER BY pd.fullpath
 		LIMIT $3
-	`, gt), start, []byte(opi.largestKey), opi.batchSize)
+	`, gt), start, endLimitKey, opi.batchSize)
 }

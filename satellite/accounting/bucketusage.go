@@ -6,10 +6,10 @@ package accounting
 import (
 	"time"
 
-	"github.com/skyrings/skyring-common/tools/uuid"
+	"storj.io/common/uuid"
 )
 
-// BucketStorageTally holds data about a bucket tally
+// BucketStorageTally holds data about a bucket tally.
 type BucketStorageTally struct {
 	BucketName    string
 	ProjectID     uuid.UUID

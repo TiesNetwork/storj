@@ -7,6 +7,7 @@
 *.so
 *.dylib
 *.db
+*.wasm
 
 # Test binary, build with `go test -c`
 *.test
@@ -33,3 +34,5 @@
 resource.syso
 
 *.resource.go
+
+.build

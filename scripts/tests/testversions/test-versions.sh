@@ -5,11 +5,24 @@ set -ueo pipefail
 main_cfg_dir=$1
 command=$2
 uplink_version=$3
+update_access_script_path=$4
 
 bucket="bucket-123"
 test_files_dir="${main_cfg_dir}/testfiles"
 stage1_dst_dir="${main_cfg_dir}/stage1"
 stage2_dst_dir="${main_cfg_dir}/stage2"
+
+replace_in_file(){
+    local src="$1"
+    local dest="$2"
+    local path=$3
+    case "$OSTYPE" in
+    darwin*)
+        sed -i '' "s|# ${src}|${dest}|" "${path}" ;;
+    *)
+        sed -i "s|# ${src}|${dest}|" "${path}" ;;
+    esac
+}
 
 setup(){
     mkdir -p "$test_files_dir" "$stage1_dst_dir" "$stage2_dst_dir"
@@ -18,9 +31,9 @@ setup(){
         output=$2
 	    head -c $size </dev/urandom > $output
     }
-    random_bytes_file "2048"   "$test_files_dir/small-upload-testfile"          # create 2kb file of random bytes (inline)
-    random_bytes_file "5120" "$test_files_dir/big-upload-testfile"              # create 5kb file of random bytes (remote)
-    random_bytes_file "131072" "$test_files_dir/multisegment-upload-testfile"   # create 128kb file of random bytes (remote)
+    random_bytes_file "2KiB"  "$test_files_dir/small-upload-testfile"         # create 2kb file of random bytes (inline)
+    random_bytes_file "5KiB"  "$test_files_dir/big-upload-testfile"           # create 5kb file of random bytes (remote)
+    random_bytes_file "64MiB" "$test_files_dir/multisegment-upload-testfile"  # create 64mb file of random bytes (remote + inline)
 
     echo "setup test successfully"
 }
@@ -54,31 +67,12 @@ if [ ! -d ${main_cfg_dir}/uplink ]; then
     mkdir -p ${main_cfg_dir}/uplink
     api_key=$(storj-sim --config-dir=$main_cfg_dir network env GATEWAY_0_API_KEY)
     sat_addr=$(storj-sim --config-dir=$main_cfg_dir network env SATELLITE_0_ADDR)
-    should_use_access=$(echo $uplink_version | awk 'BEGIN{FS="[v.]"} $3 >= 30 || $2 >= 1 {print $0}')
-    if [[ ${#should_use_access} -gt 0 ]]; then
-        access=$(storj-sim --config-dir=$main_cfg_dir network env GATEWAY_0_ACCESS)
-        uplink import --config-dir="${main_cfg_dir}/uplink" "${access}" --client.segment-size="64.0 KiB"
-    else
-        uplink setup --config-dir="${main_cfg_dir}/uplink" --non-interactive --api-key="$api_key" --satellite-addr="$sat_addr" --enc.encryption-key="test" --client.segment-size="64.0 KiB"
-    fi
-fi
+    access=$(storj-sim --config-dir=$main_cfg_dir network env GATEWAY_0_ACCESS)
+    new_access=$(go run $update_access_script_path $(storj-sim --config-dir=$main_cfg_dir network env SATELLITE_0_DIR) $access)
+    uplink --metrics.addr="" import --config-dir="${main_cfg_dir}/uplink" "${new_access}"
 
-if [[ $uplink_version = "v0.29.10" ]]; then
-    uplink share --config-dir="${main_cfg_dir}/uplink" | grep "Scope" | awk -F ": " '{print $2}' | tee ${main_cfg_dir}/uplink/access.txt
-fi
-
-# after version v0.30.x we need to use access instead of separate values for api key, sat addr, and encryption key
-should_use_access=$(echo $uplink_version | awk 'BEGIN{FS="[v.]"} $3 == 30 {print $0}')
-if [[ ${#should_use_access} -gt 0 ]] && [ -e ${main_cfg_dir}/uplink/access.txt ]
-then
-    # the access provided by storj-sim uses an empty encryption key; we cannot do uplink setup above with an empty encryption key
-    # therefore, we use a hack -> get an access key from the existing uplink config, then import that same access key
-
-    # super hack:
-    access=$(head -n 1 ${main_cfg_dir}/uplink/access.txt)
-    echo "import for uplink $access"
-    uplink import --config-dir="${main_cfg_dir}/uplink" "${access}"
-    rm -rf ${main_cfg_dir}/uplink/access.txt
+    replace_in_file "version.server-address:.*" "version.server-address: http://$(storj-sim --config-dir=$main_cfg_dir network env VERSIONCONTROL_0_ADDR)" ${main_cfg_dir}/uplink/config.yaml
+    replace_in_file "tls.use-peer-ca-whitelist:.*" "tls.use-peer-ca-whitelist: false" ${main_cfg_dir}/uplink/config.yaml
 fi
 
 echo -e "\nConfig directory for satellite:"
@@ -143,7 +137,7 @@ if [[ "$command" == "upload" ]]; then
 fi
 
 if [[ "$command" == "download" ]]; then
-    existing_bucket_name_suffixes=$4
+    existing_bucket_name_suffixes=$5
 
     # download all uploaded files from stage 1 with currently selected uplink
     for suffix in ${existing_bucket_name_suffixes}; do

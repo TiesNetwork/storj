@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"io/ioutil"
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/gorilla/mux"
@@ -14,6 +15,7 @@ import (
 	"github.com/zeebo/errs"
 	"go.uber.org/zap"
 
+	"storj.io/common/uuid"
 	"storj.io/storj/satellite/console"
 )
 
@@ -88,7 +90,21 @@ func (p *Payments) ProjectsCharges(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 
-	charges, err := p.service.Payments().ProjectsCharges(ctx)
+	sinceStamp, err := strconv.ParseInt(r.URL.Query().Get("from"), 10, 64)
+	if err != nil {
+		p.serveJSONError(w, http.StatusBadRequest, err)
+		return
+	}
+	beforeStamp, err := strconv.ParseInt(r.URL.Query().Get("to"), 10, 64)
+	if err != nil {
+		p.serveJSONError(w, http.StatusBadRequest, err)
+		return
+	}
+
+	since := time.Unix(sinceStamp, 0).UTC()
+	before := time.Unix(beforeStamp, 0).UTC()
+
+	charges, err := p.service.Payments().ProjectsCharges(ctx, since, before)
 	if err != nil {
 		if console.ErrUnauthorized.Has(err) {
 			p.serveJSONError(w, http.StatusUnauthorized, err)
@@ -246,13 +262,16 @@ func (p *Payments) TokenDeposit(w http.ResponseWriter, r *http.Request) {
 
 	if err = json.NewDecoder(r.Body).Decode(&requestData); err != nil {
 		p.serveJSONError(w, http.StatusBadRequest, err)
+		return
 	}
 
 	if requestData.Amount < 0 {
 		p.serveJSONError(w, http.StatusBadRequest, errs.New("amount can not be negative"))
+		return
 	}
 	if requestData.Amount == 0 {
 		p.serveJSONError(w, http.StatusBadRequest, errs.New("amount should be greater than zero"))
+		return
 	}
 
 	tx, err := p.service.Payments().TokenDeposit(ctx, requestData.Amount)
@@ -290,8 +309,42 @@ func (p *Payments) TokenDeposit(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// PaywallEnabled returns is paywall enabled status.
+func (p *Payments) PaywallEnabled(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	var err error
+	defer mon.Task()(&ctx)(&err)
+
+	vars := mux.Vars(r)
+	reqID := vars["userId"]
+
+	if reqID == "" {
+		p.serveJSONError(w, http.StatusBadRequest, err)
+		return
+	}
+
+	userID, err := uuid.FromString(reqID)
+	if err != nil {
+		p.serveJSONError(w, http.StatusInternalServerError, err)
+		return
+	}
+
+	paywallEnabled := p.service.PaywallEnabled(userID)
+
+	err = json.NewEncoder(w).Encode(paywallEnabled)
+	if err != nil {
+		p.log.Error("failed to write json paywall enabled response", zap.Error(ErrPaymentsAPI.Wrap(err)))
+	}
+}
+
 // serveJSONError writes JSON error to response output stream.
 func (p *Payments) serveJSONError(w http.ResponseWriter, status int, err error) {
+	if status == http.StatusInternalServerError {
+		p.log.Error("returning error to client", zap.Int("code", status), zap.Error(err))
+	} else {
+		p.log.Debug("returning error to client", zap.Int("code", status), zap.Error(err))
+	}
+
 	w.WriteHeader(status)
 
 	var response struct {

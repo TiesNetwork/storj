@@ -7,10 +7,13 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 
 	"github.com/zeebo/errs"
 
+	"storj.io/storj/private/dbutil/cockroachutil"
+	"storj.io/storj/private/tagsql"
 	"storj.io/storj/storage"
 )
 
@@ -20,7 +23,7 @@ type orderedCockroachIterator struct {
 	delimiter      byte
 	batchSize      int
 	curIndex       int
-	curRows        *sql.Rows
+	curRows        tagsql.Rows
 	skipPrefix     bool
 	lastKeySeen    storage.Key
 	largestKey     storage.Key
@@ -39,7 +42,7 @@ func newOrderedCockroachIterator(ctx context.Context, cli *Client, opts storage.
 		opts.First = opts.Prefix
 	}
 
-	opi := &orderedCockroachIterator{
+	oci := &orderedCockroachIterator{
 		client:    cli,
 		opts:      &opts,
 		delimiter: byte('/'),
@@ -48,57 +51,90 @@ func newOrderedCockroachIterator(ctx context.Context, cli *Client, opts storage.
 	}
 
 	if len(opts.Prefix) > 0 {
-		opi.largestKey = storage.AfterPrefix(opts.Prefix)
+		oci.largestKey = storage.AfterPrefix(opts.Prefix)
 	}
 
-	newRows, err := opi.doNextQuery(ctx)
+	newRows, err := oci.doNextQuery(ctx)
 	if err != nil {
 		return nil, err
 	}
-	opi.curRows = newRows
+	oci.curRows = newRows
 
-	return opi, nil
+	return oci, nil
 }
 
-func (opi *orderedCockroachIterator) Close() error {
-	return errs.Combine(opi.errEncountered, opi.curRows.Close())
+func (oci *orderedCockroachIterator) Close() error {
+	defer mon.Task()(nil)(nil)
+
+	return errs.Combine(oci.curRows.Err(), oci.errEncountered, oci.curRows.Close())
 }
 
 // Next fills in info for the next item in an ongoing listing.
-func (opi *orderedCockroachIterator) Next(ctx context.Context, item *storage.ListItem) bool {
+func (oci *orderedCockroachIterator) Next(ctx context.Context, item *storage.ListItem) bool {
 	defer mon.Task()(&ctx)(nil)
 
 	for {
-		for !opi.curRows.Next() {
-			if err := opi.curRows.Err(); err != nil && err != sql.ErrNoRows {
-				opi.errEncountered = errs.Wrap(err)
-				return false
+		for {
+			nextTask := mon.TaskNamed("check_next_row")(nil)
+			next := oci.curRows.Next()
+			nextTask(nil)
+			if next {
+				break
 			}
-			if err := opi.curRows.Close(); err != nil {
-				opi.errEncountered = errs.Wrap(err)
-				return false
+
+			result := func() bool {
+				defer mon.TaskNamed("acquire_new_query")(nil)(nil)
+
+				retry := false
+				if err := oci.curRows.Err(); err != nil && !errors.Is(err, sql.ErrNoRows) {
+					// This NeedsRetry needs to be exported here because it is
+					// expected behavior for cockroach to return retryable errors
+					// that will be captured in this Rows object.
+					if cockroachutil.NeedsRetry(err) {
+						mon.Event("needed_retry")
+						retry = true
+					} else {
+						oci.errEncountered = errs.Wrap(err)
+						return false
+					}
+				}
+				if err := oci.curRows.Close(); err != nil {
+					if cockroachutil.NeedsRetry(err) {
+						mon.Event("needed_retry")
+						retry = true
+					} else {
+						oci.errEncountered = errs.Wrap(err)
+						return false
+					}
+				}
+				if oci.curIndex < oci.batchSize && !retry {
+					return false
+				}
+				newRows, err := oci.doNextQuery(ctx)
+				if err != nil {
+					oci.errEncountered = errs.Wrap(err)
+					return false
+				}
+				oci.curRows = newRows
+				oci.curIndex = 0
+				return true
+			}()
+			if !result {
+				return result
 			}
-			if opi.curIndex < opi.batchSize {
-				return false
-			}
-			newRows, err := opi.doNextQuery(ctx)
-			if err != nil {
-				opi.errEncountered = errs.Wrap(err)
-				return false
-			}
-			opi.curRows = newRows
-			opi.curIndex = 0
 		}
 
 		var k, v []byte
-		err := opi.curRows.Scan(&k, &v)
+		scanTask := mon.TaskNamed("scan_next_row")(nil)
+		err := oci.curRows.Scan(&k, &v)
+		scanTask(&err)
 		if err != nil {
-			opi.errEncountered = errs.Wrap(err)
+			oci.errEncountered = errs.Wrap(err)
 			return false
 		}
-		opi.curIndex++
+		oci.curIndex++
 
-		if !bytes.HasPrefix(k, []byte(opi.opts.Prefix)) {
+		if !bytes.HasPrefix(k, []byte(oci.opts.Prefix)) {
 			return false
 		}
 
@@ -106,42 +142,49 @@ func (opi *orderedCockroachIterator) Next(ctx context.Context, item *storage.Lis
 		item.Value = storage.Value(v)
 		item.IsPrefix = false
 
-		if !opi.opts.Recurse {
-			if idx := bytes.IndexByte(item.Key[len(opi.opts.Prefix):], opi.delimiter); idx >= 0 {
-				item.Key = item.Key[:len(opi.opts.Prefix)+idx+1]
+		if !oci.opts.Recurse {
+			if idx := bytes.IndexByte(item.Key[len(oci.opts.Prefix):], oci.delimiter); idx >= 0 {
+				item.Key = item.Key[:len(oci.opts.Prefix)+idx+1]
 				item.Value = nil
 				item.IsPrefix = true
 			}
 		}
-		if opi.lastKeySeen.Equal(item.Key) {
+		if oci.lastKeySeen.Equal(item.Key) {
 			continue
 		}
 
-		opi.skipPrefix = item.IsPrefix
-		opi.lastKeySeen = item.Key
+		oci.skipPrefix = item.IsPrefix
+		oci.lastKeySeen = item.Key
 		return true
 	}
 }
 
-func (opi *orderedCockroachIterator) doNextQuery(ctx context.Context) (_ *sql.Rows, err error) {
+func (oci *orderedCockroachIterator) doNextQuery(ctx context.Context) (_ tagsql.Rows, err error) {
 	defer mon.Task()(&ctx)(&err)
 
 	gt := ">"
-	start := opi.lastKeySeen
+	start := oci.lastKeySeen
 
+	largestKey := []byte(oci.largestKey)
+	if largestKey == nil {
+		// github.com/lib/pq would treat nil as an empty bytea array, while
+		// github.com/jackc/pgx will treat nil as NULL. Make an explicit empty
+		// byte array so that they'll work the same.
+		largestKey = []byte{}
+	}
 	if len(start) == 0 {
-		start = opi.opts.First
+		start = oci.opts.First
 		gt = ">="
-	} else if opi.skipPrefix {
+	} else if oci.skipPrefix {
 		start = storage.AfterPrefix(start)
 		gt = ">="
 	}
 
-	return opi.client.db.QueryContext(ctx, fmt.Sprintf(`
+	return oci.client.db.QueryContext(ctx, fmt.Sprintf(`
 		SELECT pd.fullpath, pd.metadata
 		FROM pathdata pd
 		WHERE pd.fullpath %s $1:::BYTEA
 			AND ($2:::BYTEA = '':::BYTEA OR pd.fullpath < $2:::BYTEA)
 		LIMIT $3
-	`, gt), start, []byte(opi.largestKey), opi.batchSize)
+	`, gt), start, largestKey, oci.batchSize)
 }

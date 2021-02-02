@@ -6,6 +6,8 @@ package collector
 
 import (
 	"context"
+	"errors"
+	"os"
 	"time"
 
 	"github.com/spacemonkeygo/monkit/v3"
@@ -13,7 +15,7 @@ import (
 
 	"storj.io/common/sync2"
 	"storj.io/storj/storagenode/pieces"
-	"storj.io/storj/storagenode/piecestore"
+	"storj.io/storj/storagenode/piecestore/usedserials"
 )
 
 var mon = monkit.Package()
@@ -29,13 +31,13 @@ type Config struct {
 type Service struct {
 	log         *zap.Logger
 	pieces      *pieces.Store
-	usedSerials piecestore.UsedSerials
+	usedSerials *usedserials.Table
 
 	Loop *sync2.Cycle
 }
 
 // NewService creates a new collector service.
-func NewService(log *zap.Logger, pieces *pieces.Store, usedSerials piecestore.UsedSerials, config Config) *Service {
+func NewService(log *zap.Logger, pieces *pieces.Store, usedSerials *usedserials.Table, config Config) *Service {
 	return &Service{
 		log:         log,
 		pieces:      pieces,
@@ -44,7 +46,7 @@ func NewService(log *zap.Logger, pieces *pieces.Store, usedSerials piecestore.Us
 	}
 }
 
-// Run runs monitor service
+// Run runs collector service.
 func (service *Service) Run(ctx context.Context) (err error) {
 	defer mon.Task()(&ctx)(&err)
 
@@ -70,9 +72,7 @@ func (service *Service) Close() (err error) {
 func (service *Service) Collect(ctx context.Context, now time.Time) (err error) {
 	defer mon.Task()(&ctx)(&err)
 
-	if deleteErr := service.usedSerials.DeleteExpired(ctx, now); err != nil {
-		service.log.Error("unable to delete expired used serials", zap.Error(deleteErr))
-	}
+	service.usedSerials.DeleteExpired(now)
 
 	const maxBatches = 100
 	const batchSize = 1000
@@ -96,6 +96,10 @@ func (service *Service) Collect(ctx context.Context, now time.Time) (err error) 
 		for _, expired := range infos {
 			err := service.pieces.Delete(ctx, expired.SatelliteID, expired.PieceID)
 			if err != nil {
+				if os.IsNotExist(errors.Unwrap(err)) {
+					service.log.Info("file does not exist", zap.Stringer("Satellite ID", expired.SatelliteID), zap.Stringer("Piece ID", expired.PieceID))
+					continue
+				}
 				errfailed := service.pieces.DeleteFailed(ctx, expired, now)
 				if errfailed != nil {
 					service.log.Error("unable to update piece info", zap.Stringer("Satellite ID", expired.SatelliteID), zap.Stringer("Piece ID", expired.PieceID), zap.Error(errfailed))

@@ -4,9 +4,11 @@
 package gc_test
 
 import (
+	"errors"
 	"testing"
 	"time"
 
+	"github.com/btcsuite/btcutil/base58"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
 
@@ -19,6 +21,7 @@ import (
 	"storj.io/common/testrand"
 	"storj.io/storj/private/testplanet"
 	"storj.io/storj/satellite"
+	"storj.io/storj/satellite/metainfo/metabase"
 	"storj.io/storj/storage"
 	"storj.io/storj/storagenode"
 )
@@ -29,7 +32,7 @@ import (
 // * Delete one object from the metainfo service on the satellite
 // * Wait for bloom filter generation
 // * Check that pieces of the deleted object are deleted on the storagenode
-// * Check that pieces of the kept object are not deleted on the storagenode
+// * Check that pieces of the kept object are not deleted on the storagenode.
 func TestGarbageCollection(t *testing.T) {
 	testplanet.Run(t, testplanet.Config{
 		SatelliteCount: 1, StorageNodeCount: 1, UplinkCount: 1,
@@ -121,21 +124,51 @@ func TestGarbageCollection(t *testing.T) {
 	})
 }
 
-func getPointer(ctx *testcontext.Context, t *testing.T, satellite *testplanet.SatelliteSystem, upl *testplanet.Uplink, bucket, path string) (lastSegPath string, pointer *pb.Pointer) {
-	projects, err := satellite.DB.Console().Projects().GetAll(ctx)
-	require.NoError(t, err)
-	require.Len(t, projects, 1)
+func getPointer(ctx *testcontext.Context, t *testing.T, satellite *testplanet.Satellite, upl *testplanet.Uplink, bucket, path string) (_ metabase.SegmentKey, pointer *pb.Pointer) {
+	access := upl.Access[satellite.ID()]
 
-	encParameters := upl.GetConfig(satellite).GetEncryptionParameters()
-	cipherSuite := encParameters.CipherSuite
+	serializedAccess, err := access.Serialize()
+	require.NoError(t, err)
+
+	store, err := encryptionAccess(serializedAccess)
+	require.NoError(t, err)
+
+	encryptedPath, err := encryption.EncryptPathWithStoreCipher(bucket, paths.NewUnencrypted(path), store)
+	require.NoError(t, err)
+
+	segmentLocation := metabase.SegmentLocation{
+		ProjectID:  upl.Projects[0].ID,
+		BucketName: bucket,
+		Index:      metabase.LastSegmentIndex,
+		ObjectKey:  metabase.ObjectKey(encryptedPath.Raw()),
+	}
+
+	key := segmentLocation.Encode()
+	pointer, err = satellite.Metainfo.Service.Get(ctx, key)
+	require.NoError(t, err)
+
+	return key, pointer
+}
+
+func encryptionAccess(access string) (*encryption.Store, error) {
+	data, version, err := base58.CheckDecode(access)
+	if err != nil || version != 0 {
+		return nil, errors.New("invalid access grant format")
+	}
+
+	p := new(pb.Scope)
+	if err := pb.Unmarshal(data, p); err != nil {
+		return nil, err
+	}
+
+	key, err := storj.NewKey(p.EncryptionAccess.DefaultKey)
+	if err != nil {
+		return nil, err
+	}
+
 	store := encryption.NewStore()
-	store.SetDefaultKey(new(storj.Key))
-	encryptedPath, err := encryption.EncryptPath(bucket, paths.NewUnencrypted(path), cipherSuite, store)
-	require.NoError(t, err)
+	store.SetDefaultKey(key)
+	store.SetDefaultPathCipher(storj.EncAESGCM)
 
-	lastSegPath = storj.JoinPaths(projects[0].ID.String(), "l", bucket, encryptedPath.Raw())
-	pointer, err = satellite.Metainfo.Service.Get(ctx, lastSegPath)
-	require.NoError(t, err)
-
-	return lastSegPath, pointer
+	return store, nil
 }

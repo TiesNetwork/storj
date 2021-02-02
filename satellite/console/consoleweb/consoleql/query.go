@@ -5,27 +5,24 @@ package consoleql
 
 import (
 	"github.com/graphql-go/graphql"
-	"github.com/skyrings/skyring-common/tools/uuid"
 
+	"storj.io/common/uuid"
 	"storj.io/storj/satellite/console"
 	"storj.io/storj/satellite/mailservice"
-	"storj.io/storj/satellite/rewards"
 )
 
 const (
-	// Query is immutable graphql request
+	// Query is immutable graphql request.
 	Query = "query"
-	// ProjectQuery is a query name for project
+	// ProjectQuery is a query name for project.
 	ProjectQuery = "project"
-	// MyProjectsQuery is a query name for projects related to account
+	// OwnedProjectsQuery is a query name for projects owned by an account.
+	OwnedProjectsQuery = "ownedProjects"
+	// MyProjectsQuery is a query name for projects related to account.
 	MyProjectsQuery = "myProjects"
-	// ActiveRewardQuery is a query name for current active reward offer
-	ActiveRewardQuery = "activeReward"
-	// CreditUsageQuery is a query name for credit usage related to an user
-	CreditUsageQuery = "creditUsage"
 )
 
-// rootQuery creates query for graphql populated by AccountsClient
+// rootQuery creates query for graphql populated by AccountsClient.
 func rootQuery(service *console.Service, mailService *mailservice.Service, types *TypeCreator) *graphql.Object {
 	return graphql.NewObject(graphql.ObjectConfig{
 		Name: Query,
@@ -40,17 +37,30 @@ func rootQuery(service *console.Service, mailService *mailservice.Service, types
 				Resolve: func(p graphql.ResolveParams) (interface{}, error) {
 					inputID, _ := p.Args[FieldID].(string)
 
-					id, err := uuid.Parse(inputID)
+					id, err := uuid.FromString(inputID)
 					if err != nil {
 						return nil, err
 					}
 
-					project, err := service.GetProject(p.Context, *id)
+					project, err := service.GetProject(p.Context, id)
 					if err != nil {
 						return nil, err
 					}
 
 					return project, nil
+				},
+			},
+			OwnedProjectsQuery: &graphql.Field{
+				Type: types.projectsPage,
+				Args: graphql.FieldConfigArgument{
+					CursorArg: &graphql.ArgumentConfig{
+						Type: graphql.NewNonNull(types.projectsCursor),
+					},
+				},
+				Resolve: func(p graphql.ResolveParams) (interface{}, error) {
+					cursor := fromMapProjectsCursor(p.Args[CursorArg].(map[string]interface{}))
+					page, err := service.GetUsersOwnedProjectsPage(p.Context, cursor)
+					return page, err
 				},
 			},
 			MyProjectsQuery: &graphql.Field{
@@ -62,35 +72,6 @@ func rootQuery(service *console.Service, mailService *mailservice.Service, types
 					}
 
 					return projects, nil
-				},
-			},
-			ActiveRewardQuery: &graphql.Field{
-				Type: types.reward,
-				Args: graphql.FieldConfigArgument{
-					FieldType: &graphql.ArgumentConfig{
-						Type: graphql.NewNonNull(graphql.Int),
-					},
-				},
-				Resolve: func(p graphql.ResolveParams) (interface{}, error) {
-					rewardType, _ := p.Args[FieldType].(int)
-
-					offer, err := service.GetCurrentRewardByType(p.Context, rewards.OfferType(rewardType))
-					if err != nil {
-						return nil, err
-					}
-
-					return offer, nil
-				},
-			},
-			CreditUsageQuery: &graphql.Field{
-				Type: types.creditUsage,
-				Resolve: func(p graphql.ResolveParams) (interface{}, error) {
-					usage, err := service.GetUserCreditUsage(p.Context)
-					if err != nil {
-						return nil, err
-					}
-
-					return usage, nil
 				},
 			},
 		},

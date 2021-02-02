@@ -9,12 +9,12 @@ import (
 	"path/filepath"
 	"time"
 
-	"storj.io/storj/private/version"
+	"storj.io/private/version"
 	"storj.io/storj/private/version/checker"
 	"storj.io/storj/versioncontrol"
 )
 
-// newVersionControlServer initializes the Versioning Server
+// newVersionControlServer initializes the Versioning Server.
 func (planet *Planet) newVersionControlServer() (peer *versioncontrol.Peer, err error) {
 
 	prefix := "versioncontrol"
@@ -25,6 +25,17 @@ func (planet *Planet) newVersionControlServer() (peer *versioncontrol.Peer, err 
 		return nil, err
 	}
 
+	var minimum, suggested versioncontrol.VersionConfig
+	minimum.Version = "v0.0.1"
+	suggested.Version = "v0.0.1"
+
+	defaultProcessConfig := versioncontrol.ProcessConfig{
+		Minimum:   minimum,
+		Suggested: suggested,
+		Rollout: versioncontrol.RolloutConfig{
+			Seed: "0000000000000000000000000000000000000000000000000000000000000001",
+		},
+	}
 	config := &versioncontrol.Config{
 		Address: "127.0.0.1:0",
 		Versions: versioncontrol.OldVersionConfig{
@@ -34,6 +45,17 @@ func (planet *Planet) newVersionControlServer() (peer *versioncontrol.Peer, err 
 			Gateway:     "v0.0.1",
 			Identity:    "v0.0.1",
 		},
+		Binary: versioncontrol.ProcessesConfig{
+			Satellite:          defaultProcessConfig,
+			Storagenode:        defaultProcessConfig,
+			StoragenodeUpdater: defaultProcessConfig,
+			Uplink:             defaultProcessConfig,
+			Gateway:            defaultProcessConfig,
+			Identity:           defaultProcessConfig,
+		},
+	}
+	if planet.config.Reconfigure.VersionControl != nil {
+		planet.config.Reconfigure.VersionControl(config)
 	}
 	peer, err = versioncontrol.New(log, config)
 	if err != nil {

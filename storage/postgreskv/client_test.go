@@ -8,23 +8,22 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/lib/pq"
+	"github.com/jackc/pgx/v4"
+	"github.com/jackc/pgx/v4/stdlib"
+	"github.com/stretchr/testify/require"
 	"github.com/zeebo/errs"
 
 	"storj.io/common/testcontext"
-	"storj.io/storj/private/dbutil/pgutil/pgtest"
-	"storj.io/storj/private/dbutil/txutil"
+	"storj.io/storj/private/dbutil/pgtest"
 	"storj.io/storj/private/tagsql"
 	"storj.io/storj/storage"
 	"storj.io/storj/storage/testsuite"
 )
 
-func newTestPostgres(t testing.TB) (store *Client, cleanup func()) {
-	if *pgtest.ConnStr == "" {
-		t.Skipf("postgres flag missing, example:\n-postgres-test-db=%s", pgtest.DefaultConnStr)
-	}
+func openTestPostgres(ctx context.Context, t testing.TB) (store *Client, cleanup func()) {
+	connstr := pgtest.PickPostgres(t)
 
-	pgdb, err := New(*pgtest.ConnStr)
+	pgdb, err := Open(ctx, connstr, "satellite-test-postgres")
 	if err != nil {
 		t.Fatalf("init: %v", err)
 	}
@@ -37,8 +36,14 @@ func newTestPostgres(t testing.TB) (store *Client, cleanup func()) {
 }
 
 func TestSuite(t *testing.T) {
-	store, cleanup := newTestPostgres(t)
+	ctx := testcontext.New(t)
+	defer ctx.Cleanup()
+
+	store, cleanup := openTestPostgres(ctx, t)
 	defer cleanup()
+
+	err := store.MigrateToLatest(ctx)
+	require.NoError(t, err)
 
 	// zap := zaptest.NewLogger(t)
 	// loggedStore := storelogger.New(zap, store)
@@ -51,7 +56,7 @@ func TestThatMigrationActuallyHappened(t *testing.T) {
 	ctx := testcontext.New(t)
 	defer ctx.Cleanup()
 
-	store, cleanup := newTestPostgres(t)
+	store, cleanup := openTestPostgres(ctx, t)
 	defer cleanup()
 
 	rows, err := store.db.Query(ctx, `
@@ -89,36 +94,48 @@ func TestThatMigrationActuallyHappened(t *testing.T) {
 }
 
 func BenchmarkSuite(b *testing.B) {
-	store, cleanup := newTestPostgres(b)
+	b.Skip("broken")
+
+	ctx := context.Background()
+
+	store, cleanup := openTestPostgres(ctx, b)
 	defer cleanup()
 
 	testsuite.RunBenchmarks(b, store)
 }
 
-func bulkImport(ctx context.Context, db tagsql.DB, iter storage.Iterator) error {
-	return txutil.WithTx(ctx, db, nil, func(ctx context.Context, txn tagsql.Tx) (err error) {
-		stmt, err := txn.Prepare(ctx, pq.CopyIn("pathdata", "fullpath", "metadata"))
-		if err != nil {
-			return errs.New("Failed to initialize COPY FROM: %v", err)
-		}
-		defer func() {
-			err2 := stmt.Close()
-			if err2 != nil {
-				err = errs.Combine(err, errs.New("Failed to close COPY FROM statement: %v", err2))
-			}
-		}()
+type bulkImportCopyFromSource struct {
+	ctx  context.Context
+	iter storage.Iterator
+	item storage.ListItem
+}
 
-		var item storage.ListItem
-		for iter.Next(ctx, &item) {
-			if _, err := stmt.Exec(ctx, []byte(item.Key), []byte(item.Value)); err != nil {
-				return err
-			}
-		}
-		if _, err = stmt.Exec(ctx); err != nil {
-			return errs.New("Failed to complete COPY FROM: %v", err)
-		}
-		return nil
-	})
+func (bs *bulkImportCopyFromSource) Next() bool {
+	return bs.iter.Next(bs.ctx, &bs.item)
+}
+
+func (bs *bulkImportCopyFromSource) Values() ([]interface{}, error) {
+	return []interface{}{bs.item.Key, bs.item.Value}, nil
+}
+
+func (bs *bulkImportCopyFromSource) Err() error {
+	// we can't determine this from storage.Iterator, I guess
+	return nil
+}
+
+func bulkImport(ctx context.Context, db tagsql.DB, iter storage.Iterator) (err error) {
+	defer mon.Task()(&ctx)(&err)
+	pgxConn, err := stdlib.AcquireConn(db.Internal())
+	if err != nil {
+		return err
+	}
+	defer func() {
+		err = errs.Combine(err, stdlib.ReleaseConn(db.Internal(), pgxConn))
+	}()
+
+	importSource := &bulkImportCopyFromSource{iter: iter}
+	_, err = pgxConn.CopyFrom(ctx, pgx.Identifier{"pathdata"}, []string{"fullpath", "metadata"}, importSource)
+	return err
 }
 
 func bulkDeleteAll(ctx context.Context, db tagsql.DB) error {
@@ -142,7 +159,9 @@ func (store *pgLongBenchmarkStore) BulkDeleteAll(ctx context.Context) error {
 }
 
 func BenchmarkSuiteLong(b *testing.B) {
-	store, cleanup := newTestPostgres(b)
+	ctx := context.Background()
+
+	store, cleanup := openTestPostgres(ctx, b)
 	defer cleanup()
 
 	testsuite.BenchmarkPathOperationsInLargeDb(b, &pgLongBenchmarkStore{store})

@@ -18,20 +18,22 @@ import (
 	"storj.io/common/sync2"
 	"storj.io/storj/satellite/metainfo"
 	"storj.io/storj/satellite/overlay"
-	"storj.io/uplink/piecestore"
+	"storj.io/uplink/private/piecestore"
 )
 
 var (
-	// Error defines the gc service errors class
+	// Error defines the gc service errors class.
 	Error = errs.Class("gc service error")
 	mon   = monkit.Package()
 )
 
-// Config contains configurable values for garbage collection
+// Config contains configurable values for garbage collection.
 type Config struct {
 	Interval  time.Duration `help:"the time between each send of garbage collection filters to storage nodes" releaseDefault:"120h" devDefault:"10m"`
 	Enabled   bool          `help:"set if garbage collection is enabled or not" releaseDefault:"true" devDefault:"true"`
 	SkipFirst bool          `help:"if true, skip the first run of GC" releaseDefault:"true" devDefault:"false"`
+	RunInCore bool          `help:"if true, run garbage collection as part of the core" releaseDefault:"false" devDefault:"false"`
+
 	// value for InitialPieces currently based on average pieces per node
 	InitialPieces     int           `help:"the initial number of pieces expected for a storage node to have, used for creating a filter" releaseDefault:"400000" devDefault:"10"`
 	FalsePositiveRate float64       `help:"the false positive rate used for creating a garbage collection bloom filter" releaseDefault:"0.1" devDefault:"0.1"`
@@ -39,7 +41,7 @@ type Config struct {
 	RetainSendTimeout time.Duration `help:"the amount of time to allow a node to handle a retain request" default:"1m"`
 }
 
-// Service implements the garbage collection service
+// Service implements the garbage collection service.
 //
 // architecture: Chore
 type Service struct {
@@ -52,14 +54,14 @@ type Service struct {
 	metainfoLoop *metainfo.Loop
 }
 
-// RetainInfo contains info needed for a storage node to retain important data and delete garbage data
+// RetainInfo contains info needed for a storage node to retain important data and delete garbage data.
 type RetainInfo struct {
 	Filter       *bloomfilter.Filter
 	CreationDate time.Time
 	Count        int
 }
 
-// NewService creates a new instance of the gc service
+// NewService creates a new instance of the gc service.
 func NewService(log *zap.Logger, config Config, dialer rpc.Dialer, overlay overlay.DB, loop *metainfo.Loop) *Service {
 	return &Service{
 		log:          log,
@@ -71,7 +73,7 @@ func NewService(log *zap.Logger, config Config, dialer rpc.Dialer, overlay overl
 	}
 }
 
-// Run starts the gc loop service
+// Run starts the gc loop service.
 func (service *Service) Run(ctx context.Context) (err error) {
 	defer mon.Task()(&ctx)(&err)
 
@@ -135,7 +137,7 @@ func (service *Service) Run(ctx context.Context) (err error) {
 			limiter.Go(ctx, func() {
 				err := service.sendRetainRequest(ctx, id, info)
 				if err != nil {
-					service.log.Error("error sending retain info to node", zap.Stringer("Node ID", id), zap.Error(err))
+					service.log.Warn("error sending retain info to node", zap.Stringer("Node ID", id), zap.Error(err))
 				}
 			})
 		}
@@ -161,7 +163,12 @@ func (service *Service) sendRetainRequest(ctx context.Context, id storj.NodeID, 
 		defer cancel()
 	}
 
-	client, err := piecestore.Dial(ctx, service.dialer, &dossier.Node, log, piecestore.DefaultConfig)
+	nodeurl := storj.NodeURL{
+		ID:      id,
+		Address: dossier.Address.Address,
+	}
+
+	client, err := piecestore.DialNodeURL(ctx, service.dialer, nodeurl, log, piecestore.DefaultConfig)
 	if err != nil {
 		return Error.Wrap(err)
 	}

@@ -1,11 +1,11 @@
 # Storj V3 Network
 
 [![Go Report Card](https://goreportcard.com/badge/storj.io/storj)](https://goreportcard.com/report/storj.io/storj)
-[![Go Doc](https://img.shields.io/badge/godoc-reference-blue.svg?style=flat-square)](https://godoc.org/storj.io/storj)
-[![Coverage Status](https://img.shields.io/badge/coverage-master-green.svg)](https://build.dev.storj.io/job/storj/job/master/cobertura)
+[![Go Doc](https://img.shields.io/badge/godoc-reference-blue.svg?style=flat-square)](https://pkg.go.dev/storj.io/storj)
+[![Coverage Status](https://img.shields.io/badge/coverage-master-green.svg)](https://build.dev.storj.io/job/storj/job/main/cobertura)
 ![Alpha](https://img.shields.io/badge/version-alpha-green.svg)
 
-<img src="https://github.com/storj/storj/raw/master/resources/logo.png" width="100">
+<img src="https://github.com/storj/storj/raw/main/resources/logo.png" width="100">
 
 Storj is building a decentralized cloud storage network.
 [Check out our white paper for more info!](https://storj.io/white-paper)
@@ -33,14 +33,13 @@ All of our code for Storj v3 is open source. Have a code change you think would 
 
 Have comments or bug reports? Want to propose a PR before hand-crafting it? Jump on to our [forum](https://forum.storj.io) and join the [Engineering Discussions](https://forum.storj.io/c/engineer-amas) to say hi to the developer community and to talk to the Storj core team.
 
-Want to vote on or suggest new features? Post it on [ideas.storj.io](https://ideas.storj.io).
+Want to vote on or suggest new features? Post it on the [forum](https://forum.storj.io/c/parent-cat/5).
 
 ### Issue tracking and roadmap
 
 See the breakdown of what we're building by checking out the following resources:
 
  * [White paper](https://storj.io/whitepaper)
- * [Aha! Roadmap](https://storjlabs.aha.io/published/01ee405b4bd8d14208c5256d70d73a38)
 
 ### Install required packages
 
@@ -92,10 +91,18 @@ Use Git to push your changes to your fork:
 
 ```bash
 git commit -a -m 'my changes!'
-git push origin master
+git push origin main
 ```
 
 Use Github to open a pull request!
+
+### A Note about Versioning
+
+While we are practicing [semantic versioning](https://semver.org/) for our client 
+libraries such as [uplink](https://github.com/storj/uplink), we are *not* practicing 
+semantic versioning in this repo, as we do not intend for it to be used via 
+[Go modules](https://blog.golang.org/using-go-modules). We may have 
+backwards-incompatible changes between minor and patch releases in this repo.
 
 # Start using Storj
 

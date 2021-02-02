@@ -4,6 +4,7 @@
 package piecestore_test
 
 import (
+	"bytes"
 	"io"
 	"strings"
 	"sync/atomic"
@@ -14,7 +15,6 @@ import (
 	"github.com/stretchr/testify/require"
 	"github.com/zeebo/errs"
 	"go.uber.org/zap"
-	"go.uber.org/zap/zaptest"
 	"golang.org/x/sync/errgroup"
 
 	"storj.io/common/errs2"
@@ -26,10 +26,11 @@ import (
 	"storj.io/common/storj"
 	"storj.io/common/testcontext"
 	"storj.io/common/testrand"
+	"storj.io/storj/private/testblobs"
 	"storj.io/storj/private/testplanet"
 	"storj.io/storj/storagenode"
 	"storj.io/storj/storagenode/bandwidth"
-	"storj.io/uplink/piecestore"
+	"storj.io/uplink/private/piecestore"
 )
 
 func TestUploadAndPartialDownload(t *testing.T) {
@@ -49,23 +50,25 @@ func TestUploadAndPartialDownload(t *testing.T) {
 			{1513, 1584},
 			{13581, 4783},
 		} {
-			if piecestore.DefaultConfig.InitialStep < tt.size {
-				t.Fatal("test expects initial step to be larger than size to download")
-			}
-			totalDownload += piecestore.DefaultConfig.InitialStep
+			func() {
+				if piecestore.DefaultConfig.InitialStep < tt.size {
+					t.Fatal("test expects initial step to be larger than size to download")
+				}
+				totalDownload += piecestore.DefaultConfig.InitialStep
 
-			download, cleanup, err := planet.Uplinks[0].DownloadStreamRange(ctx, planet.Satellites[0], "testbucket", "test/path", tt.offset, -1)
-			require.NoError(t, err)
-			defer ctx.Check(cleanup)
+				download, cleanup, err := planet.Uplinks[0].DownloadStreamRange(ctx, planet.Satellites[0], "testbucket", "test/path", tt.offset, -1)
+				require.NoError(t, err)
+				defer ctx.Check(cleanup)
 
-			data := make([]byte, tt.size)
-			n, err := io.ReadFull(download, data)
-			require.NoError(t, err)
-			assert.Equal(t, int(tt.size), n)
+				data := make([]byte, tt.size)
+				n, err := io.ReadFull(download, data)
+				require.NoError(t, err)
+				assert.Equal(t, int(tt.size), n)
 
-			assert.Equal(t, expectedData[tt.offset:tt.offset+tt.size], data)
+				assert.Equal(t, expectedData[tt.offset:tt.offset+tt.size], data)
 
-			require.NoError(t, download.Close())
+				require.NoError(t, download.Close())
+			}()
 		}
 
 		var totalBandwidthUsage bandwidth.Usage
@@ -140,13 +143,7 @@ func TestUpload(t *testing.T) {
 			orderLimit, err = signing.SignOrderLimit(ctx, signer, orderLimit)
 			require.NoError(t, err)
 
-			uploader, err := client.Upload(ctx, orderLimit, piecePrivateKey)
-			require.NoError(t, err)
-
-			_, err = uploader.Write(data)
-			require.NoError(t, err)
-
-			pieceHash, err := uploader.Commit(ctx)
+			pieceHash, err := client.UploadReader(ctx, orderLimit, piecePrivateKey, bytes.NewReader(data))
 			if tt.err != "" {
 				require.Error(t, err)
 				require.Contains(t, err.Error(), tt.err)
@@ -159,6 +156,68 @@ func TestUpload(t *testing.T) {
 				signee := signing.SignerFromFullIdentity(planet.StorageNodes[0].Identity)
 				require.NoError(t, signing.VerifyPieceHashSignature(ctx, signee, pieceHash))
 			}
+		}
+	})
+}
+
+func TestUploadOverAvailable(t *testing.T) {
+	testplanet.Run(t, testplanet.Config{
+		SatelliteCount: 1, StorageNodeCount: 1, UplinkCount: 1,
+		Reconfigure: testplanet.Reconfigure{
+			StorageNodeDB: func(index int, db storagenode.DB, log *zap.Logger) (storagenode.DB, error) {
+				return testblobs.NewLimitedSpaceDB(log.Named("overload"), db, 3000000), nil
+			},
+			StorageNode: func(index int, config *storagenode.Config) {
+				config.Storage2.Monitor.MinimumDiskSpace = 3 * memory.MB
+			},
+		},
+	}, func(t *testing.T, ctx *testcontext.Context, planet *testplanet.Planet) {
+		client, err := planet.Uplinks[0].DialPiecestore(ctx, planet.StorageNodes[0])
+		require.NoError(t, err)
+		defer ctx.Check(client.Close)
+
+		var tt struct {
+			pieceID       storj.PieceID
+			contentLength memory.Size
+			action        pb.PieceAction
+			err           string
+		}
+
+		tt.pieceID = storj.PieceID{1}
+		tt.contentLength = 5 * memory.MB
+		tt.action = pb.PieceAction_PUT
+		tt.err = "not enough available disk space, have: 3000000, need: 5000000"
+
+		data := testrand.Bytes(tt.contentLength)
+		serialNumber := testrand.SerialNumber()
+
+		orderLimit, piecePrivateKey := GenerateOrderLimit(
+			t,
+			planet.Satellites[0].ID(),
+			planet.StorageNodes[0].ID(),
+			tt.pieceID,
+			tt.action,
+			serialNumber,
+			24*time.Hour,
+			24*time.Hour,
+			int64(len(data)),
+		)
+		signer := signing.SignerFromFullIdentity(planet.Satellites[0].Identity)
+		orderLimit, err = signing.SignOrderLimit(ctx, signer, orderLimit)
+		require.NoError(t, err)
+
+		pieceHash, err := client.UploadReader(ctx, orderLimit, piecePrivateKey, bytes.NewReader(data))
+		if tt.err != "" {
+			require.Error(t, err)
+			require.Contains(t, err.Error(), tt.err)
+		} else {
+			require.NoError(t, err)
+
+			expectedHash := pkcrypto.SHA256Hash(data)
+			assert.Equal(t, expectedHash, pieceHash.Hash)
+
+			signee := signing.SignerFromFullIdentity(planet.StorageNodes[0].Identity)
+			require.NoError(t, signing.VerifyPieceHashSignature(ctx, signee, pieceHash))
 		}
 	})
 }
@@ -305,8 +364,13 @@ func TestDelete(t *testing.T) {
 	}, func(t *testing.T, ctx *testcontext.Context, planet *testplanet.Planet) {
 		pieceID := storj.PieceID{1}
 		uploadPiece(t, ctx, pieceID, planet.StorageNodes[0], planet.Uplinks[0], planet.Satellites[0])
-		client, err := planet.Uplinks[0].DialPiecestore(ctx, planet.StorageNodes[0])
+
+		nodeurl := planet.StorageNodes[0].NodeURL()
+		conn, err := planet.Uplinks[0].Dialer.DialNodeURL(ctx, nodeurl)
 		require.NoError(t, err)
+		defer ctx.Check(conn.Close)
+
+		client := pb.NewDRPCPiecestoreClient(conn)
 
 		for _, tt := range []struct {
 			pieceID storj.PieceID
@@ -336,7 +400,7 @@ func TestDelete(t *testing.T) {
 		} {
 			serialNumber := testrand.SerialNumber()
 
-			orderLimit, piecePrivateKey := GenerateOrderLimit(
+			orderLimit, _ := GenerateOrderLimit(
 				t,
 				planet.Satellites[0].ID(),
 				planet.StorageNodes[0].ID(),
@@ -351,7 +415,9 @@ func TestDelete(t *testing.T) {
 			orderLimit, err = signing.SignOrderLimit(ctx, signer, orderLimit)
 			require.NoError(t, err)
 
-			err := client.Delete(ctx, orderLimit, piecePrivateKey)
+			_, err := client.Delete(ctx, &pb.PieceDeleteRequest{
+				Limit: orderLimit,
+			})
 			if tt.err != "" {
 				require.Error(t, err)
 				require.Contains(t, err.Error(), tt.err)
@@ -366,34 +432,32 @@ func TestDeletePieces(t *testing.T) {
 	testplanet.Run(t, testplanet.Config{
 		SatelliteCount: 1, StorageNodeCount: 1, UplinkCount: 1,
 	}, func(t *testing.T, ctx *testcontext.Context, planet *testplanet.Planet) {
-		var (
-			planetSat = planet.Satellites[0]
-			planetSN  = planet.StorageNodes[0]
-		)
+		satellite := planet.Satellites[0]
+		storagenode := planet.StorageNodes[0]
 
-		var client *piecestore.Client
-		{
-			dossier, err := planetSat.Overlay.DB.Get(ctx.Context, planetSN.ID())
-			require.NoError(t, err)
+		nodeurl := storagenode.NodeURL()
+		conn, err := planet.Satellites[0].Dialer.DialNodeURL(ctx, nodeurl)
+		require.NoError(t, err)
+		defer ctx.Check(conn.Close)
 
-			client, err = piecestore.Dial(
-				ctx.Context, planetSat.Dialer, &dossier.Node, zaptest.NewLogger(t), piecestore.Config{},
-			)
-			require.NoError(t, err)
-		}
+		client := pb.NewDRPCPiecestoreClient(conn)
 
-		t.Run("Ok", func(t *testing.T) {
-			pieceIDs := []storj.PieceID{{1}, {2}, {3}, {4}}
+		t.Run("ok", func(t *testing.T) {
+			pieceIDs := []storj.PieceID{testrand.PieceID(), testrand.PieceID(), testrand.PieceID(), testrand.PieceID()}
 			dataArray := make([][]byte, len(pieceIDs))
 			for i, pieceID := range pieceIDs {
-				dataArray[i], _, _ = uploadPiece(t, ctx, pieceID, planetSN, planet.Uplinks[0], planetSat)
+				dataArray[i], _, _ = uploadPiece(t, ctx, pieceID, storagenode, planet.Uplinks[0], satellite)
 			}
 
-			err := client.DeletePieces(ctx.Context, pieceIDs...)
+			_, err := client.DeletePieces(ctx.Context, &pb.DeletePiecesRequest{
+				PieceIds: pieceIDs,
+			})
 			require.NoError(t, err)
 
+			planet.WaitForStorageNodeDeleters(ctx)
+
 			for i, pieceID := range pieceIDs {
-				_, err = downloadPiece(t, ctx, pieceID, int64(len(dataArray[i])), planetSN, planet.Uplinks[0], planetSat)
+				_, err = downloadPiece(t, ctx, pieceID, int64(len(dataArray[i])), storagenode, planet.Uplinks[0], satellite)
 				require.Error(t, err)
 			}
 			require.Condition(t, func() bool {
@@ -402,19 +466,23 @@ func TestDeletePieces(t *testing.T) {
 			}, "unexpected error message")
 		})
 
-		t.Run("Ok: one piece to delete is missing", func(t *testing.T) {
-			missingPieceID := storj.PieceID{12}
-			pieceIDs := []storj.PieceID{{1}, {2}, {3}, {4}}
+		t.Run("ok: one piece to delete is missing", func(t *testing.T) {
+			missingPieceID := testrand.PieceID()
+			pieceIDs := []storj.PieceID{testrand.PieceID(), testrand.PieceID(), testrand.PieceID(), testrand.PieceID()}
 			dataArray := make([][]byte, len(pieceIDs))
 			for i, pieceID := range pieceIDs {
-				dataArray[i], _, _ = uploadPiece(t, ctx, pieceID, planetSN, planet.Uplinks[0], planetSat)
+				dataArray[i], _, _ = uploadPiece(t, ctx, pieceID, storagenode, planet.Uplinks[0], satellite)
 			}
 
-			err := client.DeletePieces(ctx.Context, append(pieceIDs, missingPieceID)...)
+			_, err := client.DeletePieces(ctx.Context, &pb.DeletePiecesRequest{
+				PieceIds: append(pieceIDs, missingPieceID),
+			})
 			require.NoError(t, err)
 
+			planet.WaitForStorageNodeDeleters(ctx)
+
 			for i, pieceID := range pieceIDs {
-				_, err = downloadPiece(t, ctx, pieceID, int64(len(dataArray[i])), planetSN, planet.Uplinks[0], planetSat)
+				_, err = downloadPiece(t, ctx, pieceID, int64(len(dataArray[i])), storagenode, planet.Uplinks[0], satellite)
 				require.Error(t, err)
 			}
 			require.Condition(t, func() bool {
@@ -423,91 +491,45 @@ func TestDeletePieces(t *testing.T) {
 			}, "unexpected error message")
 		})
 
-		t.Run("Ok: no piece deleted", func(t *testing.T) {
-			pieceID := storj.PieceID{10}
-			data, _, _ := uploadPiece(t, ctx, pieceID, planetSN, planet.Uplinks[0], planetSat)
+		t.Run("ok: no piece deleted", func(t *testing.T) {
+			pieceID := testrand.PieceID()
+			data, _, _ := uploadPiece(t, ctx, pieceID, storagenode, planet.Uplinks[0], satellite)
 
-			err := client.DeletePieces(ctx.Context)
+			_, err := client.DeletePieces(ctx.Context, &pb.DeletePiecesRequest{})
 			require.NoError(t, err)
 
-			downloaded, err := downloadPiece(t, ctx, pieceID, int64(len(data)), planetSN, planet.Uplinks[0], planetSat)
+			planet.WaitForStorageNodeDeleters(ctx)
+
+			downloaded, err := downloadPiece(t, ctx, pieceID, int64(len(data)), storagenode, planet.Uplinks[0], satellite)
 			require.NoError(t, err)
 			require.Equal(t, data, downloaded)
 		})
 
 		t.Run("error: permission denied", func(t *testing.T) {
-			pieceID := storj.PieceID{11}
-			data, _, _ := uploadPiece(t, ctx, pieceID, planetSN, planet.Uplinks[0], planetSat)
-
-			client, err := planet.Uplinks[0].DialPiecestore(ctx, planetSN)
+			conn, err := planet.Uplinks[0].Dialer.DialNodeURL(ctx, nodeurl)
 			require.NoError(t, err)
+			defer ctx.Check(conn.Close)
+			client := pb.NewDRPCPiecestoreClient(conn)
 
-			err = client.DeletePieces(ctx.Context, pieceID)
+			pieceID := testrand.PieceID()
+			data, _, _ := uploadPiece(t, ctx, pieceID, storagenode, planet.Uplinks[0], satellite)
+
+			_, err = client.DeletePieces(ctx.Context, &pb.DeletePiecesRequest{
+				PieceIds: []storj.PieceID{pieceID},
+			})
 			require.Error(t, err)
 			require.Equal(t, rpcstatus.PermissionDenied, rpcstatus.Code(err))
 
-			downloaded, err := downloadPiece(t, ctx, pieceID, int64(len(data)), planetSN, planet.Uplinks[0], planetSat)
+			planet.WaitForStorageNodeDeleters(ctx)
+
+			downloaded, err := downloadPiece(t, ctx, pieceID, int64(len(data)), storagenode, planet.Uplinks[0], satellite)
 			require.NoError(t, err)
 			require.Equal(t, data, downloaded)
-		})
-	})
-}
-func TestDeletePiece(t *testing.T) {
-	testplanet.Run(t, testplanet.Config{
-		SatelliteCount: 1, StorageNodeCount: 1, UplinkCount: 1,
-	}, func(t *testing.T, ctx *testcontext.Context, planet *testplanet.Planet) {
-		var (
-			planetSat = planet.Satellites[0]
-			planetSN  = planet.StorageNodes[0]
-		)
-
-		var client *piecestore.Client
-		{
-			dossier, err := planetSat.Overlay.DB.Get(ctx.Context, planetSN.ID())
-			require.NoError(t, err)
-
-			client, err = piecestore.Dial(
-				ctx.Context, planetSat.Dialer, &dossier.Node, zaptest.NewLogger(t), piecestore.Config{},
-			)
-			require.NoError(t, err)
-		}
-
-		t.Run("Ok", func(t *testing.T) {
-			pieceID := storj.PieceID{1}
-			data, _, _ := uploadPiece(t, ctx, pieceID, planetSN, planet.Uplinks[0], planetSat)
-
-			err := client.DeletePiece(ctx.Context, pieceID)
-			require.NoError(t, err)
-
-			_, err = downloadPiece(t, ctx, pieceID, int64(len(data)), planetSN, planet.Uplinks[0], planetSat)
-			require.Error(t, err)
-
-			require.Condition(t, func() bool {
-				return strings.Contains(err.Error(), "file does not exist") ||
-					strings.Contains(err.Error(), "The system cannot find the path specified")
-			}, "unexpected error message")
-		})
-
-		t.Run("error: Not found", func(t *testing.T) {
-			err := client.DeletePiece(ctx.Context, storj.PieceID{2})
-			require.Error(t, err)
-			require.Equal(t, rpcstatus.NotFound, rpcstatus.Code(err))
-		})
-
-		t.Run("error: permission denied", func(t *testing.T) {
-			client, err := planet.Uplinks[0].DialPiecestore(ctx, planetSN)
-			require.NoError(t, err)
-
-			err = client.DeletePiece(ctx.Context, storj.PieceID{})
-			require.Error(t, err)
-			require.Equal(t, rpcstatus.PermissionDenied, rpcstatus.Code(err))
 		})
 	})
 }
 
 func TestTooManyRequests(t *testing.T) {
-	t.Skip("flaky, because of EOF issues")
-
 	const uplinkCount = 6
 	const maxConcurrent = 3
 	const expectedFailures = uplinkCount - maxConcurrent
@@ -529,11 +551,10 @@ func TestTooManyRequests(t *testing.T) {
 		for i, uplink := range planet.Uplinks {
 			i, uplink := i, uplink
 			uploads.Go(func() (err error) {
-				storageNode := planet.StorageNodes[0].Local()
+				storageNode := planet.StorageNodes[0]
 				config := piecestore.DefaultConfig
-				config.UploadBufferSize = 0 // disable buffering so we can detect write error early
 
-				client, err := piecestore.Dial(ctx, uplink.Dialer, &storageNode.Node, uplink.Log, config)
+				client, err := piecestore.DialNodeURL(ctx, uplink.Dialer, storageNode.NodeURL(), uplink.Log, config)
 				if err != nil {
 					return err
 				}
@@ -565,7 +586,7 @@ func TestTooManyRequests(t *testing.T) {
 					return err
 				}
 
-				upload, err := client.Upload(ctx, orderLimit, piecePrivateKey)
+				_, err = client.UploadReader(ctx, orderLimit, piecePrivateKey, bytes.NewReader(make([]byte, orderLimit.Limit)))
 				if err != nil {
 					if errs2.IsRPC(err, rpcstatus.Unavailable) {
 						if atomic.AddInt64(&failedCount, -1) == 0 {
@@ -574,30 +595,6 @@ func TestTooManyRequests(t *testing.T) {
 						return nil
 					}
 					uplink.Log.Error("upload failed", zap.Stringer("Piece ID", pieceID), zap.Error(err))
-					return err
-				}
-
-				_, err = upload.Write(make([]byte, orderLimit.Limit))
-				if err != nil {
-					if errs2.IsRPC(err, rpcstatus.Unavailable) {
-						if atomic.AddInt64(&failedCount, -1) == 0 {
-							close(doneWaiting)
-						}
-						return nil
-					}
-					uplink.Log.Error("write failed", zap.Stringer("Piece ID", pieceID), zap.Error(err))
-					return err
-				}
-
-				_, err = upload.Commit(ctx)
-				if err != nil {
-					if errs2.IsRPC(err, rpcstatus.Unavailable) {
-						if atomic.AddInt64(&failedCount, -1) == 0 {
-							close(doneWaiting)
-						}
-						return nil
-					}
-					uplink.Log.Error("commit failed", zap.Stringer("Piece ID", pieceID), zap.Error(err))
 					return err
 				}
 
@@ -628,8 +625,8 @@ func GenerateOrderLimit(t *testing.T, satellite storj.NodeID, storageNode storj.
 
 // uploadPiece uploads piece to storageNode.
 func uploadPiece(
-	t *testing.T, ctx *testcontext.Context, piece storj.PieceID, storageNode *storagenode.Peer,
-	uplink *testplanet.Uplink, satellite *testplanet.SatelliteSystem,
+	t *testing.T, ctx *testcontext.Context, piece storj.PieceID, storageNode *testplanet.StorageNode,
+	uplink *testplanet.Uplink, satellite *testplanet.Satellite,
 ) (uploadedData []byte, _ *pb.OrderLimit, _ *pb.PieceHash) {
 	t.Helper()
 
@@ -655,13 +652,7 @@ func uploadPiece(
 	orderLimit, err = signing.SignOrderLimit(ctx, signer, orderLimit)
 	require.NoError(t, err)
 
-	uploader, err := client.Upload(ctx, orderLimit, piecePrivateKey)
-	require.NoError(t, err)
-
-	_, err = uploader.Write(uploadedData)
-	require.NoError(t, err)
-
-	hash, err := uploader.Commit(ctx)
+	hash, err := client.UploadReader(ctx, orderLimit, piecePrivateKey, bytes.NewReader(uploadedData))
 	require.NoError(t, err)
 
 	return uploadedData, orderLimit, hash
@@ -670,7 +661,7 @@ func uploadPiece(
 // downloadPiece downlodads piece from storageNode.
 func downloadPiece(
 	t *testing.T, ctx *testcontext.Context, piece storj.PieceID, limit int64,
-	storageNode *storagenode.Peer, uplink *testplanet.Uplink, satellite *testplanet.SatelliteSystem,
+	storageNode *testplanet.StorageNode, uplink *testplanet.Uplink, satellite *testplanet.Satellite,
 ) (pieceData []byte, err error) {
 	t.Helper()
 

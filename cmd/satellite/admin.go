@@ -8,9 +8,8 @@ import (
 	"github.com/zeebo/errs"
 	"go.uber.org/zap"
 
-	"storj.io/storj/pkg/process"
-	"storj.io/storj/pkg/revocation"
-	"storj.io/storj/private/version"
+	"storj.io/private/process"
+	"storj.io/private/version"
 	"storj.io/storj/satellite"
 	"storj.io/storj/satellite/accounting/live"
 	"storj.io/storj/satellite/metainfo"
@@ -25,10 +24,12 @@ func cmdAdminRun(cmd *cobra.Command, args []string) (err error) {
 
 	identity, err := runCfg.Identity.Load()
 	if err != nil {
-		zap.S().Fatal(err)
+		log.Error("Failed to load identity.", zap.Error(err))
+		return errs.New("Failed to load identity: %+v", err)
 	}
 
-	db, err := satellitedb.New(log.Named("db"), runCfg.Database, satellitedb.Options{
+	db, err := satellitedb.Open(ctx, log.Named("db"), runCfg.Database, satellitedb.Options{
+		ApplicationName:   "satellite-admin",
 		APIKeysLRUOptions: runCfg.APIKeysLRUOptions(),
 	})
 	if err != nil {
@@ -38,7 +39,7 @@ func cmdAdminRun(cmd *cobra.Command, args []string) (err error) {
 		err = errs.Combine(err, db.Close())
 	}()
 
-	pointerDB, err := metainfo.NewStore(log.Named("pointerdb"), runCfg.Config.Metainfo.DatabaseURL)
+	peer, err := satellite.NewAdmin(log, identity, db, version.Build, &runCfg.Config, process.AtomicLevel(cmd))
 	if err != nil {
 		return errs.New("Error creating metainfo database on satellite api: %+v", err)
 	}
@@ -67,18 +68,18 @@ func cmdAdminRun(cmd *cobra.Command, args []string) (err error) {
 		return err
 	}
 
-	err = peer.Version.CheckVersion(ctx)
+	_, err = peer.Version.Service.CheckVersion(ctx)
 	if err != nil {
 		return err
 	}
 
 	if err := process.InitMetricsWithCertPath(ctx, log, nil, runCfg.Identity.CertPath); err != nil {
-		zap.S().Warn("Failed to initialize telemetry batcher on satellite api: ", err)
+		log.Warn("Failed to initialize telemetry batcher on satellite admin", zap.Error(err))
 	}
 
 	err = db.CheckVersion(ctx)
 	if err != nil {
-		zap.S().Fatal("failed satellite database version check: ", err)
+		log.Error("Failed satellite database version check.", zap.Error(err))
 		return errs.New("Error checking version for satellitedb: %+v", err)
 	}
 

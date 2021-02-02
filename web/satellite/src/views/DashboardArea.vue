@@ -2,26 +2,44 @@
 // See LICENSE for copying information.
 
 <template>
-    <div class="dashboard-container">
+    <div class="dashboard">
         <div v-if="isLoading" class="loading-overlay active">
             <img class="loading-image" src="@/../static/images/register/Loading.gif" alt="Company logo loading gif">
         </div>
-        <div v-if="!isLoading" class="dashboard-container__wrap">
-            <NavigationArea class="regular-navigation"/>
-            <div class="dashboard-container__wrap__column">
-                <DashboardHeader/>
-                <div class="dashboard-container__main-area">
-                    <div class="dashboard-container__main-area__banner-area">
-                        <VBanner
-                            v-if="isBannerShown"
-                            text="We’ve Now Added Billing!"
-                            additional-text="Your attention is required. Add a credit card to set up your account."
-                            :path="billingPath"
+        <div v-if="isBetaSatellite" class="dashboard__beta-banner">
+            <p class="dashboard__beta-banner__message">
+                Please be aware that this is a beta satellite. Data uploaded may be deleted at any point in time.
+            </p>
+        </div>
+        <NoPaywallInfoBar v-if="isNoPaywallInfoBarShown && !isLoading && !isBetaSatellite"/>
+        <div v-if="!isLoading" class="dashboard__wrap">
+            <DashboardHeader/>
+            <div class="dashboard__wrap__main-area">
+                <NavigationArea class="regular-navigation"/>
+                <div class="dashboard__wrap__main-area__content">
+                    <div class="dashboard__wrap__main-area__content__bar-area">
+                        <VInfoBar
+                            v-if="isBillingInfoBarShown"
+                            :first-value="storageRemaining"
+                            :second-value="bandwidthRemaining"
+                            first-description="of Storage Remaining"
+                            second-description="of Bandwidth Remaining"
+                            :path="projectDashboardPath"
+                            :link="projectLimitsIncreaseRequestURL"
+                            link-label="Request Limit Increase ->"
+                        />
+                        <VInfoBar
+                            v-if="isProjectLimitInfoBarShown"
+                            is-blue="true"
+                            :first-value="`You have used ${projectsCount}`"
+                            first-description="of your"
+                            :second-value="projectLimit"
+                            second-description="available projects."
+                            :link="projectLimitsIncreaseRequestURL"
+                            link-label="Request Project Limit Increase"
                         />
                     </div>
-                    <div class="dashboard-container__main-area__content">
-                        <router-view/>
-                    </div>
+                    <router-view/>
                 </div>
             </div>
         </div>
@@ -31,43 +49,70 @@
 <script lang="ts">
 import { Component, Vue } from 'vue-property-decorator';
 
-import VBanner from '@/components/common/VBanner.vue';
+import VInfoBar from '@/components/common/VInfoBar.vue';
 import DashboardHeader from '@/components/header/HeaderArea.vue';
 import NavigationArea from '@/components/navigation/NavigationArea.vue';
+import NoPaywallInfoBar from '@/components/noPaywallInfoBar/NoPaywallInfoBar.vue';
 
 import { ErrorUnauthorized } from '@/api/errors/ErrorUnauthorized';
 import { RouteConfig } from '@/router';
+import { ACCESS_GRANTS_ACTIONS } from '@/store/modules/accessGrants';
 import { BUCKET_ACTIONS } from '@/store/modules/buckets';
 import { PAYMENTS_ACTIONS } from '@/store/modules/payments';
 import { PROJECTS_ACTIONS } from '@/store/modules/projects';
-import { PROJECT_USAGE_ACTIONS } from '@/store/modules/usage';
 import { USER_ACTIONS } from '@/store/modules/users';
 import { Project } from '@/types/projects';
+import { Size } from '@/utils/bytesSize';
 import {
-    API_KEYS_ACTIONS,
     APP_STATE_ACTIONS,
     PM_ACTIONS,
 } from '@/utils/constants/actionNames';
 import { AppState } from '@/utils/constants/appStateEnum';
+import { LocalData } from '@/utils/localData';
+import { MetaUtils } from '@/utils/meta';
 
 const {
+    GET_PAYWALL_ENABLED_STATUS,
     SETUP_ACCOUNT,
     GET_BALANCE,
     GET_CREDIT_CARDS,
-    GET_BILLING_HISTORY,
-    GET_PROJECT_CHARGES,
+    GET_PAYMENTS_HISTORY,
+    GET_PROJECT_USAGE_AND_CHARGES_CURRENT_ROLLUP,
 } = PAYMENTS_ACTIONS;
 
 @Component({
     components: {
         NavigationArea,
         DashboardHeader,
-        VBanner,
+        VInfoBar,
+        NoPaywallInfoBar,
     },
 })
 export default class DashboardArea extends Vue {
-    private readonly billingPath: string = RouteConfig.Account.with(RouteConfig.Billing).path;
+    private FIRST_PAGE: number = 1;
 
+    /**
+     * Holds router link to project dashboard page.
+     */
+    public readonly projectDashboardPath: string = RouteConfig.ProjectDashboard.path;
+
+    /**
+     * Lifecycle hook before initial render.
+     * Sets access grants web worker.
+     */
+    public async beforeMount(): Promise<void> {
+        try {
+            await this.$store.dispatch(ACCESS_GRANTS_ACTIONS.STOP_ACCESS_GRANTS_WEB_WORKER);
+            await this.$store.dispatch(ACCESS_GRANTS_ACTIONS.SET_ACCESS_GRANTS_WEB_WORKER);
+        } catch (error) {
+            await this.$notify.error(`Unable to set access grants wizard. ${error.message}`);
+        }
+    }
+
+    /**
+     * Lifecycle hook after initial render.
+     * Pre fetches user`s and project information.
+     */
     public async mounted(): Promise<void> {
         // TODO: combine all project related requests in one
         try {
@@ -84,13 +129,39 @@ export default class DashboardArea extends Vue {
         }
 
         try {
-            await this.$store.dispatch(SETUP_ACCOUNT);
-            await this.$store.dispatch(GET_BALANCE);
-            await this.$store.dispatch(GET_CREDIT_CARDS);
-            await this.$store.dispatch(GET_BILLING_HISTORY);
-            await this.$store.dispatch(GET_PROJECT_CHARGES);
+            await this.$store.dispatch(GET_PAYWALL_ENABLED_STATUS);
         } catch (error) {
-            await this.$notify.error(error.message);
+            await this.$notify.error(`Unable to get paywall enabled status. ${error.message}`);
+        }
+
+        try {
+            await this.$store.dispatch(SETUP_ACCOUNT);
+        } catch (error) {
+            await this.$notify.error(`Unable to setup account. ${error.message}`);
+        }
+
+        try {
+            await this.$store.dispatch(GET_BALANCE);
+        } catch (error) {
+            await this.$notify.error(`Unable to get account balance. ${error.message}`);
+        }
+
+        try {
+            await this.$store.dispatch(GET_CREDIT_CARDS);
+        } catch (error) {
+            await this.$notify.error(`Unable to get credit cards. ${error.message}`);
+        }
+
+        try {
+            await this.$store.dispatch(GET_PAYMENTS_HISTORY);
+        } catch (error) {
+            await this.$notify.error(`Unable to get account payments history. ${error.message}`);
+        }
+
+        try {
+            await this.$store.dispatch(GET_PROJECT_USAGE_AND_CHARGES_CURRENT_ROLLUP);
+        } catch (error) {
+            await this.$notify.error(`Unable to get usage and charges for current billing period. ${error.message}`);
         }
 
         let projects: Project[] = [];
@@ -104,24 +175,40 @@ export default class DashboardArea extends Vue {
         }
 
         if (!projects.length) {
-            await this.$store.dispatch(APP_STATE_ACTIONS.CHANGE_STATE, AppState.LOADED_EMPTY);
+            await this.$store.dispatch(APP_STATE_ACTIONS.CHANGE_STATE, AppState.LOADED);
 
-            if (!this.isRouteAccessibleWithoutProject()) {
-                try {
-                    await this.$router.push(RouteConfig.ProjectOverview.with(RouteConfig.ProjectDetails).path);
-                } catch (err) {
-                    return;
-                }
+            try {
+                await this.$router.push(RouteConfig.OnboardingTour.with(RouteConfig.OverviewStep).path);
+            } catch (error) {
+                return;
             }
 
             return;
         }
 
-        await this.$store.dispatch(PROJECTS_ACTIONS.SELECT, projects[0].id);
+        this.selectProject(projects);
+
+        try {
+            await this.$store.dispatch(ACCESS_GRANTS_ACTIONS.FETCH, this.FIRST_PAGE);
+        } catch (error) {
+            await this.$notify.error(`Unable to fetch access grants. ${error.message}`);
+        }
+
+        try {
+            await this.$store.dispatch(PROJECTS_ACTIONS.FETCH_OWNED, this.FIRST_PAGE);
+        } catch (error) {
+            await this.$notify.error(`Unable to fetch owned projects. ${error.message}`);
+        }
+
+        try {
+            await this.$store.dispatch(BUCKET_ACTIONS.FETCH_ALL_BUCKET_NAMES);
+        } catch (error) {
+            await this.$notify.error(`Unable to fetch all bucket names. ${error.message}`);
+        }
 
         await this.$store.dispatch(PM_ACTIONS.SET_SEARCH_QUERY, '');
         try {
-            await this.$store.dispatch(PM_ACTIONS.FETCH, 1);
+            await this.$store.dispatch(PM_ACTIONS.FETCH, this.FIRST_PAGE);
         } catch (error) {
             await this.$notify.error(`Unable to fetch project members. ${error.message}`);
         }
@@ -133,19 +220,7 @@ export default class DashboardArea extends Vue {
         }
 
         try {
-            await this.$store.dispatch(API_KEYS_ACTIONS.FETCH, 1);
-        } catch (error) {
-            await this.$notify.error(`Unable to fetch api keys. ${error.message}`);
-        }
-
-        try {
-            await this.$store.dispatch(PROJECT_USAGE_ACTIONS.FETCH_CURRENT_ROLLUP);
-        } catch (error) {
-            await this.$notify.error(`Unable to fetch project usage. ${error.message}`);
-        }
-
-        try {
-            await this.$store.dispatch(BUCKET_ACTIONS.FETCH, 1);
+            await this.$store.dispatch(BUCKET_ACTIONS.FETCH, this.FIRST_PAGE);
         } catch (error) {
             await this.$notify.error(`Unable to fetch buckets. ${error.message}`);
         }
@@ -153,85 +228,142 @@ export default class DashboardArea extends Vue {
         await this.$store.dispatch(APP_STATE_ACTIONS.CHANGE_STATE, AppState.LOADED);
     }
 
-    public get isBannerShown(): boolean {
-        return this.$store.state.paymentsModule.creditCards.length === 0;
+    /**
+     * Indicates if no paywall info bar is shown.
+     */
+    public get isNoPaywallInfoBarShown(): boolean {
+        const isOnboardingTour: boolean = this.$route.path.includes(RouteConfig.OnboardingTour.path);
+
+        return !this.isPaywallEnabled && !isOnboardingTour &&
+            this.$store.state.paymentsModule.balance.coins === 0 &&
+            this.$store.state.paymentsModule.creditCards.length === 0;
     }
 
+    /**
+     * Indicates if satellite is in beta.
+     */
+    public get isBetaSatellite(): boolean {
+        return this.$store.state.appStateModule.isBetaSatellite;
+    }
+
+    /**
+     * Indicates if billing info bar is shown.
+     */
+    public get isBillingInfoBarShown(): boolean {
+        const showBillingInfoBar = (this.$route.name === RouteConfig.Billing.name) || (this.$route.name === RouteConfig.ProjectDashboard.name);
+
+        return showBillingInfoBar && this.projectsCount > 0;
+    }
+
+    /**
+     * Indicates if project limit info bar is shown.
+     */
+    public get isProjectLimitInfoBarShown(): boolean {
+        return this.$route.name === RouteConfig.ProjectsList.name;
+    }
+
+    /**
+     * Returns user's projects count.
+     */
+    public get projectsCount(): number {
+        return this.$store.getters.projectsCount;
+    }
+
+    /**
+     * Returns project limit from store.
+     */
+    public get projectLimit(): number {
+        const projectLimit: number = this.$store.getters.user.projectLimit;
+        if (projectLimit < this.projectsCount) return this.projectsCount;
+
+        return projectLimit;
+    }
+
+    /**
+     * Returns project limits increase request url from config.
+     */
+    public get projectLimitsIncreaseRequestURL(): string {
+        return MetaUtils.getMetaContent('project-limits-increase-request-url');
+    }
+
+    /**
+     * Returns formatted string of remaining storage.
+     */
+    public get storageRemaining(): string {
+        const storageUsed = this.$store.state.projectsModule.currentLimits.storageUsed;
+        const storageLimit = this.$store.state.projectsModule.currentLimits.storageLimit;
+
+        const difference = storageLimit - storageUsed;
+        if (difference < 0) {
+            return '0 Bytes';
+        }
+
+        const remaining = new Size(difference, 2);
+
+        return `${remaining.formattedBytes}${remaining.label}`;
+    }
+
+    /**
+     * Returns formatted string of remaining bandwidth.
+     */
+    public get bandwidthRemaining(): string {
+        const bandwidthUsed = this.$store.state.projectsModule.currentLimits.bandwidthUsed;
+        const bandwidthLimit = this.$store.state.projectsModule.currentLimits.bandwidthLimit;
+
+        const difference = bandwidthLimit - bandwidthUsed;
+        if (difference < 0) {
+            return '0 Bytes';
+        }
+
+        const remaining = new Size(difference, 2);
+
+        return `${remaining.formattedBytes}${remaining.label}`;
+    }
+
+    /**
+     * Indicates if loading screen is active.
+     */
     public get isLoading(): boolean {
         return this.$store.state.appStateModule.appState.fetchState === AppState.LOADING;
     }
 
     /**
-     * This method checks if current route is available when user has no created projects
+     * Indicates if paywall is enabled.
      */
-    private isRouteAccessibleWithoutProject(): boolean {
-        const availableRoutes = [
-            RouteConfig.Account.with(RouteConfig.Billing).path,
-            RouteConfig.Account.with(RouteConfig.Profile).path,
-            RouteConfig.ProjectOverview.with(RouteConfig.ProjectDetails).path,
-        ];
+    private get isPaywallEnabled(): boolean {
+        return this.$store.state.paymentsModule.isPaywallEnabled;
+    }
 
-        return availableRoutes.includes(this.$router.currentRoute.path.toLowerCase());
+    /**
+     * Checks if stored project is in fetched projects array and selects it.
+     * Selects first fetched project if check is not successful.
+     * @param fetchedProjects - fetched projects array
+     */
+    private selectProject(fetchedProjects: Project[]): void {
+        const storedProjectID = LocalData.getSelectedProjectId();
+        const isProjectInFetchedProjects = fetchedProjects.some(project => project.id === storedProjectID);
+        if (storedProjectID && isProjectInFetchedProjects) {
+            this.storeProject(storedProjectID);
+
+            return;
+        }
+
+        // Length of fetchedProjects array is checked before selectProject() function call.
+        this.storeProject(fetchedProjects[0].id);
+    }
+
+    /**
+     * Stores project to vuex store and browser's local storage.
+     * @param projectID - project id string
+     */
+    private storeProject(projectID: string): void {
+        this.$store.dispatch(PROJECTS_ACTIONS.SELECT, projectID);
+        LocalData.setSelectedProjectId(projectID);
     }
 }
 </script>
 
 <style scoped lang="scss">
-    .dashboard-container {
-        position: fixed;
-        max-width: 100%;
-        width: 100%;
-        height: 100%;
-        left: 0;
-        top: 0;
-        background-color: #f5f6fa;
-        z-index: 10;
-
-        &__wrap {
-            display: flex;
-
-            &__column {
-                display: flex;
-                flex-direction: column;
-                width: 100%;
-            }
-        }
-
-        &__main-area {
-            position: relative;
-            width: 100%;
-            height: calc(100vh - 50px);
-            overflow-y: scroll;
-            display: flex;
-            flex-direction: column;
-
-            &__banner-area {
-                flex: 0 1 auto;
-            }
-
-            &__content {
-                flex: 1 1 auto;
-            }
-        }
-    }
-
-    @media screen and (max-width: 1024px) {
-
-        .regular-navigation {
-            display: none;
-        }
-    }
-
-    @media screen and (max-width: 720px) {
-
-        .dashboard-container {
-
-            &__main-area {
-                left: 60px;
-            }
-        }
-    }
-
     .loading-overlay {
         display: flex;
         justify-content: center;
@@ -240,8 +372,7 @@ export default class DashboardArea extends Vue {
         top: 0;
         left: 0;
         right: 0;
-        height: 100vh;
-        z-index: 100;
+        bottom: 0;
         background-color: rgba(134, 134, 148, 1);
         visibility: hidden;
         opacity: 0;
@@ -249,14 +380,62 @@ export default class DashboardArea extends Vue {
         -moz-transition: all 0.5s linear;
         -o-transition: all 0.5s linear;
         transition: all 0.5s linear;
-
-        .loading-image {
-            z-index: 200;
-        }
     }
 
     .loading-overlay.active {
         visibility: visible;
         opacity: 1;
+    }
+
+    .dashboard {
+        height: 100%;
+        background-color: #f5f6fa;
+        display: flex;
+        flex-direction: column;
+
+        &__beta-banner {
+            width: calc(100% - 60px);
+            padding: 0 30px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            font-family: 'font_regular', sans-serif;
+            background-color: red;
+
+            &__message {
+                font-weight: normal;
+                font-size: 14px;
+                line-height: 12px;
+                color: #fff;
+            }
+        }
+
+        &__wrap {
+            display: flex;
+            flex-direction: column;
+            height: 100%;
+
+            &__main-area {
+                display: flex;
+                height: 100%;
+
+                &__content {
+                    overflow-y: scroll;
+                    height: calc(100vh - 62px);
+                    width: 100%;
+
+                    &__bar-area {
+                        position: relative;
+                    }
+                }
+            }
+        }
+    }
+
+    @media screen and (max-width: 1280px) {
+
+        .regular-navigation {
+            display: none;
+        }
     }
 </style>

@@ -14,18 +14,17 @@ import (
 	"golang.org/x/sync/errgroup"
 
 	"storj.io/common/identity"
-	"storj.io/common/peertls/extensions"
 	"storj.io/common/storj"
-	"storj.io/storj/pkg/debug"
+	"storj.io/private/debug"
+	"storj.io/private/version"
 	"storj.io/storj/private/lifecycle"
-	"storj.io/storj/private/version"
 	"storj.io/storj/private/version/checker"
-	"storj.io/storj/satellite/accounting"
 	"storj.io/storj/satellite/admin"
-	"storj.io/storj/satellite/metainfo"
+	"storj.io/storj/satellite/payments"
+	"storj.io/storj/satellite/payments/stripecoinpayments"
 )
 
-// Admin is the satellite core process that runs chores
+// Admin is the satellite core process that runs chores.
 //
 // architecture: Peer
 type Admin struct {
@@ -41,7 +40,21 @@ type Admin struct {
 		Server   *debug.Server
 	}
 
-	Version *checker.Service
+	Version struct {
+		Chore   *checker.Chore
+		Service *checker.Service
+	}
+
+	Payments struct {
+		Accounts payments.Accounts
+		Service  *stripecoinpayments.Service
+		Stripe   stripecoinpayments.StripeClient
+	}
+
+	Admin struct {
+		Listener net.Listener
+		Server   *admin.Server
+	}
 
 	Admin struct {
 		Listener net.Listener
@@ -51,6 +64,7 @@ type Admin struct {
 
 // NewAdmin creates a new satellite admin peer.
 func NewAdmin(log *zap.Logger, full *identity.FullIdentity, db DB,
+	versionInfo version.Info, config *Config, atomicLogLevel *zap.AtomicLevel) (*Admin, error) {
 	pointerDB metainfo.PointerDB,
 	revocationDB extensions.RevocationDB,
 	accountingCache accounting.Cache,
@@ -75,7 +89,7 @@ func NewAdmin(log *zap.Logger, full *identity.FullIdentity, db DB,
 		}
 		debugConfig := config.Debug
 		debugConfig.ControlTitle = "Admin"
-		peer.Debug.Server = debug.NewServer(log.Named("debug"), peer.Debug.Listener, monkit.Default, debugConfig)
+		peer.Debug.Server = debug.NewServerWithAtomicLevel(log.Named("debug"), peer.Debug.Listener, monkit.Default, debugConfig, atomicLogLevel)
 		peer.Servers.Add(lifecycle.Item{
 			Name:  "debug",
 			Run:   peer.Debug.Server.Run,
@@ -85,33 +99,73 @@ func NewAdmin(log *zap.Logger, full *identity.FullIdentity, db DB,
 
 	{
 		if !versionInfo.IsZero() {
-			peer.Log.Sugar().Debugf("Binary Version: %s with CommitHash %s, built at %s as Release %v",
-				versionInfo.Version.String(), versionInfo.CommitHash, versionInfo.Timestamp.String(), versionInfo.Release)
+			peer.Log.Debug("Version info",
+				zap.Stringer("Version", versionInfo.Version.Version),
+				zap.String("Commit Hash", versionInfo.CommitHash),
+				zap.Stringer("Build Timestamp", versionInfo.Timestamp),
+				zap.Bool("Release Build", versionInfo.Release),
+			)
 		}
-		peer.Version = checker.NewService(log.Named("version"), config.Version, versionInfo, "Satellite")
+		peer.Version.Service = checker.NewService(log.Named("version"), config.Version, versionInfo, "Satellite")
+		peer.Version.Chore = checker.NewChore(peer.Version.Service, config.Version.CheckInterval)
 
 		peer.Services.Add(lifecycle.Item{
 			Name: "version",
-			Run:  peer.Version.Run,
+			Run:  peer.Version.Chore.Run,
 		})
 	}
 
-	{ // setup admin
+	{ // setup payments
+		pc := config.Payments
+
+		var stripeClient stripecoinpayments.StripeClient
+		var err error
+		switch pc.Provider {
+		default:
+			stripeClient = stripecoinpayments.NewStripeMock(
+				peer.ID(),
+				peer.DB.StripeCoinPayments().Customers(),
+				peer.DB.Console().Users(),
+			)
+		case "stripecoinpayments":
+			stripeClient = stripecoinpayments.NewStripeClient(log, pc.StripeCoinPayments)
+		}
+
+		peer.Payments.Service, err = stripecoinpayments.NewService(
+			peer.Log.Named("payments.stripe:service"),
+			stripeClient,
+			pc.StripeCoinPayments,
+			peer.DB.StripeCoinPayments(),
+			peer.DB.Console().Projects(),
+			peer.DB.ProjectAccounting(),
+			pc.StorageTBPrice,
+			pc.EgressTBPrice,
+			pc.ObjectPrice,
+			pc.BonusRate,
+			pc.CouponValue,
+			pc.CouponDuration,
+			pc.CouponProjectLimit,
+			pc.MinCoinPayment,
+			pc.PaywallProportion)
+
+		if err != nil {
+			return nil, errs.Combine(err, peer.Close())
+		}
+
+		peer.Payments.Stripe = stripeClient
+		peer.Payments.Accounts = peer.Payments.Service.Accounts()
+	}
+	{ // setup admin endpoint
 		var err error
 		peer.Admin.Listener, err = net.Listen("tcp", config.Admin.Address)
 		if err != nil {
 			return nil, err
 		}
-		liveAccounting := accounting.NewService(
-			db.ProjectAccounting(),
-			accountingCache,
-			config.Rollup.MaxAlphaUsage,
-		)
-		service := admin.NewService(db.Console(), db.ProjectAccounting(), db.StoragenodeAccounting(), db.Admin(), liveAccounting, &admin.ServiceConfig{
-			SatelliteNodeID:  &peer.Identity.ID,
-			SatelliteAddress: config.Server.Address,
-		})
-		peer.Admin.Server = admin.NewServer(log.Named("admin"), peer.Admin.Listener, config.Admin, service)
+
+		adminConfig := config.Admin
+		adminConfig.AuthorizationToken = config.Console.AuthToken
+
+		peer.Admin.Server = admin.NewServer(log.Named("admin"), peer.Admin.Listener, peer.DB, peer.Payments.Accounts, adminConfig)
 		peer.Servers.Add(lifecycle.Item{
 			Name:  "admin",
 			Run:   peer.Admin.Server.Run,

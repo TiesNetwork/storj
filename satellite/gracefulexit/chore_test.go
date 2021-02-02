@@ -8,7 +8,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/gogo/protobuf/proto"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
 
@@ -20,6 +19,7 @@ import (
 	"storj.io/storj/private/testplanet"
 	"storj.io/storj/satellite"
 	"storj.io/storj/satellite/gracefulexit"
+	"storj.io/storj/satellite/metainfo/metabase"
 	"storj.io/storj/satellite/overlay"
 	"storj.io/storj/satellite/satellitedb/satellitedbtest"
 	"storj.io/storj/storage"
@@ -32,14 +32,12 @@ func TestChore(t *testing.T) {
 		StorageNodeCount: 8,
 		UplinkCount:      1,
 		Reconfigure: testplanet.Reconfigure{
-			Satellite: func(log *zap.Logger, index int, config *satellite.Config) {
-				config.GracefulExit.MaxInactiveTimeFrame = maximumInactiveTimeFrame
-
-				config.Metainfo.RS.MinThreshold = 4
-				config.Metainfo.RS.RepairThreshold = 6
-				config.Metainfo.RS.SuccessThreshold = 8
-				config.Metainfo.RS.TotalThreshold = 8
-			},
+			Satellite: testplanet.Combine(
+				func(log *zap.Logger, index int, config *satellite.Config) {
+					config.GracefulExit.MaxInactiveTimeFrame = maximumInactiveTimeFrame
+				},
+				testplanet.ReconfigureRS(4, 6, 8, 8),
+			),
 		},
 	}, func(t *testing.T, ctx *testcontext.Context, planet *testplanet.Planet) {
 		uplinkPeer := planet.Uplinks[0]
@@ -56,7 +54,7 @@ func TestChore(t *testing.T) {
 
 		exitStatusRequest := overlay.ExitStatusRequest{
 			NodeID:          exitingNode.ID(),
-			ExitInitiatedAt: time.Now().UTC(),
+			ExitInitiatedAt: time.Now(),
 		}
 
 		_, err = satellite.Overlay.DB.UpdateExitStatus(ctx, &exitStatusRequest)
@@ -83,11 +81,11 @@ func TestChore(t *testing.T) {
 		}
 
 		// test the other nodes don't have anything to transfer
-		for _, sn := range planet.StorageNodes {
-			if sn.ID() == exitingNode.ID() {
+		for _, node := range planet.StorageNodes {
+			if node.ID() == exitingNode.ID() {
 				continue
 			}
-			incompleteTransfers, err := satellite.DB.GracefulExit().GetIncomplete(ctx, sn.ID(), 20, 0)
+			incompleteTransfers, err := satellite.DB.GracefulExit().GetIncomplete(ctx, node.ID(), 20, 0)
 			require.NoError(t, err)
 			require.Len(t, incompleteTransfers, 0)
 		}
@@ -136,14 +134,12 @@ func TestDurabilityRatio(t *testing.T) {
 		StorageNodeCount: 4,
 		UplinkCount:      1,
 		Reconfigure: testplanet.Reconfigure{
-			Satellite: func(log *zap.Logger, index int, config *satellite.Config) {
-				config.GracefulExit.MaxInactiveTimeFrame = maximumInactiveTimeFrame
-
-				config.Metainfo.RS.MinThreshold = 2
-				config.Metainfo.RS.RepairThreshold = 3
-				config.Metainfo.RS.SuccessThreshold = successThreshold
-				config.Metainfo.RS.TotalThreshold = 4
-			},
+			Satellite: testplanet.Combine(
+				func(log *zap.Logger, index int, config *satellite.Config) {
+					config.GracefulExit.MaxInactiveTimeFrame = maximumInactiveTimeFrame
+				},
+				testplanet.ReconfigureRS(2, 3, successThreshold, 4),
+			),
 		},
 	}, func(t *testing.T, ctx *testcontext.Context, planet *testplanet.Planet) {
 		uplinkPeer := planet.Uplinks[0]
@@ -158,7 +154,7 @@ func TestDurabilityRatio(t *testing.T) {
 
 		exitStatusRequest := overlay.ExitStatusRequest{
 			NodeID:          exitingNode.ID(),
-			ExitInitiatedAt: time.Now().UTC(),
+			ExitInitiatedAt: time.Now(),
 		}
 
 		_, err = satellite.Overlay.DB.UpdateExitStatus(ctx, &exitStatusRequest)
@@ -181,7 +177,7 @@ func TestDurabilityRatio(t *testing.T) {
 		var oldPointer *pb.Pointer
 		var path []byte
 		for _, key := range keys {
-			p, err := satellite.Metainfo.Service.Get(ctx, string(key))
+			p, err := satellite.Metainfo.Service.Get(ctx, metabase.SegmentKey(key))
 			require.NoError(t, err)
 
 			if p.GetRemote() != nil {
@@ -193,10 +189,10 @@ func TestDurabilityRatio(t *testing.T) {
 
 		// remove a piece from the pointer
 		require.NotNil(t, oldPointer)
-		oldPointerBytes, err := proto.Marshal(oldPointer)
+		oldPointerBytes, err := pb.Marshal(oldPointer)
 		require.NoError(t, err)
 		newPointer := &pb.Pointer{}
-		err = proto.Unmarshal(oldPointerBytes, newPointer)
+		err = pb.Unmarshal(oldPointerBytes, newPointer)
 		require.NoError(t, err)
 
 		remotePieces := newPointer.GetRemote().GetRemotePieces()
@@ -209,7 +205,7 @@ func TestDurabilityRatio(t *testing.T) {
 			}
 		}
 		newPointer.Remote.RemotePieces = newPieces
-		newPointerBytes, err := proto.Marshal(newPointer)
+		newPointerBytes, err := pb.Marshal(newPointer)
 		require.NoError(t, err)
 		err = satellite.Metainfo.Database.CompareAndSwap(ctx, storage.Key(path), oldPointerBytes, newPointerBytes)
 		require.NoError(t, err)
@@ -234,18 +230,20 @@ func BenchmarkChore(b *testing.B) {
 		b.Run("BatchUpdateStats-100", func(b *testing.B) {
 			batch(ctx, b, gracefulexitdb, 100)
 		})
-		b.Run("BatchUpdateStats-250", func(b *testing.B) {
-			batch(ctx, b, gracefulexitdb, 250)
-		})
-		b.Run("BatchUpdateStats-500", func(b *testing.B) {
-			batch(ctx, b, gracefulexitdb, 500)
-		})
-		b.Run("BatchUpdateStats-1000", func(b *testing.B) {
-			batch(ctx, b, gracefulexitdb, 1000)
-		})
-		b.Run("BatchUpdateStats-5000", func(b *testing.B) {
-			batch(ctx, b, gracefulexitdb, 5000)
-		})
+		if !testing.Short() {
+			b.Run("BatchUpdateStats-250", func(b *testing.B) {
+				batch(ctx, b, gracefulexitdb, 250)
+			})
+			b.Run("BatchUpdateStats-500", func(b *testing.B) {
+				batch(ctx, b, gracefulexitdb, 500)
+			})
+			b.Run("BatchUpdateStats-1000", func(b *testing.B) {
+				batch(ctx, b, gracefulexitdb, 1000)
+			})
+			b.Run("BatchUpdateStats-5000", func(b *testing.B) {
+				batch(ctx, b, gracefulexitdb, 5000)
+			})
+		}
 	})
 }
 func batch(ctx context.Context, b *testing.B, db gracefulexit.DB, size int) {
@@ -254,7 +252,7 @@ func batch(ctx context.Context, b *testing.B, db gracefulexit.DB, size int) {
 		for j := 0; j < size; j++ {
 			item := gracefulexit.TransferQueueItem{
 				NodeID:          testrand.NodeID(),
-				Path:            testrand.Bytes(memory.B * 256),
+				Key:             testrand.Bytes(memory.B * 256),
 				PieceNum:        0,
 				DurabilityRatio: 1.0,
 			}

@@ -5,12 +5,12 @@ package stripecoinpayments
 
 import (
 	"context"
+	"errors"
 	"time"
 
-	"github.com/skyrings/skyring-common/tools/uuid"
 	"github.com/stripe/stripe-go"
 
-	"storj.io/storj/private/date"
+	"storj.io/common/uuid"
 	"storj.io/storj/satellite/payments"
 )
 
@@ -48,7 +48,7 @@ func (accounts *accounts) Setup(ctx context.Context, userID uuid.UUID, email str
 		Email: stripe.String(email),
 	}
 
-	customer, err := accounts.service.stripeClient.Customers.New(params)
+	customer, err := accounts.service.stripeClient.Customers().New(params)
 	if err != nil {
 		return Error.Wrap(err)
 	}
@@ -58,46 +58,46 @@ func (accounts *accounts) Setup(ctx context.Context, userID uuid.UUID, email str
 }
 
 // Balance returns an integer amount in cents that represents the current balance of payment account.
-func (accounts *accounts) Balance(ctx context.Context, userID uuid.UUID) (_ int64, err error) {
+func (accounts *accounts) Balance(ctx context.Context, userID uuid.UUID) (_ payments.Balance, err error) {
 	defer mon.Task()(&ctx, userID)(&err)
 
 	customerID, err := accounts.service.db.Customers().GetCustomerID(ctx, userID)
 	if err != nil {
-		return 0, Error.Wrap(err)
+		return payments.Balance{}, Error.Wrap(err)
 	}
 
-	c, err := accounts.service.stripeClient.Customers.Get(customerID, nil)
+	c, err := accounts.service.stripeClient.Customers().Get(customerID, nil)
 	if err != nil {
-		return 0, Error.Wrap(err)
+		return payments.Balance{}, Error.Wrap(err)
 	}
 
 	// add all active coupons amount to balance.
 	coupons, err := accounts.service.db.Coupons().ListByUserIDAndStatus(ctx, userID, payments.CouponActive)
 	if err != nil {
-		return 0, Error.Wrap(err)
+		return payments.Balance{}, Error.Wrap(err)
 	}
 
 	var couponsAmount int64 = 0
 	for _, coupon := range coupons {
 		alreadyUsed, err := accounts.service.db.Coupons().TotalUsage(ctx, coupon.ID)
 		if err != nil {
-			return 0, Error.Wrap(err)
+			return payments.Balance{}, Error.Wrap(err)
 		}
 
 		couponsAmount += coupon.Amount - alreadyUsed
 	}
 
-	creditBalance, err := accounts.service.db.Credits().Balance(ctx, userID)
-	if err != nil {
-		return 0, Error.Wrap(err)
+	accountBalance := payments.Balance{
+		FreeCredits: couponsAmount,
+		Coins:       -c.Balance,
 	}
 
-	return -c.Balance + couponsAmount + creditBalance, nil
+	return accountBalance, nil
 }
 
 // ProjectCharges returns how much money current user will be charged for each project.
-func (accounts *accounts) ProjectCharges(ctx context.Context, userID uuid.UUID) (charges []payments.ProjectCharge, err error) {
-	defer mon.Task()(&ctx, userID)(&err)
+func (accounts *accounts) ProjectCharges(ctx context.Context, userID uuid.UUID, since, before time.Time) (charges []payments.ProjectCharge, err error) {
+	defer mon.Task()(&ctx, userID, since, before)(&err)
 
 	// to return empty slice instead of nil if there are no projects
 	charges = make([]payments.ProjectCharge, 0)
@@ -107,11 +107,8 @@ func (accounts *accounts) ProjectCharges(ctx context.Context, userID uuid.UUID) 
 		return nil, Error.Wrap(err)
 	}
 
-	start, end := date.MonthBoundary(time.Now().UTC())
-
-	// TODO: we should improve performance of this block of code. It takes ~4-5 sec to get project charges.
 	for _, project := range projects {
-		usage, err := accounts.service.usageDB.GetProjectTotal(ctx, project.ID, start, end)
+		usage, err := accounts.service.usageDB.GetProjectTotal(ctx, project.ID, since, before)
 		if err != nil {
 			return charges, Error.Wrap(err)
 		}
@@ -119,6 +116,8 @@ func (accounts *accounts) ProjectCharges(ctx context.Context, userID uuid.UUID) 
 		projectPrice := accounts.service.calculateProjectUsagePrice(usage.Egress, usage.Storage, usage.ObjectCount)
 
 		charges = append(charges, payments.ProjectCharge{
+			ProjectUsage: *usage,
+
 			ProjectID:    project.ID,
 			Egress:       projectPrice.Egress.IntPart(),
 			ObjectCount:  projectPrice.Objects.IntPart(),
@@ -127,6 +126,51 @@ func (accounts *accounts) ProjectCharges(ctx context.Context, userID uuid.UUID) 
 	}
 
 	return charges, nil
+}
+
+// CheckProjectInvoicingStatus returns true if for the given project there are outstanding project records and/or usage
+// which have not been applied/invoiced yet (meaning sent over to stripe).
+func (accounts *accounts) CheckProjectInvoicingStatus(ctx context.Context, projectID uuid.UUID) (unpaidUsage bool, err error) {
+	defer mon.Task()(&ctx)(&err)
+
+	// we do not want to delete projects that have usage for the current month.
+	year, month, _ := accounts.service.nowFn().UTC().Date()
+	firstOfMonth := time.Date(year, month, 1, 0, 0, 0, 0, time.UTC)
+
+	currentUsage, err := accounts.service.usageDB.GetProjectTotal(ctx, projectID, firstOfMonth, accounts.service.nowFn())
+	if err != nil {
+		return false, err
+	}
+	if currentUsage.Storage > 0 || currentUsage.Egress > 0 || currentUsage.ObjectCount > 0 {
+		return true, errors.New("usage for current month exists")
+	}
+
+	// if usage of last month exist, make sure to look for billing records
+	lastMonthUsage, err := accounts.service.usageDB.GetProjectTotal(ctx, projectID, firstOfMonth.AddDate(0, -1, 0), firstOfMonth.AddDate(0, 0, -1))
+	if err != nil {
+		return false, err
+	}
+
+	if lastMonthUsage.Storage > 0 || lastMonthUsage.Egress > 0 || lastMonthUsage.ObjectCount > 0 {
+		// time passed into the check function need to be the UTC midnight dates of the first and last day of the month
+		err = accounts.service.db.ProjectRecords().Check(ctx, projectID, firstOfMonth.AddDate(0, -1, 0), firstOfMonth.Add(-time.Hour*24))
+		switch err {
+		case ErrProjectRecordExists:
+			record, err := accounts.service.db.ProjectRecords().Get(ctx, projectID, firstOfMonth.AddDate(0, -1, 0), firstOfMonth.Add(-time.Hour*24))
+			if err != nil {
+				return true, err
+			}
+			// state = 0 means unapplied and not invoiced yet.
+			if record.State == 0 {
+				return true, errors.New("unapplied project invoice record exist")
+			}
+		case nil:
+			return true, errors.New("usage for last month exist, but is not billed yet")
+		default:
+			return true, err
+		}
+	}
+	return false, nil
 }
 
 // Charges returns list of all credit card charges related to account.
@@ -143,7 +187,7 @@ func (accounts *accounts) Charges(ctx context.Context, userID uuid.UUID) (_ []pa
 	}
 	params.Filters.AddFilter("limit", "", "100")
 
-	iter := accounts.service.stripeClient.Charges.List(params)
+	iter := accounts.service.stripeClient.Charges().List(params)
 
 	var charges []payments.Charge
 	for iter.Next() {
@@ -186,8 +230,13 @@ func (accounts *accounts) Coupons() payments.Coupons {
 	return &coupons{service: accounts.service}
 }
 
-// Credits exposes all needed functionality to manage credits.
-func (accounts *accounts) Credits() payments.Credits {
+// PaywallEnabled returns a true if a credit card or account
+// balance is required to create projects.
+func (accounts *accounts) PaywallEnabled(userID uuid.UUID) bool {
+	return BytesAreWithinProportion(userID, accounts.service.PaywallProportion)
+}
 
-	return &credits{service: accounts.service}
+// BytesAreWithinProportion returns true if first byte is less than the normalized proportion [0..1].
+func BytesAreWithinProportion(uuidBytes [16]byte, proportion float64) bool {
+	return int(uuidBytes[0]) < int(proportion*256)
 }

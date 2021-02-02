@@ -3,125 +3,186 @@
 
 <template>
     <div class="info-area">
-        <SatelliteSelection/>
+        <SatelliteSelection />
         <div v-if="isDisqualifiedInfoShown" class="info-area__disqualified-info">
             <LargeDisqualificationIcon
                 class="info-area__disqualified-info__image"
                 alt="Disqualified image"
             />
-            <p class="info-area__disqualified-info__info">Your node has been disqualified on <b>{{getDisqualificationDate}}</b>. If you have any questions regarding this please check our Node Operators <a href="https://forum.storj.io/c/sno-category" target="_blank">thread</a> on Storj forum.</p>
+            <p class="info-area__disqualified-info__info">
+                Your node has been disqualified on <b>{{ getDisqualificationDate }}</b>. If you have any questions regarding this please check our Node Operators
+                <a
+                    class="info-area__disqualified-info__info__link"
+                    href="https://forum.storj.io/c/sno-category"
+                    rel="noopener noreferrer"
+                    target="_blank"
+                >
+                    thread
+                </a> on Storj forum.
+            </p>
         </div>
         <div v-else-if="doDisqualifiedSatellitesExist" class="info-area__disqualified-info">
             <LargeDisqualificationIcon
                 class="info-area__disqualified-info__image"
                 alt="Disqualified image"
             />
-            <p class="info-area__disqualified-info__info">Your node has been disqualified on<span v-for="disqualified in disqualifiedSatellites"><b> {{disqualified.id}}</b></span>. If you have any questions regarding this please check our Node Operators <a href="https://forum.storj.io/c/sno-category" target="_blank">thread</a> on Storj forum.</p>
+            <p class="info-area__disqualified-info__info">
+                Your node has been disqualified on<span v-for="disqualified in disqualifiedSatellites"><b> {{ disqualified.id }}</b></span>. If you have any questions regarding this please check our Node Operators
+                <a
+                    class="info-area__disqualified-info__info__link"
+                    href="https://forum.storj.io/c/sno-category"
+                    rel="noopener noreferrer"
+                    target="_blank"
+                >
+                    thread
+                </a> on Storj forum.
+            </p>
         </div>
-        <p class="info-area__title">Utilization & Remaining</p>
-        <div class="info-area__chart-area">
-            <div class="chart-container">
+        <div v-if="isSuspendedInfoShown" class="info-area__suspended-info">
+            <LargeSuspensionIcon
+                class="info-area__suspended-info__image"
+                alt="Suspended image"
+            />
+            <p class="info-area__suspended-info__info">
+                Your node has been suspended on <b>{{ getSuspensionDate }}</b>. If you have any questions regarding this please check our Node Operators
+                <a
+                    class="info-area__disqualified-info__info__link"
+                    href="https://forum.storj.io/c/sno-category"
+                    rel="noopener noreferrer"
+                    target="_blank"
+                >
+                    thread
+                </a> on Storj forum.
+            </p>
+        </div>
+        <div v-else-if="doSuspendedSatellitesExist" class="info-area__suspended-info">
+            <LargeSuspensionIcon
+                class="info-area__suspended-info__image"
+                alt="Suspended image"
+            />
+            <p class="info-area__suspended-info__info">
+                Your node has been suspended on<span v-for="suspended in suspendedSatellites"><b> {{ suspended.id }}</b></span>. If you have any questions regarding this please check our Node Operators
+                <a
+                    class="info-area__disqualified-info__info__link"
+                    href="https://forum.storj.io/c/sno-category"
+                    rel="noopener noreferrer"
+                    target="_blank"
+                >
+                    thread
+                </a> on Storj forum.
+            </p>
+        </div>
+        <p class="info-area__title">Bandwidth Utilization </p>
+        <section>
+            <div class="chart-container bandwidth-chart">
                 <div class="chart-container__title-area">
                     <p class="chart-container__title-area__title">Bandwidth Used This Month</p>
-                    <div class="chart-container__title-area__chart-choice-item" :class="{'egress-chart-shown' : isEgressChartShown}" @click.stop="toggleEgressChartShowing">Egress</div>
-                    <div class="chart-container__title-area__chart-choice-item" :class="{'ingress-chart-shown' : isIngressChartShown}" @click.stop="toggleIngressChartShowing">Ingress</div>
+                    <div class="chart-container__title-area__buttons-area">
+                        <button
+                            name="Show Egress Chart"
+                            class="chart-container__title-area__chart-choice-item"
+                            :class="{ 'egress-chart-shown': isEgressChartShown }"
+                            @click.stop="toggleEgressChartShowing"
+                        >
+                            Egress
+                        </button>
+                        <button
+                            name="Show Ingress Chart"
+                            class="chart-container__title-area__chart-choice-item"
+                            :class="{ 'ingress-chart-shown': isIngressChartShown }"
+                            @click.stop="toggleIngressChartShowing"
+                        >
+                            Ingress
+                        </button>
+                    </div>
                 </div>
-                <p class="chart-container__amount" v-if="isBandwidthChartShown"><b>{{bandwidthSummary}}</b></p>
-                <p class="chart-container__amount" v-if="isEgressChartShown"><b>{{egressSummary}}</b></p>
-                <p class="chart-container__amount" v-if="isIngressChartShown"><b>{{ingressSummary}}</b></p>
-                <div class="chart-container__chart">
-                    <BandwidthChart v-if="isBandwidthChartShown"/>
-                    <EgressChart v-if="isEgressChartShown"/>
-                    <IngressChart v-if="isIngressChartShown"/>
+                <p class="chart-container__amount" v-if="isBandwidthChartShown"><b>{{ bandwidthSummary }}</b></p>
+                <p class="chart-container__amount" v-if="isEgressChartShown"><b>{{ egressSummary }}</b></p>
+                <p class="chart-container__amount" v-if="isIngressChartShown"><b>{{ ingressSummary }}</b></p>
+                <div class="chart-container__chart" ref="chart" onresize="recalculateChartDimensions()" >
+                    <BandwidthChart v-if="isBandwidthChartShown" :height="chartHeight" :width="chartWidth" :is-dark-mode="isDarkMode"/>
+                    <EgressChart v-if="isEgressChartShown" :height="chartHeight" :width="chartWidth" :is-dark-mode="isDarkMode"/>
+                    <IngressChart v-if="isIngressChartShown" :height="chartHeight" :width="chartWidth" :is-dark-mode="isDarkMode"/>
                 </div>
             </div>
-            <div class="chart-container">
+        </section>
+        <p class="info-area__title">Disk Utilization & Remaining</p>
+        <section class="info-area__chart-area">
+            <section class="chart-container">
                 <div class="chart-container__title-area disk-space-title">
                     <p class="chart-container__title-area__title">Disk Space Used This Month</p>
                 </div>
-                <p class="chart-container__amount disk-space-amount"><b>{{storageSummary}}*h</b></p>
-                <div class="chart-container__chart">
-                    <DiskSpaceChart/>
+                <p class="chart-container__amount disk-space-amount"><b>{{ storageSummary }}*h</b></p>
+                <div class="chart-container__chart" ref="diskSpaceChart" onresize="recalculateChartDimensions()" >
+                    <DiskSpaceChart :height="diskSpaceChartHeight" :width="diskSpaceChartWidth" :is-dark-mode="isDarkMode"/>
                 </div>
-            </div>
-        </div>
+            </section>
+            <section>
+                <DiskStatChart />
+            </section>
+        </section>
         <div>
-            <div class="info-area__remaining-space-area">
-                <BarInfo
-                    label="Bandwidth Remaining"
-                    :amount="bandwidth.remaining"
-                    info-text="of bandwidth left"
-                    :current-bar-amount="bandwidth.used"
-                    :max-bar-amount="bandwidth.available"
-                />
-                <BarInfo
-                    label="Disk Space Remaining"
-                    :amount="diskSpace.remaining"
-                    info-text="of disk space left"
-                    :current-bar-amount="diskSpace.used"
-                    :max-bar-amount="diskSpace.available"
-                />
-            </div>
-        </div>
-        <div class="info-area__blurred-checks" v-if="!selectedSatellite.id">
-            <p class="info-area__blurred-checks__title">Select A Specific Satellite To View Audit And Uptime Percentages</p>
-        </div>
-        <div v-if="selectedSatellite.id">
-            <p class="info-area__title">Uptime & Audit Checks by Satellite</p>
-            <div class="info-area__checks-area">
+            <p class="info-area__title">Suspension & Audit</p>
+            <div class="info-area__checks-area" v-if="selectedSatellite.id">
                 <ChecksArea
-                    label="Uptime Checks"
-                    :amount="checks.uptime"
-                    info-text="Uptime checks occur to make sure  your node is still online. This is the percentage of uptime checks you’ve passed."
+                    label="Suspension Score"
+                    :amount="audits.suspensionScore.label"
+                    info-text="This score shows how close your node is to getting suspended on a satellite. A score of 60% or below will result in suspension. If your node stays suspended for more than one week you will be disqualified from this satellite, so please correct the errors that lead to suspension asap."
                 />
                 <ChecksArea
-                    label="Audit Checks"
-                    :amount="checks.audit"
+                    label="Audit Score"
+                    :amount="audits.auditScore.label"
                     info-text="Percentage of successful pings/communication between the node & satellite."
                 />
             </div>
+            <AllSatellitesAuditsArea v-else />
         </div>
-        <p class="info-area__title">Payout</p>
+        <div class="info-area__payout-header">
+            <p class="info-area__title">Payout</p>
+            <router-link :to="PAYOUT_PATH" class="info-area__payout-header__link">
+                <p class="info-area__payout-header__link__text">Payout Information</p>
+                <BlueArrowRight />
+            </router-link>
+        </div>
         <PayoutArea
             label="STORJ Wallet Address"
             :wallet-address="wallet"
         />
+        <TotalPayoutArea class="info-area__total-area" />
     </div>
 </template>
 
 <script lang="ts">
 import { Component, Vue } from 'vue-property-decorator';
 
+import AllSatellitesAuditsArea from '@/app/components/AllSatellitesAuditsArea.vue';
 import BandwidthChart from '@/app/components/BandwidthChart.vue';
 import BarInfo from '@/app/components/BarInfo.vue';
 import ChecksArea from '@/app/components/ChecksArea.vue';
 import DiskSpaceChart from '@/app/components/DiskSpaceChart.vue';
+import DiskStatChart from '@/app/components/DiskStatChart.vue';
 import EgressChart from '@/app/components/EgressChart.vue';
 import IngressChart from '@/app/components/IngressChart.vue';
+import EstimationArea from '@/app/components/payments/EstimationArea.vue';
 import PayoutArea from '@/app/components/PayoutArea.vue';
 import SatelliteSelection from '@/app/components/SatelliteSelection.vue';
+import TotalPayoutArea from '@/app/components/TotalPayoutArea.vue';
 
+import BlueArrowRight from '@/../static/images/BlueArrowRight.svg';
 import LargeDisqualificationIcon from '@/../static/images/largeDisqualify.svg';
+import LargeSuspensionIcon from '@/../static/images/largeSuspend.svg';
 
+import { RouteConfig } from '@/app/router';
 import { APPSTATE_ACTIONS } from '@/app/store/modules/appState';
-import { formatBytes } from '@/app/utils/converter';
-import { BandwidthInfo, DiskSpaceInfo, SatelliteInfo } from '@/storagenode/dashboard';
-
-/**
- * Checks class holds info for Checks entity.
- */
-class Checks {
-    public uptime: number;
-    public audit: number;
-
-    public constructor(uptime: number, audit: number) {
-        this.uptime = uptime;
-        this.audit = audit;
-    }
-}
+import { Size } from '@/private/memory/size';
+import { SatelliteInfo, SatelliteScores } from '@/storagenode/sno/sno';
 
 @Component ({
     components: {
+        AllSatellitesAuditsArea,
+        DiskStatChart,
+        TotalPayoutArea,
+        EstimationArea,
         EgressChart,
         IngressChart,
         SatelliteSelection,
@@ -131,9 +192,53 @@ class Checks {
         ChecksArea,
         PayoutArea,
         LargeDisqualificationIcon,
+        LargeSuspensionIcon,
+        BlueArrowRight,
     },
 })
 export default class SNOContentFilling extends Vue {
+    public readonly PAYOUT_PATH: string = RouteConfig.Payout.path;
+    public chartWidth: number = 0;
+    public chartHeight: number = 0;
+    public diskSpaceChartWidth: number = 0;
+    public diskSpaceChartHeight: number = 0;
+
+    public $refs: {
+        chart: HTMLElement;
+        diskSpaceChart: HTMLElement;
+    };
+
+    public get isDarkMode(): boolean {
+        return this.$store.state.appStateModule.isDarkMode;
+    }
+
+    /**
+     * Used container size recalculation for charts resizing.
+     */
+    public recalculateChartDimensions(): void {
+        this.chartWidth = this.$refs['chart'].clientWidth;
+        this.chartHeight = this.$refs['chart'].clientHeight;
+        this.diskSpaceChartWidth = this.$refs['diskSpaceChart'].clientWidth;
+        this.diskSpaceChartHeight = this.$refs['diskSpaceChart'].clientHeight;
+    }
+
+    /**
+     * Lifecycle hook after initial render.
+     * Adds event on window resizing to recalculate size of charts.
+     */
+    public mounted(): void {
+        window.addEventListener('resize', this.recalculateChartDimensions);
+        this.recalculateChartDimensions();
+    }
+
+    /**
+     * Lifecycle hook before component destruction.
+     * Removes event on window resizing.
+     */
+    public beforeDestroy(): void {
+        window.removeEventListener('resize', this.recalculateChartDimensions);
+    }
+
     /**
      * isBandwidthChartShown showing status of bandwidth chart from store.
      * @return boolean - bandwidth chart displaying status
@@ -197,7 +302,7 @@ export default class SNOContentFilling extends Vue {
      * @return string - formatted amount of monthly bandwidth used
      */
     public get bandwidthSummary(): string {
-        return formatBytes(this.$store.state.node.bandwidthSummary);
+        return Size.toBase10String(this.$store.state.node.bandwidthSummary);
     }
 
     /**
@@ -205,7 +310,7 @@ export default class SNOContentFilling extends Vue {
      * @return string - formatted amount of monthly egress used
      */
     public get egressSummary(): string {
-        return formatBytes(this.$store.state.node.egressSummary);
+        return Size.toBase10String(this.$store.state.node.egressSummary);
     }
 
     /**
@@ -213,7 +318,7 @@ export default class SNOContentFilling extends Vue {
      * @return string - formatted amount of monthly ingress used
      */
     public get ingressSummary(): string {
-        return formatBytes(this.$store.state.node.ingressSummary);
+        return Size.toBase10String(this.$store.state.node.ingressSummary);
     }
 
     /**
@@ -221,31 +326,15 @@ export default class SNOContentFilling extends Vue {
      * @return string - formatted amount of monthly disk space used
      */
     public get storageSummary(): string {
-        return formatBytes(this.$store.state.node.storageSummary);
+        return Size.toBase10String(this.$store.state.node.storageSummary);
     }
 
     /**
-     * bandwidth - remaining amount of bandwidth from store.
-     * @return BandwidthInfo - remaining amount of bandwidth
+     * checks - audit checks status from store.
+     * @return Checks - audit checks statuses
      */
-    public get bandwidth(): BandwidthInfo {
-        return this.$store.state.node.utilization.bandwidth;
-    }
-
-    /**
-     * diskSpace - remaining amount of diskSpace from store.
-     * @return DiskSpaceInfo - remaining amount of diskSpace
-     */
-    public get diskSpace(): DiskSpaceInfo {
-        return this.$store.state.node.utilization.diskSpace;
-    }
-
-    /**
-     * checks - uptime and audit checks statuses from store.
-     * @return Checks - uptime and audit checks statuses
-     */
-    public get checks(): Checks {
-        return this.$store.state.node.checks;
+    public get audits(): SatelliteScores {
+        return this.$store.state.node.audits;
     }
 
     /**
@@ -291,6 +380,42 @@ export default class SNOContentFilling extends Vue {
     public get doDisqualifiedSatellitesExist(): boolean {
         return this.disqualifiedSatellites.length > 0;
     }
+
+    /**
+     * suspendedSatellites - array of suspended satellites from store.
+     * @return SatelliteInfo[] - array of suspended satellites
+     */
+    public get suspendedSatellites(): SatelliteInfo[] {
+        return this.$store.state.node.suspendedSatellites;
+    }
+
+    /**
+     * isSuspendedInfoShown checks if suspension status is shown.
+     * @return boolean - suspension status
+     */
+    public get isSuspendedInfoShown(): boolean {
+        return !!(this.selectedSatellite.id && this.selectedSatellite.suspended);
+    }
+
+    /**
+     * getSuspensionDate gets a date of suspension.
+     * @return String - date of suspension
+     */
+    public get getSuspensionDate(): string {
+        if (this.selectedSatellite.suspended) {
+            return this.selectedSatellite.suspended.toUTCString();
+        }
+
+        return '';
+    }
+
+    /**
+     * doSuspendedSatellitesExist checks if suspended satellites exist.
+     * @return boolean - suspended satellites existing status
+     */
+    public get doSuspendedSatellitesExist(): boolean {
+        return this.suspendedSatellites.length > 0;
+    }
 }
 </script>
 
@@ -309,6 +434,33 @@ export default class SNOContentFilling extends Vue {
             align-items: center;
             justify-content: space-between;
             padding: 20px 27px 20px 25px;
+            background-color: var(--block-background-color);
+            border-radius: 12px;
+            width: calc(100% - 52px);
+            margin-top: 17px;
+            color: var(--regular-text-color);
+
+            &__image {
+                min-height: 35px;
+                min-width: 38px;
+                margin-right: 17px;
+            }
+
+            &__info {
+                font-size: 14px;
+                line-height: 21px;
+
+                &__link {
+                    color: var(--navigation-link-color);
+                }
+            }
+        }
+
+        &__suspended-info {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 20px 27px 20px 25px;
             background-color: #fcf8e3;
             border-radius: 12px;
             width: calc(100% - 52px);
@@ -316,20 +468,24 @@ export default class SNOContentFilling extends Vue {
 
             &__image {
                 min-height: 35px;
-                min-width: 35px;
+                min-width: 38px;
                 margin-right: 17px;
             }
 
             &__info {
                 font-size: 14px;
                 line-height: 21px;
+
+                &__link {
+                    color: var(--navigation-link-color);
+                }
             }
         }
 
         &__title {
             font-size: 18px;
             line-height: 57px;
-            color: #535f77;
+            color: var(--regular-text-color);
             user-select: none;
         }
 
@@ -339,7 +495,7 @@ export default class SNOContentFilling extends Vue {
             justify-content: center;
             width: 100%;
             height: 224px;
-            background-image: url('../../../static/images/BlurredChecks.png');
+            background-image: var(--blurred-image-path);
             background-size: contain;
             margin: 35px 0;
 
@@ -347,24 +503,59 @@ export default class SNOContentFilling extends Vue {
                 font-family: 'font_bold', sans-serif;
                 font-size: 22px;
                 line-height: 49px;
-                color: #4a4a4a;
+                color: var(--regular-text-color);
                 user-select: none;
             }
         }
 
+        &__payout-header {
+            display: flex;
+            flex-direction: row;
+            align-items: center;
+            justify-content: space-between;
+
+            &__link {
+                display: flex;
+                flex-direction: row;
+                align-items: center;
+                justify-content: flex-end;
+                text-decoration: none;
+
+                &__text {
+                    font-size: 16px;
+                    line-height: 22px;
+                    color: var(--navigation-link-color);
+                    margin-right: 9px;
+                }
+            }
+        }
+
         &__chart-area,
-        &__remaining-space-area,
         &__checks-area {
             display: flex;
+            flex-direction: row;
             justify-content: space-between;
+            width: 100%;
+        }
+
+        &__bar-info {
+            width: 339px;
+        }
+
+        &__estimation-area {
+            margin-top: 11px;
+        }
+
+        &__total-area {
+            margin-top: 20px;
         }
     }
 
     .chart-container {
         width: 339px;
         height: 336px;
-        background-color: #fff;
-        border: 1px solid #e9eff4;
+        background-color: var(--block-background-color);
+        border: 1px solid var(--block-border-color);
         border-radius: 11px;
         padding: 32px 30px;
         margin-bottom: 13px;
@@ -375,49 +566,106 @@ export default class SNOContentFilling extends Vue {
             align-items: center;
             justify-content: space-between;
 
+            &__buttons-area {
+                display: flex;
+                flex-direction: row;
+                align-items: flex-end;
+            }
+
             &__title {
                 font-size: 14px;
-                color: #586c86;
+                color: var(--regular-text-color);
                 user-select: none;
             }
 
             &__chart-choice-item {
                 padding: 5px 12px;
-                background-color: #f1f6ff;
+                background-color: var(--chart-selection-button-background-color);
                 border-radius: 47px;
                 font-size: 12px;
                 color: #9daed2;
                 max-height: 25px;
                 cursor: pointer;
                 user-select: none;
+                margin-left: 9px;
             }
         }
 
         &__amount {
+            font-family: 'font_bold', sans-serif;
             font-size: 32px;
             line-height: 57px;
-            color: #535f77;
+            color: var(--regular-text-color);
         }
 
         &__chart {
             position: absolute;
-            bottom: 0;
             left: 0;
+            width: calc(100% - 10px);
+            height: 240px;
         }
     }
 
     .egress-chart-shown {
-        background-color: #d3f2cc;
-        color: #2e5f46;
+        background-color: var(--egress-button-background-color);
+        color: var(--egress-button-font-color);
     }
 
     .ingress-chart-shown {
-        background-color: #ffeac2;
-        color: #c48c4b;
+        background-color: var(--ingress-button-background-color);
+        color: var(--ingress-button-font-color);
     }
 
     .disk-space-title,
     .disk-space-amount {
         margin-top: 5px;
+    }
+
+    .bandwidth-chart {
+        width: calc(100% - 60px);
+    }
+
+    @media screen and (max-width: 1000px) {
+
+        .info-area {
+
+            &__chart-area {
+                flex-direction: column;
+                justify-content: flex-start;
+            }
+        }
+
+        .chart-container {
+            width: calc(100% - 60px);
+        }
+    }
+
+    @media screen and (max-width: 780px) {
+
+        .info-area {
+
+            &__checks-area {
+                flex-direction: column;
+
+                .checks-area-container {
+                    width: calc(100% - 60px) !important;
+                }
+            }
+
+            &__blurred-checks {
+
+                &__title {
+                    text-align: center;
+                }
+            }
+        }
+    }
+
+    @media screen and (max-width: 400px) {
+
+        .chart-container {
+            width: calc(100% - 36px);
+            padding: 24px 18px;
+        }
     }
 </style>

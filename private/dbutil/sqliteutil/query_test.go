@@ -6,7 +6,6 @@ package sqliteutil_test
 import (
 	"testing"
 
-	_ "github.com/lib/pq"
 	_ "github.com/mattn/go-sqlite3"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -21,7 +20,7 @@ func TestQuery(t *testing.T) {
 	ctx := testcontext.New(t)
 	defer ctx.Cleanup()
 
-	db, err := tagsql.Open("sqlite3", ":memory:")
+	db, err := tagsql.Open(ctx, "sqlite3", ":memory:")
 	require.NoError(t, err)
 
 	defer ctx.Check(db.Close)

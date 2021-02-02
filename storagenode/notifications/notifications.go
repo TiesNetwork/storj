@@ -7,9 +7,8 @@ import (
 	"context"
 	"time"
 
-	"github.com/skyrings/skyring-common/tools/uuid"
-
 	"storj.io/common/storj"
+	"storj.io/common/uuid"
 )
 
 // DB tells how application works with notifications database.
@@ -28,14 +27,14 @@ type Type int
 
 const (
 	// TypeCustom is a common notification type which doesn't describe node's core functionality.
-	// TODO: change type name when all notification types will be known
+	// TODO: change type name when all notification types will be known.
 	TypeCustom Type = 0
 	// TypeAuditCheckFailure is a notification type which describes node's audit check failure.
 	TypeAuditCheckFailure Type = 1
-	// TypeUptimeCheckFailure is a notification type which describes node's uptime check failure.
-	TypeUptimeCheckFailure Type = 2
 	// TypeDisqualification is a notification type which describes node's disqualification status.
-	TypeDisqualification Type = 3
+	TypeDisqualification Type = 2
+	// TypeSuspension is a notification type which describes node's suspension status.
+	TypeSuspension Type = 3
 )
 
 // NewNotification holds notification entity info which is being received from satellite or local client.

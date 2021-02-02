@@ -11,7 +11,7 @@ import (
 	"storj.io/storj/private/dbutil/sqliteutil"
 )
 
-// States is the global variable that stores all the states for testing
+// States is the global variable that stores all the states for testing.
 var States = MultiDBStates{
 	List: []*MultiDBState{
 		&v0,
@@ -46,10 +46,30 @@ var States = MultiDBStates{
 		&v29,
 		&v30,
 		&v31,
+		&v32,
+		&v33,
+		&v34,
+		&v35,
+		&v36,
+		&v37,
+		&v38,
+		&v39,
+		&v40,
+		&v41,
+		&v42,
+		&v43,
+		&v44,
+		&v45,
+		&v46,
+		&v47,
+		&v48,
+		&v49,
+		&v50,
+		&v51,
 	},
 }
 
-// MultiDBStates provides a convenient list of MultiDBState
+// MultiDBStates provides a convenient list of MultiDBState.
 type MultiDBStates struct {
 	List []*MultiDBState
 }
@@ -71,32 +91,35 @@ type MultiDBState struct {
 	DBStates DBStates
 }
 
-// DBStates is a convenience type
+// DBStates is a convenience type.
 type DBStates map[string]*DBState
 
 // DBState allows you to define the desired state of the DB using SQl commands.
 // Both the SQl and NewData fields contains SQL that will be executed to create
 // the expected DB. The NewData SQL additionally will be executed on the testDB
-// to ensure data is consistent.
+// to ensure data is consistent. If OldData is not empty, it is executed on the
+// testDB before the migration is run, and NewData is not run on the testDB. This
+// is used to assert that a migration that modifies data runs as expected.
 type DBState struct {
 	SQL     string
+	OldData string
 	NewData string
 }
 
-// MultiDBSnapshot represents an expected state among multiple databases
+// MultiDBSnapshot represents an expected state among multiple databases.
 type MultiDBSnapshot struct {
 	Version     int
 	DBSnapshots DBSnapshots
 }
 
-// NewMultiDBSnapshot returns a new MultiDBSnapshot
+// NewMultiDBSnapshot returns a new MultiDBSnapshot.
 func NewMultiDBSnapshot() *MultiDBSnapshot {
 	return &MultiDBSnapshot{
 		DBSnapshots: DBSnapshots{},
 	}
 }
 
-// DBSnapshots is a convenience type
+// DBSnapshots is a convenience type.
 type DBSnapshots map[string]*DBSnapshot
 
 // DBSnapshot is a snapshot of a single DB.
@@ -106,7 +129,7 @@ type DBSnapshot struct {
 }
 
 // LoadMultiDBSnapshot converts a MultiDBState into a MultiDBSnapshot. It
-// executes the SQL and stores the shema and data.
+// executes the SQL and stores the schema and data.
 func LoadMultiDBSnapshot(ctx context.Context, multiDBState *MultiDBState) (*MultiDBSnapshot, error) {
 	multiDBSnapshot := NewMultiDBSnapshot()
 	for dbName, dbState := range multiDBState.DBStates {

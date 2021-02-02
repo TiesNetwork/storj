@@ -5,55 +5,55 @@ package consoleql
 
 import (
 	"github.com/graphql-go/graphql"
-	"github.com/skyrings/skyring-common/tools/uuid"
 	"go.uber.org/zap"
 
+	"storj.io/common/uuid"
 	"storj.io/storj/private/post"
 	"storj.io/storj/satellite/console"
 	"storj.io/storj/satellite/mailservice"
 )
 
 const (
-	// Mutation is graphql request that modifies data
+	// Mutation is graphql request that modifies data.
 	Mutation = "mutation"
 
-	// CreateProjectMutation is a mutation name for project creation
+	// CreateProjectMutation is a mutation name for project creation.
 	CreateProjectMutation = "createProject"
-	// DeleteProjectMutation is a mutation name for project deletion
+	// DeleteProjectMutation is a mutation name for project deletion.
 	DeleteProjectMutation = "deleteProject"
-	// UpdateProjectDescriptionMutation is a mutation name for project updating
-	UpdateProjectDescriptionMutation = "updateProjectDescription"
+	// UpdateProjectMutation is a mutation name for project name and description updating.
+	UpdateProjectMutation = "updateProject"
 
-	// AddProjectMembersMutation is a mutation name for adding new project members
+	// AddProjectMembersMutation is a mutation name for adding new project members.
 	AddProjectMembersMutation = "addProjectMembers"
-	// DeleteProjectMembersMutation is a mutation name for deleting project members
+	// DeleteProjectMembersMutation is a mutation name for deleting project members.
 	DeleteProjectMembersMutation = "deleteProjectMembers"
 
-	// CreateAPIKeyMutation is a mutation name for api key creation
+	// CreateAPIKeyMutation is a mutation name for api key creation.
 	CreateAPIKeyMutation = "createAPIKey"
-	// DeleteAPIKeysMutation is a mutation name for api key deleting
+	// DeleteAPIKeysMutation is a mutation name for api key deleting.
 	DeleteAPIKeysMutation = "deleteAPIKeys"
 
-	// AddPaymentMethodMutation is mutation name for adding new payment method
+	// AddPaymentMethodMutation is mutation name for adding new payment method.
 	AddPaymentMethodMutation = "addPaymentMethod"
-	// DeletePaymentMethodMutation is mutation name for deleting payment method
+	// DeletePaymentMethodMutation is mutation name for deleting payment method.
 	DeletePaymentMethodMutation = "deletePaymentMethod"
-	// SetDefaultPaymentMethodMutation is mutation name setting payment method as default payment method
+	// SetDefaultPaymentMethodMutation is mutation name setting payment method as default payment method.
 	SetDefaultPaymentMethodMutation = "setDefaultPaymentMethod"
 
-	// InputArg is argument name for all input types
+	// InputArg is argument name for all input types.
 	InputArg = "input"
-	// FieldProjectID is field name for projectID
+	// FieldProjectID is field name for projectID.
 	FieldProjectID = "projectID"
-	// FieldNewPassword is a field name for new password
+	// FieldNewPassword is a field name for new password.
 	FieldNewPassword = "newPassword"
-	// Secret is a field name for registration token for user creation during Vanguard release
+	// Secret is a field name for registration token for user creation during Vanguard release.
 	Secret = "secret"
-	// ReferrerUserID is a field name for passing referrer's user id
+	// ReferrerUserID is a field name for passing referrer's user id.
 	ReferrerUserID = "referrerUserId"
 )
 
-// rootMutation creates mutation for graphql populated by AccountsClient
+// rootMutation creates mutation for graphql populated by AccountsClient.
 func rootMutation(log *zap.Logger, service *console.Service, mailService *mailservice.Service, types *TypeCreator) *graphql.Object {
 	return graphql.NewObject(graphql.ObjectConfig{
 		Name: Mutation,
@@ -86,29 +86,17 @@ func rootMutation(log *zap.Logger, service *console.Service, mailService *mailse
 					},
 				},
 				Resolve: func(p graphql.ResolveParams) (interface{}, error) {
-					inputID := p.Args[FieldID].(string)
-					projectID, err := uuid.Parse(inputID)
-					if err != nil {
-						return nil, err
-					}
-
-					project, err := service.GetProject(p.Context, *projectID)
-					if err != nil {
-						return nil, err
-					}
-
-					if err = service.DeleteProject(p.Context, project.ID); err != nil {
-						return nil, err
-					}
-
-					return project, nil
+					return nil, console.ErrUnauthorized.New("not implemented")
 				},
 			},
-			// updates project description
-			UpdateProjectDescriptionMutation: &graphql.Field{
+			// updates project name and description.
+			UpdateProjectMutation: &graphql.Field{
 				Type: types.project,
 				Args: graphql.FieldConfigArgument{
 					FieldID: &graphql.ArgumentConfig{
+						Type: graphql.NewNonNull(graphql.String),
+					},
+					FieldName: &graphql.ArgumentConfig{
 						Type: graphql.NewNonNull(graphql.String),
 					},
 					FieldDescription: &graphql.ArgumentConfig{
@@ -116,15 +104,16 @@ func rootMutation(log *zap.Logger, service *console.Service, mailService *mailse
 					},
 				},
 				Resolve: func(p graphql.ResolveParams) (interface{}, error) {
+					name := p.Args[FieldName].(string)
 					description := p.Args[FieldDescription].(string)
 
 					inputID := p.Args[FieldID].(string)
-					projectID, err := uuid.Parse(inputID)
+					projectID, err := uuid.FromString(inputID)
 					if err != nil {
 						return nil, err
 					}
 
-					project, err := service.UpdateProject(p.Context, *projectID, description)
+					project, err := service.UpdateProject(p.Context, projectID, name, description)
 					if err != nil {
 						return nil, err
 					}
@@ -147,7 +136,7 @@ func rootMutation(log *zap.Logger, service *console.Service, mailService *mailse
 					pID, _ := p.Args[FieldProjectID].(string)
 					emails, _ := p.Args[FieldEmail].([]interface{})
 
-					projectID, err := uuid.Parse(pID)
+					projectID, err := uuid.FromString(pID)
 					if err != nil {
 						return nil, err
 					}
@@ -157,12 +146,12 @@ func rootMutation(log *zap.Logger, service *console.Service, mailService *mailse
 						userEmails = append(userEmails, email.(string))
 					}
 
-					project, err := service.GetProject(p.Context, *projectID)
+					project, err := service.GetProject(p.Context, projectID)
 					if err != nil {
 						return nil, err
 					}
 
-					users, err := service.AddProjectMembers(p.Context, *projectID, userEmails)
+					users, err := service.AddProjectMembers(p.Context, projectID, userEmails)
 					if err != nil {
 						return nil, err
 					}
@@ -214,7 +203,7 @@ func rootMutation(log *zap.Logger, service *console.Service, mailService *mailse
 					pID, _ := p.Args[FieldProjectID].(string)
 					emails, _ := p.Args[FieldEmail].([]interface{})
 
-					projectID, err := uuid.Parse(pID)
+					projectID, err := uuid.FromString(pID)
 					if err != nil {
 						return nil, err
 					}
@@ -224,12 +213,12 @@ func rootMutation(log *zap.Logger, service *console.Service, mailService *mailse
 						userEmails = append(userEmails, email.(string))
 					}
 
-					err = service.DeleteProjectMembers(p.Context, *projectID, userEmails)
+					err = service.DeleteProjectMembers(p.Context, projectID, userEmails)
 					if err != nil {
 						return nil, err
 					}
 
-					project, err := service.GetProject(p.Context, *projectID)
+					project, err := service.GetProject(p.Context, projectID)
 					if err != nil {
 						return nil, err
 					}
@@ -249,15 +238,15 @@ func rootMutation(log *zap.Logger, service *console.Service, mailService *mailse
 					},
 				},
 				Resolve: func(p graphql.ResolveParams) (interface{}, error) {
-					projectID, _ := p.Args[FieldProjectID].(string)
+					projectIDField, _ := p.Args[FieldProjectID].(string)
 					name, _ := p.Args[FieldName].(string)
 
-					pID, err := uuid.Parse(projectID)
+					projectID, err := uuid.FromString(projectIDField)
 					if err != nil {
 						return nil, err
 					}
 
-					info, key, err := service.CreateAPIKey(p.Context, *pID, name)
+					info, key, err := service.CreateAPIKey(p.Context, projectID, name)
 					if err != nil {
 						return nil, err
 					}
@@ -282,17 +271,17 @@ func rootMutation(log *zap.Logger, service *console.Service, mailService *mailse
 					var keyIds []uuid.UUID
 					var keys []console.APIKeyInfo
 					for _, id := range paramKeysID {
-						keyID, err := uuid.Parse(id.(string))
+						keyID, err := uuid.FromString(id.(string))
 						if err != nil {
 							return nil, err
 						}
 
-						key, err := service.GetAPIKeyInfo(p.Context, *keyID)
+						key, err := service.GetAPIKeyInfo(p.Context, keyID)
 						if err != nil {
 							return nil, err
 						}
 
-						keyIds = append(keyIds, *keyID)
+						keyIds = append(keyIds, keyID)
 						keys = append(keys, *key)
 					}
 

@@ -55,7 +55,6 @@ const {
     DELETE,
     TOGGLE_SELECTION,
     CLEAR,
-    CLEAR_SELECTION,
     SET_SEARCH_QUERY,
     SET_SORT_BY,
     SET_SORT_DIRECTION,
@@ -81,6 +80,10 @@ export default class ProjectMembersArea extends Vue {
         pagination: HTMLElement & ResetPagination;
     };
 
+    /**
+     * Lifecycle hook after initial render.
+     * Fetches first page of team members list of current project.
+     */
     public async mounted(): Promise<void> {
         await this.$store.dispatch(FETCH, 1);
         this.$segment.track(SegmentEvent.TEAM_VIEWED, {
@@ -89,24 +92,45 @@ export default class ProjectMembersArea extends Vue {
         });
     }
 
+    /**
+     * Selects team member if this user has no owner status.
+     * @param member
+     */
     public onMemberClick(member: ProjectMember): void {
         if (this.$store.getters.selectedProject.ownerId !== member.user.id) {
             this.$store.dispatch(TOGGLE_SELECTION, member);
         }
     }
 
+    /**
+     * Returns team members of current page from store.
+     * With project owner pinned to top
+     */
     public get projectMembers(): ProjectMember[] {
-        return this.$store.state.projectMembersModule.page.projectMembers;
+        const projectMembers = this.$store.state.projectMembersModule.page.projectMembers;
+        const projectOwner = projectMembers.find((member) => member.user.id === this.$store.getters.selectedProject.ownerId);
+        const projectMembersToReturn = projectMembers.filter((member) => member.user.id !== this.$store.getters.selectedProject.ownerId);
+
+        // if the project owner exists, place at the front of the members list
+        projectOwner && projectMembersToReturn.unshift(projectOwner);
+
+        return projectMembersToReturn;
     }
 
     public get getItemComponent() {
         return ProjectMemberListItem;
     }
 
+    /**
+     * Returns team members total page count from store.
+     */
     public get projectMembersTotalCount(): number {
         return this.$store.state.projectMembersModule.page.totalCount;
     }
 
+    /**
+     * Returns team members count of current page from store.
+     */
     public get projectMembersCount(): number {
         return this.$store.state.projectMembersModule.page.projectMembers.length;
     }
@@ -120,11 +144,7 @@ export default class ProjectMembersArea extends Vue {
     }
 
     public get headerState(): number {
-        if (this.selectedProjectMembersLength > 0) {
-            return ProjectMemberHeaderState.ON_SELECT;
-        }
-
-        return ProjectMemberHeaderState.DEFAULT;
+        return this.selectedProjectMembersLength > 0 ? ProjectMemberHeaderState.ON_SELECT : ProjectMemberHeaderState.DEFAULT;
     }
 
     public get isTeamAreaShown(): boolean {
@@ -135,6 +155,10 @@ export default class ProjectMembersArea extends Vue {
         return this.projectMembersCount === 0 && this.projectMembersTotalCount === 0;
     }
 
+    /**
+     * Fetches team member of selected page.
+     * @param index
+     */
     public async onPageClick(index: number): Promise<void> {
         try {
             await this.$store.dispatch(FETCH, index);
@@ -143,6 +167,11 @@ export default class ProjectMembersArea extends Vue {
         }
     }
 
+    /**
+     * Changes sorting parameters and fetches team members.
+     * @param sortBy
+     * @param sortDirection
+     */
     public async onHeaderSectionClickCallback(sortBy: ProjectMemberOrderBy, sortDirection: SortDirection): Promise<void> {
         await this.$store.dispatch(SET_SORT_BY, sortBy);
         await this.$store.dispatch(SET_SORT_DIRECTION, sortDirection);
@@ -165,7 +194,7 @@ export default class ProjectMembersArea extends Vue {
 
 <style scoped lang="scss">
     .team-area {
-        padding: 40px 65px 55px 65px;
+        padding: 40px 30px 55px 30px;
         font-family: 'font_regular', sans-serif;
 
         &__header {
@@ -205,15 +234,7 @@ export default class ProjectMembersArea extends Vue {
     }
 
     .pagination-area {
-        margin-top: 50px;
         margin-left: -25px;
-        padding-bottom: 50px;
-    }
-
-    @media screen and (max-width: 1024px) {
-
-        .team-area {
-            padding: 40px 40px 55px 40px;
-        }
+        padding-bottom: 15px;
     }
 </style>

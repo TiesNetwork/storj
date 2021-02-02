@@ -6,14 +6,14 @@ package tagsql_test
 import (
 	"testing"
 
-	_ "github.com/lib/pq"
+	_ "github.com/jackc/pgx/v4/stdlib"
 	_ "github.com/mattn/go-sqlite3"
 	"github.com/stretchr/testify/require"
 
 	"storj.io/common/testcontext"
 	"storj.io/storj/private/dbutil/cockroachutil"
+	"storj.io/storj/private/dbutil/pgtest"
 	"storj.io/storj/private/dbutil/pgutil"
-	"storj.io/storj/private/dbutil/pgutil/pgtest"
 	"storj.io/storj/private/tagsql"
 )
 
@@ -24,7 +24,7 @@ func run(t *testing.T, fn func(*testcontext.Context, *testing.T, tagsql.DB, tags
 		ctx := testcontext.New(t)
 		defer ctx.Cleanup()
 
-		db, err := tagsql.Open("sqlite3", ":memory:")
+		db, err := tagsql.Open(ctx, "sqlite3", ":memory:")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -33,32 +33,34 @@ func run(t *testing.T, fn func(*testcontext.Context, *testing.T, tagsql.DB, tags
 		fn(ctx, t, db, tagsql.SupportBasic)
 	})
 
-	t.Run("lib-pq-postgres", func(t *testing.T) {
+	t.Run("jackc-pgx-postgres", func(t *testing.T) {
+		connstr := pgtest.PickPostgres(t)
+
 		ctx := testcontext.New(t)
 		defer ctx.Cleanup()
 
-		if *pgtest.ConnStr == "" {
-			t.Skipf("postgresql flag missing, example:\n-postgres-test-db=%s", pgtest.DefaultConnStr)
-		}
-
-		db, err := pgutil.OpenUnique(ctx, *pgtest.ConnStr, "detect")
+		db, err := pgutil.OpenUnique(ctx, connstr, "detect")
 		require.NoError(t, err)
 		defer ctx.Check(db.Close)
+
+		db.SetMaxOpenConns(100)
+		db.SetMaxIdleConns(100)
 
 		fn(ctx, t, db.DB, tagsql.SupportNone)
 	})
 
-	t.Run("lib-pq-cockroach", func(t *testing.T) {
+	t.Run("jackc-pgx-cockroach", func(t *testing.T) {
+		connstr := pgtest.PickCockroach(t)
+
 		ctx := testcontext.New(t)
 		defer ctx.Cleanup()
 
-		if *pgtest.CrdbConnStr == "" {
-			t.Skipf("postgresql flag missing, example:\n-cockroach-test-db=%s", pgtest.DefaultCrdbConnStr)
-		}
-
-		db, err := cockroachutil.OpenUnique(ctx, *pgtest.CrdbConnStr, "detect")
+		db, err := cockroachutil.OpenUnique(ctx, connstr, "detect")
 		require.NoError(t, err)
 		defer ctx.Check(db.Close)
+
+		db.SetMaxOpenConns(100)
+		db.SetMaxIdleConns(100)
 
 		fn(ctx, t, db.DB, tagsql.SupportNone)
 	})

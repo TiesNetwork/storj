@@ -7,12 +7,14 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
+	"errors"
+	"sort"
 
-	"github.com/lib/pq"
 	"github.com/spacemonkeygo/monkit/v3"
 	"github.com/zeebo/errs"
 
 	"storj.io/storj/private/dbutil"
+	"storj.io/storj/private/dbutil/cockroachutil"
 	"storj.io/storj/private/dbutil/pgutil"
 	"storj.io/storj/private/dbutil/txutil"
 	"storj.io/storj/private/tagsql"
@@ -24,36 +26,38 @@ var (
 	mon = monkit.Package()
 )
 
-// Client is the entrypoint into a cockroachkv data store
+// Client is the entrypoint into a cockroachkv data store.
 type Client struct {
-	db tagsql.DB
-
+	db          tagsql.DB
+	dbURL       string
 	lookupLimit int
 }
 
-// New instantiates a new cockroachkv client given db URL
-func New(dbURL string) (*Client, error) {
-	dbURL = pgutil.CheckApplicationName(dbURL)
-
-	db, err := tagsql.Open("cockroach", dbURL)
+// Open connects a new cockroachkv client given db URL.
+func Open(ctx context.Context, dbURL string, app string) (*Client, error) {
+	dbURL, err := pgutil.CheckApplicationName(dbURL, app)
 	if err != nil {
 		return nil, err
 	}
 
-	dbutil.Configure(db, mon)
-
-	// TODO: new shouldn't be taking ctx as argument
-	err = schema.PrepareDB(context.TODO(), db)
+	db, err := tagsql.Open(ctx, "cockroach", dbURL)
 	if err != nil {
 		return nil, err
 	}
 
-	return NewWith(db), nil
+	dbutil.Configure(ctx, db, "cockroachkv", mon)
+
+	return NewWith(db, dbURL), nil
 }
 
 // NewWith instantiates a new cockroachkv client given db.
-func NewWith(db tagsql.DB) *Client {
-	return &Client{db: db, lookupLimit: storage.DefaultLookupLimit}
+func NewWith(db tagsql.DB, dbURL string) *Client {
+	return &Client{db: db, dbURL: dbURL, lookupLimit: storage.DefaultLookupLimit}
+}
+
+// MigrateToLatest migrates to latest schema version.
+func (client *Client) MigrateToLatest(ctx context.Context) error {
+	return schema.PrepareDB(ctx, client.db)
 }
 
 // SetLookupLimit sets the lookup limit.
@@ -62,7 +66,7 @@ func (client *Client) SetLookupLimit(v int) { client.lookupLimit = v }
 // LookupLimit returns the maximum limit that is allowed.
 func (client *Client) LookupLimit() int { return client.lookupLimit }
 
-// Close closes the client
+// Close closes the client.
 func (client *Client) Close() error {
 	return client.db.Close()
 }
@@ -98,7 +102,7 @@ func (client *Client) Get(ctx context.Context, key storage.Key) (_ storage.Value
 
 	var val []byte
 	err = row.Scan(&val)
-	if err == sql.ErrNoRows {
+	if errors.Is(err, sql.ErrNoRows) {
 		return nil, storage.ErrKeyNotFound.New("%q", key)
 	}
 
@@ -107,37 +111,57 @@ func (client *Client) Get(ctx context.Context, key storage.Key) (_ storage.Value
 
 // GetAll finds all values for the provided keys (up to LookupLimit).
 // If more keys are provided than the maximum, an error will be returned.
-func (client *Client) GetAll(ctx context.Context, keys storage.Keys) (_ storage.Values, err error) {
+func (client *Client) GetAll(ctx context.Context, keys storage.Keys) (values storage.Values, err error) {
 	defer mon.Task()(&ctx)(&err)
 
 	if len(keys) > client.lookupLimit {
-		return nil, storage.ErrLimitExceeded
+		return nil, storage.ErrLimitExceeded.New("lookup limit exceeded")
 	}
 
+	for {
+		values, err = client.getAllOnce(ctx, keys)
+		if err != nil {
+			if cockroachutil.NeedsRetry(err) {
+				continue
+			}
+			return nil, Error.Wrap(err)
+		}
+		return values, nil
+	}
+}
+
+func (client *Client) getAllOnce(ctx context.Context, keys storage.Keys) (values storage.Values, err error) {
+	defer mon.Task()(&ctx)(&err)
 	q := `
-		SELECT metadata
-		FROM pathdata pd
-			RIGHT JOIN
-				unnest($1:::BYTEA[]) WITH ORDINALITY pk(request, ord)
-			ON (pd.fullpath = pk.request)
-		ORDER BY pk.ord
-	`
-	rows, err := client.db.QueryContext(ctx, q, pq.ByteaArray(keys.ByteSlices()))
+			SELECT metadata
+			FROM pathdata pd
+				RIGHT JOIN
+					unnest($1:::BYTEA[]) WITH ORDINALITY pk(request, ord)
+				ON (pd.fullpath = pk.request)
+			ORDER BY pk.ord
+		`
+	rows, err := client.db.QueryContext(ctx, q, pgutil.ByteaArray(keys.ByteSlices()))
 	if err != nil {
-		return nil, errs.Wrap(err)
+		return nil, err
 	}
-	defer func() { err = errs.Combine(err, Error.Wrap(rows.Close())) }()
-
-	values := make([]storage.Value, 0, len(keys))
+	defer func() {
+		closeErr := rows.Close()
+		if closeErr != nil {
+			err = errs.Combine(err, closeErr)
+		}
+	}()
+	values = make([]storage.Value, 0, len(keys))
 	for rows.Next() {
 		var value []byte
 		if err := rows.Scan(&value); err != nil {
-			return nil, Error.Wrap(err)
+			return nil, err
 		}
 		values = append(values, storage.Value(value))
 	}
-
-	return values, Error.Wrap(rows.Err())
+	if err = rows.Err(); err != nil {
+		return nil, err
+	}
+	return values, nil
 }
 
 // Delete deletes the given key and its associated value.
@@ -164,23 +188,44 @@ func (client *Client) Delete(ctx context.Context, key storage.Key) (err error) {
 	return nil
 }
 
-// DeleteMultiple deletes keys ignoring missing keys
-func (client *Client) DeleteMultiple(ctx context.Context, keys []storage.Key) (_ storage.Items, err error) {
-	defer mon.Task()(&ctx, len(keys))(&err)
+// DeleteMultiple deletes keys ignoring missing keys.
+func (client *Client) DeleteMultiple(ctx context.Context, keys []storage.Key) (items storage.Items, err error) {
+	defer mon.Task()(&ctx)(&err)
 
+	// make sure delete always happen in the same order
+	sort.Slice(keys, func(i, j int) bool {
+		return keys[i].Less(keys[j])
+	})
+
+	for {
+		items, err = client.deleteMultipleOnce(ctx, keys)
+		if err != nil {
+			if cockroachutil.NeedsRetry(err) {
+				continue
+			}
+			return nil, Error.Wrap(err)
+		}
+		return items, nil
+	}
+}
+
+func (client *Client) deleteMultipleOnce(ctx context.Context, keys storage.Keys) (items storage.Items, err error) {
+	defer mon.Task()(&ctx)(&err)
 	rows, err := client.db.QueryContext(ctx, `
 		DELETE FROM pathdata
 		WHERE fullpath = any($1::BYTEA[])
 		RETURNING fullpath, metadata`,
-		pq.ByteaArray(storage.Keys(keys).ByteSlices()))
+		pgutil.ByteaArray(keys.ByteSlices()))
 	if err != nil {
 		return nil, err
 	}
 	defer func() {
-		err = errs.Combine(err, rows.Close())
+		closeErr := rows.Close()
+		if closeErr != nil {
+			err = errs.Combine(err, closeErr)
+		}
 	}()
-
-	var items storage.Items
+	items = make([]storage.ListItem, 0, len(keys))
 	for rows.Next() {
 		var key, value []byte
 		err := rows.Scan(&key, &value)
@@ -192,8 +237,10 @@ func (client *Client) DeleteMultiple(ctx context.Context, keys []storage.Key) (_
 			Value: value,
 		})
 	}
-
-	return items, rows.Err()
+	if err = rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }
 
 // List returns either a list of known keys, in order, or an error.
@@ -210,6 +257,13 @@ func (client *Client) Iterate(ctx context.Context, opts storage.IterateOptions, 
 		opts.Limit = client.lookupLimit
 	}
 
+	return client.IterateWithoutLookupLimit(ctx, opts, fn)
+}
+
+// IterateWithoutLookupLimit calls the callback with an iterator over the keys, but doesn't enforce default limit on opts.
+func (client *Client) IterateWithoutLookupLimit(ctx context.Context, opts storage.IterateOptions, fn func(context.Context, storage.Iterator) error) (err error) {
+	defer mon.Task()(&ctx)(&err)
+
 	opi, err := newOrderedCockroachIterator(ctx, client, opts)
 	if err != nil {
 		return err
@@ -221,7 +275,7 @@ func (client *Client) Iterate(ctx context.Context, opts storage.IterateOptions, 
 	return fn(ctx, opi)
 }
 
-// CompareAndSwap atomically compares and swaps oldValue with newValue
+// CompareAndSwap atomically compares and swaps oldValue with newValue.
 func (client *Client) CompareAndSwap(ctx context.Context, key storage.Key, oldValue, newValue storage.Value) (err error) {
 	defer mon.Task()(&ctx)(&err)
 
@@ -235,7 +289,7 @@ func (client *Client) CompareAndSwap(ctx context.Context, key storage.Key, oldVa
 
 		var val []byte
 		err = row.Scan(&val)
-		if err == sql.ErrNoRows {
+		if errors.Is(err, sql.ErrNoRows) {
 			return nil
 		}
 
@@ -255,7 +309,7 @@ func (client *Client) CompareAndSwap(ctx context.Context, key storage.Key, oldVa
 
 		var val []byte
 		err = row.Scan(&val)
-		if err == sql.ErrNoRows {
+		if errors.Is(err, sql.ErrNoRows) {
 			return storage.ErrValueChanged.New("%q", key)
 		}
 		return Error.Wrap(err)
@@ -267,7 +321,7 @@ func (client *Client) CompareAndSwap(ctx context.Context, key storage.Key, oldVa
 
 		var metadata []byte
 		err = row.Scan(&metadata)
-		if err == sql.ErrNoRows {
+		if errors.Is(err, sql.ErrNoRows) {
 			// Row not found for this fullpath.
 			// Potentially because another concurrent transaction changed the row.
 			return storage.ErrKeyNotFound.New("%q", key)

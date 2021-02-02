@@ -6,36 +6,47 @@
 <script lang="ts">
 import { Component, Vue } from 'vue-property-decorator';
 
-import NewProjectArea from '@/components/header/NewProjectArea.vue';
-import ProjectSelectionArea from '@/components/header/projectSelection/ProjectSelectionArea.vue';
+import ProjectSelection from '@/components/header/projectsDropdown/ProjectSelection.vue';
+import ResourcesSelection from '@/components/header/resourcesDropdown/ResourcesSelection.vue';
+import SettingsSelection from '@/components/header/settingsDropdown/SettingsSelection.vue';
 import NavigationArea from '@/components/navigation/NavigationArea.vue';
-import ProjectCreationSuccessPopup from '@/components/project/ProjectCreationSuccessPopup.vue';
 
 import LogoIcon from '@/../static/images/header/logo.svg';
 import NavigationCloseIcon from '@/../static/images/header/navigationClose.svg';
 import NavigationMenuIcon from '@/../static/images/header/navigationMenu.svg';
 
-import AccountButton from './AccountButton.vue';
+import { RouteConfig } from '@/router';
+
+import AccountButton from './accountDropdown/AccountButton.vue';
 
 @Component({
     components: {
-        ProjectCreationSuccessPopup,
-        ProjectSelectionArea,
-        NewProjectArea,
         AccountButton,
         NavigationArea,
         NavigationMenuIcon,
         NavigationCloseIcon,
         LogoIcon,
+        ProjectSelection,
+        ResourcesSelection,
+        SettingsSelection,
     },
 })
-export default class DashboardHeader extends Vue {
+export default class HeaderArea extends Vue {
+    /**
+     * Indicates if navigation toggling button is visible depending on screen width.
+     */
     public isNavigationVisible: boolean = false;
 
+    /**
+     * Toggle navigation visibility.
+     */
     public toggleNavigationVisibility(): void {
         this.isNavigationVisible = !this.isNavigationVisible;
     }
 
+    /**
+     * Reloads page.
+     */
     public onLogoClick(): void {
         location.reload();
     }

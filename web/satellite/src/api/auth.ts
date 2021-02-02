@@ -1,6 +1,8 @@
 // Copyright (C) 2019 Storj Labs, Inc.
 // See LICENSE for copying information.
 
+import { ErrorEmailUsed } from '@/api/errors/ErrorEmailUsed';
+import { ErrorTooManyRequests } from '@/api/errors/ErrorTooManyRequests';
 import { ErrorUnauthorized } from '@/api/errors/ErrorUnauthorized';
 import { UpdatedUser, User } from '@/types/users';
 import { HttpClient } from '@/utils/httpClient';
@@ -12,7 +14,6 @@ import { HttpClient } from '@/utils/httpClient';
 export class AuthHttpApi {
     private readonly http: HttpClient = new HttpClient();
     private readonly ROOT_PATH: string = '/api/v0/auth';
-    private readonly REFERRAL_PATH: string = '/api/v0/referrals';
 
     /**
      * Used to resend an registration confirmation email.
@@ -48,11 +49,14 @@ export class AuthHttpApi {
             return await response.json();
         }
 
-        if (response.status === 401) {
-            throw new Error('your email or password was incorrect, please try again');
+        switch (response.status) {
+            case 401:
+                throw new ErrorUnauthorized('Your email or password was incorrect, please try again');
+            case 429:
+                throw new ErrorTooManyRequests('You\'ve exceeded limit of attempts, try again in 5 minutes');
+            default:
+                throw new Error('Can not receive authentication token');
         }
-
-        throw new Error('can not receive authentication token');
     }
 
     /**
@@ -83,7 +87,12 @@ export class AuthHttpApi {
      */
     public async forgotPassword(email: string): Promise<void> {
         const path = `${this.ROOT_PATH}/forgot-password/${email}`;
-        await this.http.post(path, email);
+        const response = await this.http.post(path, email);
+        if (response.ok) {
+            return;
+        }
+
+        throw new Error('There is no such email');
     }
 
     /**
@@ -115,7 +124,18 @@ export class AuthHttpApi {
         const path = `${this.ROOT_PATH}/account`;
         const response = await this.http.get(path);
         if (response.ok) {
-            return await response.json();
+            const userResponse = await response.json();
+
+            return new User(
+                userResponse.id,
+                userResponse.fullName,
+                userResponse.shortName,
+                userResponse.email,
+                userResponse.partner,
+                userResponse.partnerId,
+                userResponse.password,
+                userResponse.projectLimit,
+            );
         }
 
         if (response.status === 401) {
@@ -178,63 +198,41 @@ export class AuthHttpApi {
 
     // TODO: remove secret after Vanguard release
     /**
-     * Used to register account
+     * Used to register account.
      *
      * @param user - stores user information
      * @param secret - registration token used in Vanguard release
-     * @param referrerUserId - referral id to participate in bonus program
      * @returns id of created user
      * @throws Error
      */
-    public async register(user: {fullName: string; shortName: string; email: string; partnerId: string; password: string}, secret: string, referrerUserId: string): Promise<string> {
+    public async register(user: {fullName: string; shortName: string; email: string; partner: string; partnerId: string; password: string; isProfessional: boolean; position: string; companyName: string; employeeCount: string}, secret: string): Promise<string> {
         const path = `${this.ROOT_PATH}/register`;
         const body = {
             secret: secret,
-            referrerUserId: referrerUserId ? referrerUserId : '',
             password: user.password,
             fullName: user.fullName,
             shortName: user.shortName,
             email: user.email,
+            partner: user.partner ? user.partner : '',
             partnerId: user.partnerId ? user.partnerId : '',
+            isProfessional: user.isProfessional,
+            position: user.position,
+            companyName: user.companyName,
+            employeeCount: user.employeeCount,
         };
 
         const response = await this.http.post(path, JSON.stringify(body));
         if (!response.ok) {
-            if (response.status === 401) {
-                throw new ErrorUnauthorized('we are unable to create your account. This is an invite-only alpha, please join our waitlist to receive an invitation');
+            switch (response.status) {
+                case 401:
+                    throw new ErrorUnauthorized('We are unable to create your account. This is an invite-only alpha, please join our waitlist to receive an invitation');
+                case 409:
+                    throw new ErrorEmailUsed('This email is already in use, try another');
+                case 429:
+                    throw new ErrorTooManyRequests('You\'ve exceeded limit of attempts, try again in 5 minutes');
+                default:
+                    throw new Error('Can not register user');
             }
-
-            throw new Error('can not register user');
-        }
-
-        return await response.json();
-    }
-
-    /**
-     * Used to register account by referral link.
-     *
-     * @param user - stores user information
-     * @param referralToken - referral registration token
-     * @returns id of created user
-     * @throws Error
-     */
-    public async referralRegister(user: {fullName: string; shortName: string; email: string; password: string}, referralToken: string): Promise<string> {
-        const path = `${this.REFERRAL_PATH}/register`;
-        const body = {
-            referralToken,
-            password: user.password,
-            fullName: user.fullName,
-            shortName: user.shortName,
-            email: user.email,
-        };
-
-        const response = await this.http.post(path, JSON.stringify(body));
-        if (!response.ok) {
-            if (response.status === 400) {
-                throw new Error('we are unable to create your account. This is an invite-only alpha, please join our waitlist to receive an invitation');
-            }
-
-            throw new Error('can not register user');
         }
 
         return await response.json();

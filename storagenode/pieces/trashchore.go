@@ -14,7 +14,7 @@ import (
 	"storj.io/storj/storagenode/trust"
 )
 
-// TrashChore is the chore that periodically empties the trash
+// TrashChore is the chore that periodically empties the trash.
 type TrashChore struct {
 	log                 *zap.Logger
 	interval            time.Duration
@@ -27,7 +27,7 @@ type TrashChore struct {
 
 // NewTrashChore instantiates a new TrashChore. choreInterval is how often this
 // chore runs, and trashExpiryInterval is passed into the EmptyTrash method to
-// determine which trashed pieces should be deleted
+// determine which trashed pieces should be deleted.
 func NewTrashChore(log *zap.Logger, choreInterval, trashExpiryInterval time.Duration, trust *trust.Pool, store *Store) *TrashChore {
 	return &TrashChore{
 		log:                 log,
@@ -38,13 +38,13 @@ func NewTrashChore(log *zap.Logger, choreInterval, trashExpiryInterval time.Dura
 	}
 }
 
-// Run starts the cycle
+// Run starts the cycle.
 func (chore *TrashChore) Run(ctx context.Context) (err error) {
 	defer mon.Task()(&ctx)(&err)
 
 	chore.cycle = sync2.NewCycle(chore.interval)
 	chore.cycle.Start(ctx, &errgroup.Group{}, func(ctx context.Context) error {
-		chore.log.Debug("starting emptying trash")
+		chore.log.Debug("starting to empty trash")
 
 		for _, satelliteID := range chore.trust.GetSatellites(ctx) {
 			trashedBefore := time.Now().Add(-chore.trashExpiryInterval)
@@ -68,7 +68,7 @@ func (chore *TrashChore) TriggerWait(ctx context.Context) {
 	chore.cycle.TriggerWait()
 }
 
-// Close the chore
+// Close the chore.
 func (chore *TrashChore) Close() error {
 	if chore.cycle != nil {
 		chore.cycle.Close()

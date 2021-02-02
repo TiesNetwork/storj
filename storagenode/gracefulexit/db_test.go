@@ -16,7 +16,7 @@ import (
 	"storj.io/storj/storagenode/storagenodedb/storagenodedbtest"
 )
 
-// TestDB tests the graceful exit database calls
+// TestDB tests the graceful exit database calls.
 func TestDB(t *testing.T) {
 	storagenodedbtest.Run(t, func(ctx *testcontext.Context, t *testing.T, db storagenode.DB) {
 		for i := 0; i <= 3; i++ {
@@ -32,7 +32,7 @@ func TestDB(t *testing.T) {
 			require.Equal(t, len(exits), i+1)
 			require.Equal(t, exits[i].BytesDeleted, int64(0))
 			require.Equal(t, exits[i].CompletionReceipt, []byte(nil))
-			require.Equal(t, *exits[i].InitiatedAt, start.UTC())
+			require.True(t, exits[i].InitiatedAt.Equal(start))
 			require.Nil(t, exits[i].FinishedAt)
 			require.Equal(t, exits[i].SatelliteID, nodeID)
 			require.Equal(t, exits[i].StartingDiskUsage, int64(5000))
@@ -46,7 +46,7 @@ func TestDB(t *testing.T) {
 			require.Equal(t, len(exits), i+1)
 			require.Equal(t, exits[i].BytesDeleted, int64(3000))
 			require.Equal(t, exits[i].CompletionReceipt, []byte(nil))
-			require.Equal(t, *exits[i].InitiatedAt, start.UTC())
+			require.True(t, exits[i].InitiatedAt.Equal(start))
 			require.Nil(t, exits[i].FinishedAt)
 			require.Equal(t, exits[i].SatelliteID, nodeID)
 			require.Equal(t, exits[i].StartingDiskUsage, int64(5000))
@@ -58,8 +58,8 @@ func TestDB(t *testing.T) {
 			require.Equal(t, len(exits), i+1)
 			require.Equal(t, exits[i].BytesDeleted, int64(3000))
 			require.Equal(t, exits[i].CompletionReceipt, []byte{0, 0, 0})
-			require.Equal(t, *exits[i].InitiatedAt, start.UTC())
-			require.Equal(t, *exits[i].FinishedAt, stop.UTC())
+			require.True(t, exits[i].InitiatedAt.Equal(start))
+			require.True(t, exits[i].FinishedAt.Equal(stop))
 			require.Equal(t, exits[i].SatelliteID, nodeID)
 			require.Equal(t, exits[i].StartingDiskUsage, int64(5000))
 

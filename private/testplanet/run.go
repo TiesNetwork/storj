@@ -4,23 +4,40 @@
 package testplanet
 
 import (
+	"context"
+	"runtime/pprof"
+	"strings"
 	"testing"
 
-	"go.uber.org/zap"
-	"go.uber.org/zap/zaptest"
-
 	"storj.io/common/testcontext"
-	"storj.io/storj/satellite"
-	"storj.io/storj/satellite/metainfo"
+	"storj.io/storj/private/dbutil/pgtest"
 	"storj.io/storj/satellite/satellitedb/satellitedbtest"
+	"storj.io/uplink"
 )
 
 // Run runs testplanet in multiple configurations.
 func Run(t *testing.T, config Config, test func(t *testing.T, ctx *testcontext.Context, planet *Planet)) {
+	databases := satellitedbtest.Databases()
+	hasDatabase := false
+	for _, db := range databases {
+		hasDatabase = hasDatabase || (db.MasterDB.URL != "" && db.MasterDB.URL != "omit")
+	}
+	if !hasDatabase {
+		t.Fatal("Databases flag missing, set at least one:\n" +
+			"-postgres-test-db=" + pgtest.DefaultPostgres + "\n" +
+			"-cockroach-test-db=" + pgtest.DefaultCockroach)
+	}
+
 	for _, satelliteDB := range satellitedbtest.Databases() {
 		satelliteDB := satelliteDB
-		t.Run(satelliteDB.MasterDB.Name, func(t *testing.T) {
-			t.Parallel()
+		if strings.EqualFold(satelliteDB.MasterDB.URL, "omit") {
+			continue
+		}
+		t.Run(satelliteDB.Name, func(t *testing.T) {
+			parallel := !config.NonParallel
+			if parallel {
+				t.Parallel()
+			}
 
 			ctx := testcontext.New(t)
 			defer ctx.Cleanup()
@@ -30,25 +47,36 @@ func Run(t *testing.T, config Config, test func(t *testing.T, ctx *testcontext.C
 			}
 
 			planetConfig := config
-			planetConfig.Reconfigure.NewSatelliteDB = func(log *zap.Logger, index int) (satellite.DB, error) {
-				return satellitedbtest.CreateMasterDB(ctx, t, "S", index, satelliteDB.MasterDB)
+			if planetConfig.Name == "" {
+				planetConfig.Name = t.Name()
 			}
 
-			if satelliteDB.PointerDB.URL != "" {
-				planetConfig.Reconfigure.NewSatellitePointerDB = func(log *zap.Logger, index int) (metainfo.PointerDB, error) {
-					return satellitedbtest.CreatePointerDB(ctx, t, "P", index, satelliteDB.PointerDB)
+			pprof.Do(ctx, pprof.Labels("planet", planetConfig.Name), func(namedctx context.Context) {
+				planet, err := NewCustom(namedctx, newLogger(t), planetConfig, satelliteDB)
+				if err != nil {
+					t.Fatalf("%+v", err)
 				}
-			}
+				defer ctx.Check(planet.Shutdown)
 
-			planet, err := NewCustom(zaptest.NewLogger(t), planetConfig)
+				planet.Start(namedctx)
+
+				provisionUplinks(namedctx, t, planet)
+
+				test(t, ctx, planet)
+			})
+		})
+	}
+}
+
+func provisionUplinks(ctx context.Context, t *testing.T, planet *Planet) {
+	for _, planetUplink := range planet.Uplinks {
+		for _, satellite := range planet.Satellites {
+			apiKey := planetUplink.APIKey[satellite.ID()]
+			access, err := uplink.RequestAccessWithPassphrase(ctx, satellite.URL(), apiKey.Serialize(), "")
 			if err != nil {
 				t.Fatalf("%+v", err)
 			}
-			defer ctx.Check(planet.Shutdown)
-
-			planet.Start(ctx)
-
-			test(t, ctx, planet)
-		})
+			planetUplink.Access[satellite.ID()] = access
+		}
 	}
 }

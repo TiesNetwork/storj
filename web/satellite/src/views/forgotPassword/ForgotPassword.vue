@@ -13,9 +13,7 @@ import LogoIcon from '@/../static/images/Logo.svg';
 
 import { AuthHttpApi } from '@/api/auth';
 import { RouteConfig } from '@/router';
-import { SegmentEvent } from '@/utils/constants/analyticsEventNames';
-import { LOADING_CLASSES } from '@/utils/constants/classConstants';
-import { validateEmail } from '@/utils/validation';
+import { Validator } from '@/utils/validation';
 
 @Component({
     components: {
@@ -25,17 +23,43 @@ import { validateEmail } from '@/utils/validation';
     },
 })
 export default class ForgotPassword extends Vue {
-    public loadingClassName: string = LOADING_CLASSES.LOADING_OVERLAY;
     private email: string = '';
     private emailError: string = '';
 
     private readonly auth: AuthHttpApi = new AuthHttpApi();
+
+    // tardigrade logic
+    public isDropdownShown: boolean = false;
+
+    /**
+     * Checks if page is inside iframe
+     */
+    public get isInsideIframe(): boolean {
+        return window.self !== window.top;
+    }
 
     public setEmail(value: string): void {
         this.email = value;
         this.emailError = '';
     }
 
+    /**
+     * Toggles satellite selection dropdown visibility (Tardigrade).
+     */
+    public toggleDropdown(): void {
+        this.isDropdownShown = !this.isDropdownShown;
+    }
+
+    /**
+     * Closes satellite selection dropdown (Tardigrade).
+     */
+    public closeDropdown(): void {
+        this.isDropdownShown = false;
+    }
+
+    /**
+     * Sends recovery password email.
+     */
     public async onSendConfigurations(): Promise<void> {
         const self = this;
 
@@ -45,22 +69,28 @@ export default class ForgotPassword extends Vue {
 
         try {
             await this.auth.forgotPassword(this.email);
-            await this.$notify.success('Please look for instructions at your email');
         } catch (error) {
             await this.$notify.error(error.message);
+
+            return;
         }
+
+        await this.$notify.success('Please look for instructions at your email');
     }
 
+    /**
+     * Changes location to Login route.
+     */
     public onBackToLoginClick(): void {
-      this.$router.push(RouteConfig.Login.path);
+        this.$router.push(RouteConfig.Login.path);
     }
 
     public onLogoClick(): void {
-      location.reload();
+        location.reload();
     }
 
     private validateFields(): boolean {
-        const isEmailValid = validateEmail(this.email.trim());
+        const isEmailValid = Validator.email(this.email.trim());
 
         if (!isEmailValid) {
             this.emailError = 'Invalid Email';

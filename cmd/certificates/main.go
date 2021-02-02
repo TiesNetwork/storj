@@ -9,11 +9,12 @@ import (
 	"go.uber.org/zap"
 
 	"storj.io/common/fpath"
+	"storj.io/private/cfgstruct"
+	"storj.io/private/process"
 	"storj.io/storj/certificate"
 	"storj.io/storj/certificate/authorization"
-	"storj.io/storj/pkg/cfgstruct"
-	"storj.io/storj/pkg/process"
 	"storj.io/storj/pkg/revocation"
+	_ "storj.io/storj/private/version" // This attaches version information during release builds.
 )
 
 var (
@@ -69,12 +70,12 @@ func cmdRun(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	authorizationDB, err := authorization.NewDBFromCfg(runCfg.AuthorizationDB)
+	authorizationDB, err := authorization.OpenDBFromCfg(ctx, runCfg.AuthorizationDB)
 	if err != nil {
 		return errs.New("error opening authorizations database: %+v", err)
 	}
 
-	revocationDB, err := revocation.NewDBFromCfg(runCfg.Server.Config)
+	revocationDB, err := revocation.OpenDBFromCfg(ctx, runCfg.Server.Config)
 	if err != nil {
 		return errs.New("error creating revocation database: %+v", err)
 	}

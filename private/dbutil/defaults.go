@@ -4,6 +4,7 @@
 package dbutil
 
 import (
+	"context"
 	"database/sql"
 	"flag"
 	"time"
@@ -12,9 +13,9 @@ import (
 )
 
 var (
-	maxIdleConns    = flag.Int("db.max_idle_conns", 20, "Maximum Amount of Idle Database connections, -1 means the stdlib default")
-	maxOpenConns    = flag.Int("db.max_open_conns", 25, "Maximum Amount of Open Database connections, -1 means the stdlib default")
-	connMaxLifetime = flag.Duration("db.conn_max_lifetime", -1, "Maximum Database Connection Lifetime, -1ns means the stdlib default")
+	maxIdleConns    = flag.Int("db.max_idle_conns", 1, "Maximum Amount of Idle Database connections, -1 means the stdlib default")
+	maxOpenConns    = flag.Int("db.max_open_conns", 5, "Maximum Amount of Open Database connections, -1 means the stdlib default")
+	connMaxLifetime = flag.Duration("db.conn_max_lifetime", 30*time.Minute, "Maximum Database Connection Lifetime, -1ns means the stdlib default")
 )
 
 // ConfigurableDB contains methods for configuring a database.
@@ -25,8 +26,8 @@ type ConfigurableDB interface {
 	Stats() sql.DBStats
 }
 
-// Configure Sets Connection Boundaries and adds db_stats monitoring to monkit
-func Configure(db ConfigurableDB, mon *monkit.Scope) {
+// Configure Sets Connection Boundaries and adds db_stats monitoring to monkit.
+func Configure(ctx context.Context, db ConfigurableDB, dbName string, mon *monkit.Scope) {
 	if *maxIdleConns >= 0 {
 		db.SetMaxIdleConns(*maxIdleConns)
 	}
@@ -38,6 +39,6 @@ func Configure(db ConfigurableDB, mon *monkit.Scope) {
 	}
 	mon.Chain(monkit.StatSourceFunc(
 		func(cb func(key monkit.SeriesKey, field string, val float64)) {
-			monkit.StatSourceFromStruct(monkit.NewSeriesKey("db_stats"), db.Stats()).Stats(cb)
+			monkit.StatSourceFromStruct(monkit.NewSeriesKey("db_stats").WithTag("db_name", dbName), db.Stats()).Stats(cb)
 		}))
 }

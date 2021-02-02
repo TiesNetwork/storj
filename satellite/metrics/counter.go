@@ -6,10 +6,6 @@ package metrics
 import (
 	"context"
 
-	"github.com/gogo/protobuf/proto"
-
-	"storj.io/common/pb"
-	"storj.io/common/rpc/rpcstatus"
 	"storj.io/storj/satellite/metainfo"
 )
 
@@ -28,14 +24,8 @@ func NewCounter() *Counter {
 }
 
 // Object increments counts for inline objects and remote dependent objects.
-func (counter *Counter) Object(ctx context.Context, path metainfo.ScopedPath, pointer *pb.Pointer) (err error) {
-	streamMeta := &pb.StreamMeta{}
-	err = proto.Unmarshal(pointer.Metadata, streamMeta)
-	if err != nil {
-		return rpcstatus.Error(rpcstatus.Internal, err.Error())
-	}
-
-	if streamMeta.NumberOfSegments == 1 && pointer.Type == pb.Pointer_INLINE {
+func (counter *Counter) Object(ctx context.Context, object *metainfo.Object) (err error) {
+	if object.SegmentCount == 1 && object.LastSegment.Inline {
 		counter.Inline++
 	} else {
 		counter.RemoteDependent++
@@ -46,11 +36,11 @@ func (counter *Counter) Object(ctx context.Context, path metainfo.ScopedPath, po
 }
 
 // RemoteSegment returns nil because counter does not interact with remote segments this way for now.
-func (counter *Counter) RemoteSegment(ctx context.Context, path metainfo.ScopedPath, pointer *pb.Pointer) (err error) {
+func (counter *Counter) RemoteSegment(ctx context.Context, segment *metainfo.Segment) (err error) {
 	return nil
 }
 
 // InlineSegment returns nil because counter does not interact with inline segments this way for now.
-func (counter *Counter) InlineSegment(ctx context.Context, path metainfo.ScopedPath, pointer *pb.Pointer) (err error) {
+func (counter *Counter) InlineSegment(ctx context.Context, segment *metainfo.Segment) (err error) {
 	return nil
 }

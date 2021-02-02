@@ -2,15 +2,14 @@
 // See LICENSE for copying information.
 
 <template>
-    <div class="remaining-space-container">
-        <p class="remaining-space-container__title">{{label}}</p>
-        <p class="remaining-space-container__amount"><b>{{remaining}}</b></p>
-        <div class="remaining-space-container__bar">
+    <div class="bar-info-container">
+        <p class="bar-info-container__title">{{ label }}</p>
+        <p class="bar-info-container__amount"><b>{{ remaining }}</b></p>
+        <div class="bar-info-container__bar">
             <VInfo :text="infoMessage">
                 <VBar
                     :current="currentBarAmount"
                     :max="maxBarAmount"
-                    color="#224CA5"
                 />
             </VInfo>
         </div>
@@ -23,7 +22,7 @@ import { Component, Prop, Vue } from 'vue-property-decorator';
 import VBar from '@/app/components/VBar.vue';
 import VInfo from '@/app/components/VInfo.vue';
 
-import { formatBytes } from '@/app/utils/converter';
+import { Size } from '@/private/memory/size';
 
 @Component ({
     components: {
@@ -48,7 +47,7 @@ export default class BarInfo extends Vue {
     }
 
     public get remaining(): string {
-        return formatBytes(this.amount);
+        return Size.toBase10String(this.amount);
     }
 }
 </script>
@@ -58,11 +57,11 @@ export default class BarInfo extends Vue {
         margin: 0;
     }
 
-    .remaining-space-container {
-        width: 339px;
+    .bar-info-container {
+        width: calc(100% - 60px);
         height: 99px;
-        background-color: #fff;
-        border: 1px solid #e9eff4;
+        background-color: var(--block-background-color);
+        border: 1px solid var(--block-border-color);
         border-radius: 11px;
         padding: 32px 30px;
         margin-bottom: 13px;
@@ -71,14 +70,13 @@ export default class BarInfo extends Vue {
         &__title {
             font-size: 14px;
             line-height: 21px;
-            color: #586c86;
-            user-select: none;
+            color: var(--title-text-color);
         }
 
         &__amount {
             font-size: 32px;
             line-height: 57px;
-            color: #535f77;
+            color: var(--regular-text-color);
         }
     }
 </style>

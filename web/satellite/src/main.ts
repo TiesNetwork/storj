@@ -25,10 +25,13 @@ Vue.use(VueClipboard);
 
 let clickOutsideEvent: EventListener;
 
+/**
+ * Binds closing action to outside popups area.
+ */
 Vue.directive('click-outside', {
     bind: function (el: HTMLElement, binding: DirectiveBinding, vnode: VNode) {
         clickOutsideEvent = function(event: Event): void {
-            if (el === event.target) {
+            if (el === event.target || el.contains((event.target as Node))) {
                 return;
             }
 
@@ -45,7 +48,7 @@ Vue.directive('click-outside', {
 });
 
 /**
- * number directive allow user to type only numbers in input
+ * number directive allow user to type only numbers in input.
  */
 Vue.directive('number', {
     bind (el: HTMLElement) {
@@ -62,7 +65,7 @@ Vue.directive('number', {
 });
 
 /**
- * leadingZero adds zero to the start of single digit number
+ * leadingZero adds zero to the start of single digit number.
  */
 Vue.filter('leadingZero', function (value: number): string {
     if (value <= 9) {
@@ -76,7 +79,7 @@ Vue.filter('leadingZero', function (value: number): string {
  * centsToDollars is a Vue filter that converts amount of cents in dollars string.
  */
 Vue.filter('centsToDollars', (cents: number): string => {
-    return `USD $${(cents / 100).toFixed(2)}`;
+    return `$${(cents / 100).toFixed(2)}`;
 });
 
 new Vue({

@@ -14,15 +14,14 @@ import (
 	"time"
 
 	"github.com/fatih/color"
-	"github.com/golang/protobuf/ptypes"
 	"github.com/spf13/cobra"
 	"go.uber.org/zap"
 
 	"storj.io/common/memory"
-	"storj.io/common/pb"
 	"storj.io/common/rpc"
-	"storj.io/storj/pkg/process"
-	"storj.io/storj/private/version"
+	"storj.io/private/process"
+	"storj.io/private/version"
+	"storj.io/storj/storagenode/internalpb"
 )
 
 const contactWindow = time.Hour * 2
@@ -39,8 +38,8 @@ func dialDashboardClient(ctx context.Context, address string) (*dashboardClient,
 	return &dashboardClient{conn: conn}, nil
 }
 
-func (dash *dashboardClient) dashboard(ctx context.Context) (*pb.DashboardResponse, error) {
-	return pb.NewDRPCPieceStoreInspectorClient(dash.conn.Raw()).Dashboard(ctx, &pb.DashboardRequest{})
+func (dash *dashboardClient) dashboard(ctx context.Context) (*internalpb.DashboardResponse, error) {
+	return internalpb.NewDRPCPieceStoreInspectorClient(dash.conn).Dashboard(ctx, &internalpb.DashboardRequest{})
 }
 
 func (dash *dashboardClient) close() error {
@@ -52,9 +51,9 @@ func cmdDashboard(cmd *cobra.Command, args []string) (err error) {
 
 	ident, err := runCfg.Identity.Load()
 	if err != nil {
-		zap.S().Fatal(err)
+		zap.L().Fatal("Failed to load identity.", zap.Error(err))
 	} else {
-		zap.S().Info("Node ID: ", ident.ID)
+		zap.L().Info("Identity loaded.", zap.Stringer("Node ID", ident.ID))
 	}
 
 	client, err := dialDashboardClient(ctx, dashboardCfg.Address)
@@ -63,7 +62,7 @@ func cmdDashboard(cmd *cobra.Command, args []string) (err error) {
 	}
 	defer func() {
 		if err := client.close(); err != nil {
-			zap.S().Debug("closing dashboard client failed", err)
+			zap.L().Debug("Closing dashboard client failed.", zap.Error(err))
 		}
 	}()
 
@@ -82,7 +81,7 @@ func cmdDashboard(cmd *cobra.Command, args []string) (err error) {
 	}
 }
 
-func printDashboard(data *pb.DashboardResponse) error {
+func printDashboard(data *internalpb.DashboardResponse) error {
 	clearScreen()
 	var warnFlag bool
 	color.NoColor = !useColor
@@ -95,13 +94,12 @@ func printDashboard(data *pb.DashboardResponse) error {
 	fmt.Fprintf(w, "ID\t%s\n", color.YellowString(data.NodeId.String()))
 
 	if data.LastPinged.IsZero() || time.Since(data.LastPinged) >= contactWindow {
-		fmt.Fprintf(w, "Last Contact\t%s\n", color.RedString("OFFLINE"))
+		fmt.Fprintf(w, "Status\t%s\n", color.RedString("OFFLINE"))
 	} else {
-		fmt.Fprintf(w, "Last Contact\t%s\n", color.GreenString("ONLINE"))
+		fmt.Fprintf(w, "Status\t%s\n", color.GreenString("ONLINE"))
 	}
 
-	// TODO: use stdtime in protobuf
-	uptime, err := ptypes.Duration(data.GetUptime())
+	uptime, err := time.ParseDuration(data.GetUptime())
 	if err == nil {
 		fmt.Fprintf(w, "Uptime\t%s\n", color.YellowString(uptime.Truncate(time.Second).String()))
 	}
@@ -112,13 +110,7 @@ func printDashboard(data *pb.DashboardResponse) error {
 
 	stats := data.GetStats()
 	if stats != nil {
-		availBW := memory.Size(stats.GetAvailableBandwidth())
 		usedBandwidth := color.WhiteString(memory.Size(stats.GetUsedBandwidth()).Base10String())
-		if availBW < 0 {
-			warnFlag = true
-			availBW = 0
-		}
-		availableBandwidth := color.WhiteString((availBW).Base10String())
 		availableSpace := color.WhiteString(memory.Size(stats.GetAvailableSpace()).Base10String())
 		usedSpace := color.WhiteString(memory.Size(stats.GetUsedSpace()).Base10String())
 		usedEgress := color.WhiteString(memory.Size(stats.GetUsedEgress()).Base10String())
@@ -126,7 +118,7 @@ func printDashboard(data *pb.DashboardResponse) error {
 
 		w = tabwriter.NewWriter(color.Output, 0, 0, 5, ' ', tabwriter.AlignRight)
 		fmt.Fprintf(w, "\n\t%s\t%s\t%s\t%s\t\n", color.GreenString("Available"), color.GreenString("Used"), color.GreenString("Egress"), color.GreenString("Ingress"))
-		fmt.Fprintf(w, "Bandwidth\t%s\t%s\t%s\t%s\t (since %s 1)\n", availableBandwidth, usedBandwidth, usedEgress, usedIngress, time.Now().Format("Jan"))
+		fmt.Fprintf(w, "Bandwidth\t%s\t%s\t%s\t%s\t (since %s 1)\n", color.WhiteString("N/A"), usedBandwidth, usedEgress, usedIngress, time.Now().Format("Jan"))
 		fmt.Fprintf(w, "Disk\t%s\t%s\t\n", availableSpace, usedSpace)
 		if err = w.Flush(); err != nil {
 			return err
@@ -153,7 +145,7 @@ func printDashboard(data *pb.DashboardResponse) error {
 	return nil
 }
 
-// clearScreen clears the screen so it can be redrawn
+// clearScreen clears the screen so it can be redrawn.
 func clearScreen() {
 	switch runtime.GOOS {
 	case "linux", "darwin":

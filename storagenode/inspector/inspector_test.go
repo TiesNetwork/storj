@@ -11,11 +11,11 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"storj.io/common/memory"
-	"storj.io/common/pb"
 	"storj.io/common/sync2"
 	"storj.io/common/testcontext"
 	"storj.io/common/testrand"
 	"storj.io/storj/private/testplanet"
+	"storj.io/storj/storagenode/internalpb"
 )
 
 func TestInspectorStats(t *testing.T) {
@@ -26,21 +26,19 @@ func TestInspectorStats(t *testing.T) {
 			Satellite: testplanet.ReconfigureRS(requiredShares, 3, 4, 5),
 		},
 	}, func(t *testing.T, ctx *testcontext.Context, planet *testplanet.Planet) {
-		var availableBandwidth int64
 		var availableSpace int64
+
 		for _, storageNode := range planet.StorageNodes {
-			response, err := storageNode.Storage2.Inspector.Stats(ctx, &pb.StatsRequest{})
+			response, err := storageNode.Storage2.Inspector.Stats(ctx, &internalpb.StatsRequest{})
 			require.NoError(t, err)
 
 			assert.Zero(t, response.UsedBandwidth)
 			assert.Zero(t, response.UsedSpace)
 			assert.Zero(t, response.UsedEgress)
 			assert.Zero(t, response.UsedIngress)
-			assert.True(t, response.AvailableBandwidth > 0)
 			assert.True(t, response.AvailableSpace > 0)
 
 			// assume that all storage node should have the same initial values
-			availableBandwidth = response.AvailableBandwidth
 			availableSpace = response.AvailableSpace
 		}
 
@@ -67,25 +65,22 @@ func TestInspectorStats(t *testing.T) {
 
 		var downloaded int
 		for _, storageNode := range planet.StorageNodes {
-			response, err := storageNode.Storage2.Inspector.Stats(ctx, &pb.StatsRequest{})
+			response, err := storageNode.Storage2.Inspector.Stats(ctx, &internalpb.StatsRequest{})
 			require.NoError(t, err)
 
 			// TODO set more accurate assertions
 			if response.UsedSpace > 0 {
 				assert.NotZero(t, response.UsedBandwidth)
 				assert.Equal(t, response.UsedBandwidth, response.UsedIngress+response.UsedEgress)
-				assert.Equal(t, availableBandwidth-response.UsedBandwidth, response.AvailableBandwidth)
 				assert.Equal(t, availableSpace-response.UsedSpace, response.AvailableSpace)
 
-				assert.Equal(t, response.UsedSpace, response.UsedBandwidth-response.UsedEgress)
+				assert.Equal(t, response.UsedIngress, response.UsedBandwidth-response.UsedEgress)
 				if response.UsedEgress > 0 {
 					downloaded++
 					assert.Equal(t, response.UsedBandwidth-response.UsedIngress, response.UsedEgress)
 				}
 			} else {
 				assert.Zero(t, response.UsedSpace)
-				// TODO track why this is failing
-				//assert.Equal(t, availableBandwidth, response.AvailableBandwidth)
 				assert.Equal(t, availableSpace, response.AvailableSpace)
 			}
 		}
@@ -100,10 +95,12 @@ func TestInspectorDashboard(t *testing.T) {
 		SatelliteCount: 1, StorageNodeCount: 1, UplinkCount: 1,
 	}, func(t *testing.T, ctx *testcontext.Context, planet *testplanet.Planet) {
 		for _, storageNode := range planet.StorageNodes {
-			response, err := storageNode.Storage2.Inspector.Dashboard(ctx, &pb.DashboardRequest{})
+			response, err := storageNode.Storage2.Inspector.Dashboard(ctx, &internalpb.DashboardRequest{})
 			require.NoError(t, err)
 
-			assert.True(t, response.Uptime.Nanos > 0)
+			uptime, err := time.ParseDuration(response.Uptime)
+			require.NoError(t, err)
+			assert.True(t, uptime.Nanoseconds() > 0)
 			assert.Equal(t, storageNode.ID(), response.NodeId)
 			assert.Equal(t, storageNode.Addr(), response.ExternalAddress)
 			assert.NotNil(t, response.Stats)
@@ -115,12 +112,14 @@ func TestInspectorDashboard(t *testing.T) {
 		require.NoError(t, err)
 
 		for _, storageNode := range planet.StorageNodes {
-			response, err := storageNode.Storage2.Inspector.Dashboard(ctx, &pb.DashboardRequest{})
+			response, err := storageNode.Storage2.Inspector.Dashboard(ctx, &internalpb.DashboardRequest{})
 			require.NoError(t, err)
 
 			assert.True(t, response.LastPinged.After(testStartedTime))
 
-			assert.True(t, response.Uptime.Nanos > 0)
+			uptime, err := time.ParseDuration(response.Uptime)
+			require.NoError(t, err)
+			assert.True(t, uptime.Nanoseconds() > 0)
 			assert.Equal(t, storageNode.ID(), response.NodeId)
 			assert.Equal(t, storageNode.Addr(), response.ExternalAddress)
 			assert.NotNil(t, response.Stats)

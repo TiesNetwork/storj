@@ -6,12 +6,10 @@ package metainfo
 import (
 	"bytes"
 	"context"
+	"crypto/subtle"
 	"regexp"
-	"sync"
 	"time"
 
-	"github.com/gogo/protobuf/proto"
-	"github.com/skyrings/skyring-common/tools/uuid"
 	"github.com/zeebo/errs"
 	"go.uber.org/zap"
 	"golang.org/x/time/rate"
@@ -20,107 +18,15 @@ import (
 	"storj.io/common/macaroon"
 	"storj.io/common/pb"
 	"storj.io/common/rpc/rpcstatus"
-	"storj.io/common/signing"
 	"storj.io/common/storj"
-	"storj.io/storj/pkg/auth"
+	"storj.io/common/uuid"
 	"storj.io/storj/satellite/console"
-)
-
-const (
-	requestTTL = time.Hour * 4
+	"storj.io/storj/satellite/console/consoleauth"
 )
 
 var (
 	ipRegexp = regexp.MustCompile(`^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])$`)
 )
-
-// TTLItem keeps association between serial number and ttl
-type TTLItem struct {
-	serialNumber storj.SerialNumber
-	ttl          time.Time
-}
-
-type createRequest struct {
-	Expiration time.Time
-	Redundancy *pb.RedundancyScheme
-
-	ttl time.Time
-}
-
-type createRequests struct {
-	mu sync.RWMutex
-	// orders limit serial number used because with CreateSegment we don't have path yet
-	entries map[storj.SerialNumber]*createRequest
-
-	muTTL      sync.Mutex
-	entriesTTL []*TTLItem
-}
-
-func newCreateRequests() *createRequests {
-	return &createRequests{
-		entries:    make(map[storj.SerialNumber]*createRequest),
-		entriesTTL: make([]*TTLItem, 0),
-	}
-}
-
-func (requests *createRequests) Put(serialNumber storj.SerialNumber, createRequest *createRequest) {
-	ttl := time.Now().Add(requestTTL)
-
-	go func() {
-		requests.muTTL.Lock()
-		requests.entriesTTL = append(requests.entriesTTL, &TTLItem{
-			serialNumber: serialNumber,
-			ttl:          ttl,
-		})
-		requests.muTTL.Unlock()
-	}()
-
-	createRequest.ttl = ttl
-	requests.mu.Lock()
-	requests.entries[serialNumber] = createRequest
-	requests.mu.Unlock()
-
-	go requests.cleanup()
-}
-
-func (requests *createRequests) Load(serialNumber storj.SerialNumber) (*createRequest, bool) {
-	requests.mu.RLock()
-	request, found := requests.entries[serialNumber]
-	if request != nil && request.ttl.Before(time.Now()) {
-		request = nil
-		found = false
-	}
-	requests.mu.RUnlock()
-
-	return request, found
-}
-
-func (requests *createRequests) Remove(serialNumber storj.SerialNumber) {
-	requests.mu.Lock()
-	delete(requests.entries, serialNumber)
-	requests.mu.Unlock()
-}
-
-func (requests *createRequests) cleanup() {
-	requests.muTTL.Lock()
-	now := time.Now()
-	remove := make([]storj.SerialNumber, 0)
-	newStart := 0
-	for i, item := range requests.entriesTTL {
-		if item.ttl.Before(now) {
-			remove = append(remove, item.serialNumber)
-			newStart = i + 1
-		} else {
-			break
-		}
-	}
-	requests.entriesTTL = requests.entriesTTL[newStart:]
-	requests.muTTL.Unlock()
-
-	for _, serialNumber := range remove {
-		requests.Remove(serialNumber)
-	}
-}
 
 func getAPIKey(ctx context.Context, header *pb.RequestHeader) (key *macaroon.APIKey, err error) {
 	defer mon.Task()(&ctx)(&err)
@@ -128,7 +34,7 @@ func getAPIKey(ctx context.Context, header *pb.RequestHeader) (key *macaroon.API
 		return macaroon.ParseRawAPIKey(header.ApiKey)
 	}
 
-	keyData, ok := auth.GetAPIKey(ctx)
+	keyData, ok := consoleauth.GetAPIKey(ctx)
 	if !ok {
 		return nil, errs.New("missing credentials")
 	}
@@ -136,28 +42,16 @@ func getAPIKey(ctx context.Context, header *pb.RequestHeader) (key *macaroon.API
 	return macaroon.ParseAPIKey(string(keyData))
 }
 
+// validateAuth validates things like API key, user permissions and rate limit and always returns valid rpc error.
 func (endpoint *Endpoint) validateAuth(ctx context.Context, header *pb.RequestHeader, action macaroon.Action) (_ *console.APIKeyInfo, err error) {
 	defer mon.Task()(&ctx)(&err)
 
-	key, err := getAPIKey(ctx, header)
+	key, keyInfo, err := endpoint.validateBasic(ctx, header)
 	if err != nil {
-		endpoint.log.Debug("invalid request", zap.Error(err))
-		return nil, rpcstatus.Error(rpcstatus.InvalidArgument, "Invalid API credentials")
-	}
-
-	keyInfo, err := endpoint.apiKeys.GetByHead(ctx, key.Head())
-	if err != nil {
-		endpoint.log.Debug("unauthorized request", zap.Error(err))
-		return nil, rpcstatus.Error(rpcstatus.PermissionDenied, "Unauthorized API credentials")
-	}
-
-	if err = endpoint.checkRate(ctx, keyInfo.ProjectID); err != nil {
-		endpoint.log.Debug("rate check failed", zap.Error(err))
 		return nil, err
 	}
 
-	// Revocations are currently handled by just deleting the key.
-	err = key.Check(ctx, keyInfo.Secret, action, nil)
+	err = key.Check(ctx, keyInfo.Secret, action, endpoint.revocations)
 	if err != nil {
 		endpoint.log.Debug("unauthorized request", zap.Error(err))
 		return nil, rpcstatus.Error(rpcstatus.PermissionDenied, "Unauthorized API credentials")
@@ -166,13 +60,62 @@ func (endpoint *Endpoint) validateAuth(ctx context.Context, header *pb.RequestHe
 	return keyInfo, nil
 }
 
+func (endpoint *Endpoint) validateBasic(ctx context.Context, header *pb.RequestHeader) (_ *macaroon.APIKey, _ *console.APIKeyInfo, err error) {
+	defer mon.Task()(&ctx)(&err)
+
+	key, err := getAPIKey(ctx, header)
+	if err != nil {
+		endpoint.log.Debug("invalid request", zap.Error(err))
+		return nil, nil, rpcstatus.Error(rpcstatus.InvalidArgument, "Invalid API credentials")
+	}
+
+	keyInfo, err := endpoint.apiKeys.GetByHead(ctx, key.Head())
+	if err != nil {
+		endpoint.log.Debug("unauthorized request", zap.Error(err))
+		return nil, nil, rpcstatus.Error(rpcstatus.PermissionDenied, "Unauthorized API credentials")
+	}
+
+	if err = endpoint.checkRate(ctx, keyInfo.ProjectID); err != nil {
+		endpoint.log.Debug("rate check failed", zap.Error(err))
+		return nil, nil, err
+	}
+
+	return key, keyInfo, nil
+}
+
+func (endpoint *Endpoint) validateRevoke(ctx context.Context, header *pb.RequestHeader, macToRevoke *macaroon.Macaroon) (_ *console.APIKeyInfo, err error) {
+	defer mon.Task()(&ctx)(&err)
+	key, keyInfo, err := endpoint.validateBasic(ctx, header)
+	if err != nil {
+		return nil, err
+	}
+
+	// The macaroon to revoke must be valid with the same secret as the key.
+	if !macToRevoke.Validate(keyInfo.Secret) {
+		return nil, rpcstatus.Error(rpcstatus.InvalidArgument, "Macaroon to revoke invalid")
+	}
+
+	keyTail := key.Tail()
+	tails := macToRevoke.Tails(keyInfo.Secret)
+
+	// A macaroon cannot revoke itself. So we only check len(tails-1), skipping
+	// the final tail.  To be valid, the final tail of the auth key must be
+	// contained within the checked tails of the macaroon we want to revoke.
+	for i := 0; i < len(tails)-1; i++ {
+		if subtle.ConstantTimeCompare(tails[i], keyTail) == 1 {
+			return keyInfo, nil
+		}
+	}
+	return nil, rpcstatus.Error(rpcstatus.PermissionDenied, "Unauthorized attempt to revoke macaroon")
+}
+
 func (endpoint *Endpoint) checkRate(ctx context.Context, projectID uuid.UUID) (err error) {
 	defer mon.Task()(&ctx)(&err)
-	if !endpoint.limiterConfig.Enabled {
+	if !endpoint.config.RateLimiter.Enabled {
 		return nil
 	}
 	limiter, err := endpoint.limiterCache.Get(projectID.String(), func() (interface{}, error) {
-		limit := rate.Limit(endpoint.limiterConfig.Rate)
+		limit := rate.Limit(endpoint.config.RateLimiter.Rate)
 
 		project, err := endpoint.projects.Get(ctx, projectID)
 		if err != nil {
@@ -195,38 +138,9 @@ func (endpoint *Endpoint) checkRate(ctx context.Context, projectID uuid.UUID) (e
 			zap.Stringer("projectID", projectID),
 			zap.Float64("limit", float64(limiter.(*rate.Limiter).Limit())))
 
-		mon.Event("metainfo_rate_limit_exceeded") //locked
+		mon.Event("metainfo_rate_limit_exceeded") //mon:locked
 
 		return rpcstatus.Error(rpcstatus.ResourceExhausted, "Too Many Requests")
-	}
-
-	return nil
-}
-
-func (endpoint *Endpoint) validateCommitSegment(ctx context.Context, req *pb.SegmentCommitRequestOld) (err error) {
-	defer mon.Task()(&ctx)(&err)
-
-	err = endpoint.validateBucket(ctx, req.Bucket)
-	if err != nil {
-		return err
-	}
-
-	err = endpoint.validatePointer(ctx, req.Pointer, req.OriginalLimits)
-	if err != nil {
-		return err
-	}
-
-	if len(req.OriginalLimits) > 0 {
-		createRequest, found := endpoint.createRequests.Load(req.OriginalLimits[0].SerialNumber)
-
-		switch {
-		case !found:
-			return Error.New("missing create request or request expired")
-		case !createRequest.Expiration.Equal(req.Pointer.ExpirationDate):
-			return Error.New("pointer expiration date does not match requested one")
-		case !proto.Equal(createRequest.Redundancy, req.Pointer.Remote.Redundancy):
-			return Error.New("pointer redundancy scheme date does not match requested one")
-		}
 	}
 
 	return nil
@@ -236,7 +150,7 @@ func (endpoint *Endpoint) validateBucket(ctx context.Context, bucket []byte) (er
 	defer mon.Task()(&ctx)(&err)
 
 	if len(bucket) == 0 {
-		return Error.New("bucket not specified")
+		return Error.Wrap(storj.ErrNoBucket.New(""))
 	}
 
 	if len(bucket) < 3 || len(bucket) > 63 {
@@ -320,7 +234,7 @@ func (endpoint *Endpoint) validatePointer(ctx context.Context, pointer *pb.Point
 			return Error.New("invalid no order limit for piece")
 		}
 
-		maxAllowed, err := encryption.CalcEncryptedSize(endpoint.requiredRSConfig.MaxSegmentSize.Int64(), storj.EncryptionParameters{
+		maxAllowed, err := encryption.CalcEncryptedSize(endpoint.config.MaxSegmentSize.Int64(), storj.EncryptionParameters{
 			CipherSuite: storj.EncAESGCM,
 			BlockSize:   128, // intentionally low block size to allow maximum possible encryption overhead
 		})
@@ -351,8 +265,8 @@ func (endpoint *Endpoint) validatePointer(ctx context.Context, pointer *pb.Point
 			}
 
 			// expect that too much time has not passed between order limit creation and now
-			if time.Since(limit.OrderCreation) > endpoint.maxCommitInterval {
-				return Error.New("Segment not committed before max commit interval of %f minutes.", endpoint.maxCommitInterval.Minutes())
+			if time.Since(limit.OrderCreation) > endpoint.config.MaxCommitInterval {
+				return Error.New("Segment not committed before max commit interval of %f minutes.", endpoint.config.MaxCommitInterval.Minutes())
 			}
 
 			derivedPieceID := remote.RootPieceId.Derive(piece.NodeId, piece.PieceNum)
@@ -374,71 +288,6 @@ func (endpoint *Endpoint) validatePointer(ctx context.Context, pointer *pb.Point
 			pieceNums[piece.PieceNum] = struct{}{}
 			nodeIds[piece.NodeId] = struct{}{}
 		}
-	}
-
-	return nil
-}
-
-func (endpoint *Endpoint) validateRedundancy(ctx context.Context, redundancy *pb.RedundancyScheme) (err error) {
-	defer mon.Task()(&ctx)(&err)
-
-	if endpoint.requiredRSConfig.Validate {
-		if endpoint.requiredRSConfig.ErasureShareSize.Int32() != redundancy.ErasureShareSize ||
-			endpoint.requiredRSConfig.MinTotalThreshold > int(redundancy.Total) ||
-			endpoint.requiredRSConfig.MaxTotalThreshold < int(redundancy.Total) ||
-			endpoint.requiredRSConfig.MinThreshold != int(redundancy.MinReq) ||
-			endpoint.requiredRSConfig.RepairThreshold != int(redundancy.RepairThreshold) ||
-			endpoint.requiredRSConfig.SuccessThreshold != int(redundancy.SuccessThreshold) {
-			return Error.New("provided redundancy scheme parameters not allowed: want [%d, %d, %d, %d-%d, %d] got [%d, %d, %d, %d, %d]",
-				endpoint.requiredRSConfig.MinThreshold,
-				endpoint.requiredRSConfig.RepairThreshold,
-				endpoint.requiredRSConfig.SuccessThreshold,
-				endpoint.requiredRSConfig.MinTotalThreshold,
-				endpoint.requiredRSConfig.MaxTotalThreshold,
-				endpoint.requiredRSConfig.ErasureShareSize.Int32(),
-
-				redundancy.MinReq,
-				redundancy.RepairThreshold,
-				redundancy.SuccessThreshold,
-				redundancy.Total,
-				redundancy.ErasureShareSize,
-			)
-		}
-	}
-
-	return nil
-}
-
-func (endpoint *Endpoint) validatePieceHash(ctx context.Context, piece *pb.RemotePiece, originalLimit *pb.OrderLimit, signee signing.Signee) (err error) {
-	defer mon.Task()(&ctx)(&err)
-
-	if piece.Hash == nil {
-		return errs.New("no piece hash. NodeID: %v, PieceNum: %d", piece.NodeId, piece.PieceNum)
-	}
-
-	err = signing.VerifyPieceHashSignature(ctx, signee, piece.Hash)
-	if err != nil {
-		return errs.New("piece hash signature could not be verified for node (NodeID: %v, PieceNum: %d): %+v",
-			piece.NodeId, piece.PieceNum, err,
-		)
-	}
-
-	timestamp := piece.Hash.Timestamp
-	if timestamp.Before(time.Now().Add(-pieceHashExpiration)) {
-		return errs.New("piece hash timestamp is too old (%v). NodeId: %v, PieceNum: %d)",
-			timestamp, piece.NodeId, piece.PieceNum,
-		)
-	}
-
-	switch {
-	case originalLimit.PieceId != piece.Hash.PieceId:
-		return errs.New("piece hash pieceID (%v) doesn't match limit pieceID (%v). NodeID: %v, PieceNum: %d",
-			piece.Hash.PieceId, originalLimit.PieceId, piece.NodeId, piece.PieceNum,
-		)
-	case originalLimit.Limit < piece.Hash.PieceSize:
-		return errs.New("piece hash PieceSize (%d) is larger than order limit (%d). NodeID: %v, PieceNum: %d",
-			piece.Hash.PieceSize, originalLimit.Limit, piece.NodeId, piece.PieceNum,
-		)
 	}
 
 	return nil

@@ -18,7 +18,7 @@ import (
 var errInternal = errors.New("internal error")
 var mon = monkit.Package()
 
-// Client implements in-memory key value store
+// Client implements in-memory key value store.
 type Client struct {
 	lookupLimit int
 
@@ -41,8 +41,11 @@ type Client struct {
 	version int
 }
 
-// New creates a new in-memory key-value store
+// New creates a new in-memory key-value store.
 func New() *Client { return &Client{lookupLimit: storage.DefaultLookupLimit} }
+
+// MigrateToLatest pretends to migrate to latest db schema version.
+func (store *Client) MigrateToLatest(ctx context.Context) error { return nil }
 
 // SetLookupLimit sets the lookup limit.
 func (store *Client) SetLookupLimit(v int) { store.lookupLimit = v }
@@ -50,7 +53,7 @@ func (store *Client) SetLookupLimit(v int) { store.lookupLimit = v }
 // LookupLimit returns the maximum limit that is allowed.
 func (store *Client) LookupLimit() int { return store.lookupLimit }
 
-// indexOf finds index of key or where it could be inserted
+// indexOf finds index of key or where it could be inserted.
 func (store *Client) indexOf(key storage.Key) (int, bool) {
 	i := sort.Search(len(store.Items), func(k int) bool {
 		return !store.Items[k].Key.Less(key)
@@ -75,7 +78,7 @@ func (store *Client) forcedError() bool {
 	return false
 }
 
-// Put adds a value to store
+// Put adds a value to store.
 func (store *Client) Put(ctx context.Context, key storage.Key, value storage.Value) (err error) {
 	defer mon.Task()(&ctx)(&err)
 	defer store.locked()()
@@ -101,7 +104,7 @@ func (store *Client) Put(ctx context.Context, key storage.Key, value storage.Val
 	return nil
 }
 
-// Get gets a value to store
+// Get gets a value to store.
 func (store *Client) Get(ctx context.Context, key storage.Key) (_ storage.Value, err error) {
 	defer mon.Task()(&ctx)(&err)
 	defer store.locked()()
@@ -124,14 +127,14 @@ func (store *Client) Get(ctx context.Context, key storage.Key) (_ storage.Value,
 	return storage.CloneValue(store.Items[keyIndex].Value), nil
 }
 
-// GetAll gets all values from the store
+// GetAll gets all values from the store.
 func (store *Client) GetAll(ctx context.Context, keys storage.Keys) (_ storage.Values, err error) {
 	defer mon.Task()(&ctx)(&err)
 	defer store.locked()()
 
 	store.CallCount.GetAll++
 	if len(keys) > store.lookupLimit {
-		return nil, storage.ErrLimitExceeded
+		return nil, storage.ErrLimitExceeded.New("lookup limit exceeded")
 	}
 
 	if store.forcedError() {
@@ -150,7 +153,7 @@ func (store *Client) GetAll(ctx context.Context, keys storage.Keys) (_ storage.V
 	return values, nil
 }
 
-// Delete deletes key and the value
+// Delete deletes key and the value.
 func (store *Client) Delete(ctx context.Context, key storage.Key) (err error) {
 	defer mon.Task()(&ctx)(&err)
 	defer store.locked()()
@@ -175,7 +178,7 @@ func (store *Client) Delete(ctx context.Context, key storage.Key) (err error) {
 	return nil
 }
 
-// DeleteMultiple deletes keys ignoring missing keys
+// DeleteMultiple deletes keys ignoring missing keys.
 func (store *Client) DeleteMultiple(ctx context.Context, keys []storage.Key) (_ storage.Items, err error) {
 	defer mon.Task()(&ctx, len(keys))(&err)
 	defer store.locked()()
@@ -204,7 +207,7 @@ func (store *Client) DeleteMultiple(ctx context.Context, keys []storage.Key) (_ 
 	return items, nil
 }
 
-// List lists all keys starting from start and upto limit items
+// List lists all keys starting from start and upto limit items.
 func (store *Client) List(ctx context.Context, first storage.Key, limit int) (_ storage.Keys, err error) {
 	defer mon.Task()(&ctx)(&err)
 	store.mu.Lock()
@@ -217,7 +220,7 @@ func (store *Client) List(ctx context.Context, first storage.Key, limit int) (_ 
 	return storage.ListKeys(ctx, store, first, limit)
 }
 
-// Close closes the store
+// Close closes the store.
 func (store *Client) Close() error {
 	defer store.locked()()
 
@@ -228,8 +231,14 @@ func (store *Client) Close() error {
 	return nil
 }
 
-// Iterate iterates over items based on opts
+// Iterate iterates over items based on opts.
 func (store *Client) Iterate(ctx context.Context, opts storage.IterateOptions, fn func(context.Context, storage.Iterator) error) (err error) {
+	defer mon.Task()(&ctx)(&err)
+	return store.IterateWithoutLookupLimit(ctx, opts, fn)
+}
+
+// IterateWithoutLookupLimit calls the callback with an iterator over the keys, but doesn't enforce default limit on opts.
+func (store *Client) IterateWithoutLookupLimit(ctx context.Context, opts storage.IterateOptions, fn func(context.Context, storage.Iterator) error) (err error) {
 	defer mon.Task()(&ctx)(&err)
 
 	store.mu.Lock()
@@ -316,7 +325,7 @@ func (cursor *forward) Advance() (*storage.ListItem, bool) {
 	return cursor.next()
 }
 
-// cursor implements iterating over items with basic repositioning when the items change
+// cursor implements iterating over items with basic repositioning when the items change.
 type cursor struct {
 	store     *Client
 	done      bool
@@ -332,7 +341,7 @@ func (cursor *cursor) close() {
 	cursor.done = true
 }
 
-// positionForward positions at key or the next item
+// positionForward positions at key or the next item.
 func (cursor *cursor) positionForward(key storage.Key) {
 	store := cursor.store
 	store.mu.Lock()
@@ -369,7 +378,7 @@ func (cursor *cursor) next() (*storage.ListItem, bool) {
 	return item, true
 }
 
-// CompareAndSwap atomically compares and swaps oldValue with newValue
+// CompareAndSwap atomically compares and swaps oldValue with newValue.
 func (store *Client) CompareAndSwap(ctx context.Context, key storage.Key, oldValue, newValue storage.Value) (err error) {
 	defer mon.Task()(&ctx)(&err)
 	defer store.locked()()

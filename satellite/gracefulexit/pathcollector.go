@@ -10,15 +10,14 @@ import (
 	"github.com/zeebo/errs"
 	"go.uber.org/zap"
 
-	"storj.io/common/pb"
 	"storj.io/common/storj"
 	"storj.io/storj/satellite/metainfo"
-	"storj.io/uplink/eestream"
+	"storj.io/uplink/private/eestream"
 )
 
 var _ metainfo.Observer = (*PathCollector)(nil)
 
-// PathCollector uses the metainfo loop to add paths to node reservoirs
+// PathCollector uses the metainfo loop to add paths to node reservoirs.
 //
 // architecture: Observer
 type PathCollector struct {
@@ -55,8 +54,8 @@ func (collector *PathCollector) Flush(ctx context.Context) (err error) {
 	return collector.flush(ctx, 1)
 }
 
-// RemoteSegment takes a remote segment found in metainfo and creates a graceful exit transfer queue item if it doesn't exist already
-func (collector *PathCollector) RemoteSegment(ctx context.Context, path metainfo.ScopedPath, pointer *pb.Pointer) (err error) {
+// RemoteSegment takes a remote segment found in metainfo and creates a graceful exit transfer queue item if it doesn't exist already.
+func (collector *PathCollector) RemoteSegment(ctx context.Context, segment *metainfo.Segment) (err error) {
 	if len(collector.nodeIDStorage) == 0 {
 		return nil
 	}
@@ -64,29 +63,30 @@ func (collector *PathCollector) RemoteSegment(ctx context.Context, path metainfo
 	collector.nodeIDMutex.Lock()
 	defer collector.nodeIDMutex.Unlock()
 
-	numPieces := int32(len(pointer.GetRemote().GetRemotePieces()))
-	for _, piece := range pointer.GetRemote().GetRemotePieces() {
-		if _, ok := collector.nodeIDStorage[piece.NodeId]; !ok {
+	numPieces := len(segment.Pieces)
+	key := segment.Location.Encode()
+	for _, piece := range segment.Pieces {
+		if _, ok := collector.nodeIDStorage[piece.StorageNode]; !ok {
 			continue
 		}
-		redundancy, err := eestream.NewRedundancyStrategyFromProto(pointer.GetRemote().GetRedundancy())
+		redundancy, err := eestream.NewRedundancyStrategyFromStorj(segment.Redundancy)
 		if err != nil {
 			return err
 		}
-		pieceSize := eestream.CalcPieceSize(pointer.GetSegmentSize(), redundancy)
-		collector.nodeIDStorage[piece.NodeId] += pieceSize
+		pieceSize := eestream.CalcPieceSize(int64(segment.DataSize), redundancy)
+		collector.nodeIDStorage[piece.StorageNode] += pieceSize
 
 		item := TransferQueueItem{
-			NodeID:          piece.NodeId,
-			Path:            []byte(path.Raw),
-			PieceNum:        piece.PieceNum,
-			RootPieceID:     pointer.GetRemote().RootPieceId,
-			DurabilityRatio: float64(numPieces) / float64(pointer.GetRemote().GetRedundancy().GetTotal()),
+			NodeID:          piece.StorageNode,
+			Key:             key,
+			PieceNum:        int32(piece.Number),
+			RootPieceID:     segment.RootPieceID,
+			DurabilityRatio: float64(numPieces) / float64(segment.Redundancy.TotalShares),
 		}
 
-		collector.log.Debug("adding piece to transfer queue.", zap.Stringer("Node ID", piece.NodeId),
-			zap.String("path", path.Raw), zap.Int32("piece num", piece.GetPieceNum()),
-			zap.Int32("num pieces", numPieces), zap.Int32("total possible pieces", pointer.GetRemote().GetRedundancy().GetTotal()))
+		collector.log.Debug("adding piece to transfer queue.", zap.Stringer("Node ID", piece.StorageNode),
+			zap.ByteString("key", key), zap.Uint16("piece num", piece.Number),
+			zap.Int("num pieces", numPieces), zap.Int16("total possible pieces", segment.Redundancy.TotalShares))
 
 		collector.buffer = append(collector.buffer, item)
 		err = collector.flush(ctx, collector.batchSize)
@@ -98,13 +98,13 @@ func (collector *PathCollector) RemoteSegment(ctx context.Context, path metainfo
 	return nil
 }
 
-// Object returns nil because the audit service does not interact with objects
-func (collector *PathCollector) Object(ctx context.Context, path metainfo.ScopedPath, pointer *pb.Pointer) (err error) {
+// Object returns nil because the audit service does not interact with objects.
+func (collector *PathCollector) Object(ctx context.Context, object *metainfo.Object) (err error) {
 	return nil
 }
 
-// InlineSegment returns nil because we're only auditing for storage nodes for now
-func (collector *PathCollector) InlineSegment(ctx context.Context, path metainfo.ScopedPath, pointer *pb.Pointer) (err error) {
+// InlineSegment returns nil because we're only auditing for storage nodes for now.
+func (collector *PathCollector) InlineSegment(ctx context.Context, segment *metainfo.Segment) (err error) {
 	return nil
 }
 

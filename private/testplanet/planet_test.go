@@ -33,19 +33,21 @@ func TestBasic(t *testing.T) {
 			}
 
 			for _, sat := range planet.Satellites {
-				satellite := sat.Local().Node
 				for _, sn := range planet.StorageNodes {
-					node := sn.Local()
-					conn, err := sn.Dialer.DialNode(ctx, &satellite)
-					require.NoError(t, err)
-					defer ctx.Check(conn.Close)
-					_, err = pb.NewDRPCNodeClient(conn.Raw()).CheckIn(ctx, &pb.CheckInRequest{
-						Address:  node.GetAddress().GetAddress(),
-						Version:  &node.Version,
-						Capacity: &node.Capacity,
-						Operator: &node.Operator,
-					})
-					require.NoError(t, err)
+					func() {
+						node := sn.Contact.Service.Local()
+						conn, err := sn.Dialer.DialNodeURL(ctx, sat.NodeURL())
+
+						require.NoError(t, err)
+						defer ctx.Check(conn.Close)
+						_, err = pb.NewDRPCNodeClient(conn).CheckIn(ctx, &pb.CheckInRequest{
+							Address:  node.Address,
+							Version:  &node.Version,
+							Capacity: &node.Capacity,
+							Operator: &node.Operator,
+						})
+						require.NoError(t, err)
+					}()
 				}
 			}
 			// wait a bit to see whether some failures occur
@@ -54,7 +56,7 @@ func TestBasic(t *testing.T) {
 	}
 }
 
-// test that nodes get put into each satellite's overlay cache
+// test that nodes get put into each satellite's overlay cache.
 func TestContact(t *testing.T) {
 	testplanet.Run(t, testplanet.Config{
 		SatelliteCount: 2, StorageNodeCount: 5, UplinkCount: 0,

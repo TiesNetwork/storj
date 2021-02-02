@@ -7,6 +7,8 @@ import (
 	"context"
 	"crypto/subtle"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"html/template"
 	"mime"
 	"net"
@@ -22,19 +24,23 @@ import (
 	"github.com/gorilla/mux"
 	"github.com/graphql-go/graphql"
 	"github.com/graphql-go/graphql/gqlerrors"
-	"github.com/skyrings/skyring-common/tools/uuid"
 	"github.com/spacemonkeygo/monkit/v3"
 	"github.com/zeebo/errs"
 	"go.uber.org/zap"
 	"golang.org/x/sync/errgroup"
 
-	"storj.io/storj/pkg/auth"
+	"storj.io/common/errs2"
+	"storj.io/common/storj"
+	"storj.io/common/uuid"
+	"storj.io/storj/private/web"
+	"storj.io/storj/satellite/accounting"
 	"storj.io/storj/satellite/console"
+	"storj.io/storj/satellite/console/consoleauth"
 	"storj.io/storj/satellite/console/consoleweb/consoleapi"
 	"storj.io/storj/satellite/console/consoleweb/consoleql"
 	"storj.io/storj/satellite/console/consoleweb/consolewebauth"
 	"storj.io/storj/satellite/mailservice"
-	"storj.io/storj/satellite/referrals"
+	"storj.io/storj/satellite/rewards"
 )
 
 const (
@@ -45,15 +51,15 @@ const (
 )
 
 var (
-	// Error is satellite console error type
+	// Error is satellite console error type.
 	Error = errs.Class("satellite console error")
 
 	mon = monkit.Package()
 )
 
-// Config contains configuration for console web server
+// Config contains configuration for console web server.
 type Config struct {
-	Address         string `help:"server address of the graphql api gateway and frontend app" devDefault:"127.0.0.1:8081" releaseDefault:":10100"`
+	Address         string `help:"server address of the graphql api gateway and frontend app" devDefault:"" releaseDefault:":10100"`
 	StaticDir       string `help:"path to static resources" default:""`
 	ExternalAddress string `help:"external endpoint of the satellite if hosted" default:""`
 
@@ -61,32 +67,44 @@ type Config struct {
 	AuthToken       string `help:"auth token needed for access to registration token creation endpoint" default:""`
 	AuthTokenSecret string `help:"secret used to sign auth tokens" releaseDefault:"" devDefault:"my-suppa-secret-key"`
 
-	PasswordCost int `internal:"true" help:"password hashing cost (0=automatic)" default:"0"`
+	ContactInfoURL                  string `help:"url link to contacts page" default:"https://forum.storj.io"`
+	FrameAncestors                  string `help:"allow domains to embed the satellite in a frame, space separated" default:"tardigrade.io"`
+	LetUsKnowURL                    string `help:"url link to let us know page" default:"https://storjlabs.atlassian.net/servicedesk/customer/portals"`
+	SEO                             string `help:"used to communicate with web crawlers and other web robots" default:"User-agent: *\nDisallow: \nDisallow: /cgi-bin/"`
+	SatelliteName                   string `help:"used to display at web satellite console" default:"Storj"`
+	SatelliteOperator               string `help:"name of organization which set up satellite" default:"Storj Labs" `
+	TermsAndConditionsURL           string `help:"url link to terms and conditions page" default:"https://storj.io/storage-sla/"`
+	SegmentIOPublicKey              string `help:"used to initialize segment.io at web satellite console" default:""`
+	AccountActivationRedirectURL    string `help:"url link for account activation redirect" default:""`
+	VerificationPageURL             string `help:"url link to sign up verification page" devDefault:"" releaseDefault:"https://tardigrade.io/verify"`
+	PartneredSatelliteNames         string `help:"names of partnered satellites" default:"US-Central-1,Europe-West-1,Asia-East-1"`
+	GoogleTagManagerID              string `help:"id for google tag manager" default:""`
+	GeneralRequestURL               string `help:"url link to general request page" default:"https://support.tardigrade.io/hc/en-us/requests/new?ticket_form_id=360000379291"`
+	ProjectLimitsIncreaseRequestURL string `help:"url link to project limit increase request page" default:"https://support.tardigrade.io/hc/en-us/requests/new?ticket_form_id=360000683212"`
+	GatewayCredentialsRequestURL    string `help:"url link for gateway credentials requests" default:"https://auth.tardigradeshare.io"`
+	IsBetaSatellite                 bool   `help:"indicates if satellite is in beta" default:"false"`
 
-	ContactInfoURL        string `help:"url link to contacts page" default:"https://forum.storj.io"`
-	FrameAncestors        string `help:"allow domains to embed the satellite in a frame, space separated" default:"tardigrade.io"`
-	LetUsKnowURL          string `help:"url link to let us know page" default:"https://storjlabs.atlassian.net/servicedesk/customer/portals"`
-	SEO                   string `help:"used to communicate with web crawlers and other web robots" default:"User-agent: *\nDisallow: \nDisallow: /cgi-bin/"`
-	SatelliteName         string `help:"used to display at web satellite console" default:"Storj"`
-	SatelliteOperator     string `help:"name of organization which set up satellite" default:"Storj Labs" `
-	TermsAndConditionsURL string `help:"url link to terms and conditions page" default:"https://storj.io/storage-sla/"`
-	SegmentIOPublicKey    string `help:"used to initialize segment.io at web satellite console" default:""`
+	RateLimit web.IPRateLimiterConfig
+
+	console.Config
 }
 
-// Server represents console web server
+// Server represents console web server.
 //
 // architecture: Endpoint
 type Server struct {
 	log *zap.Logger
 
-	config           Config
-	service          *console.Service
-	mailService      *mailservice.Service
-	referralsService *referrals.Service
+	config      Config
+	service     *console.Service
+	mailService *mailservice.Service
+	partners    *rewards.PartnersService
 
-	listener   net.Listener
-	server     http.Server
-	cookieAuth *consolewebauth.CookieAuth
+	listener    net.Listener
+	server      http.Server
+	cookieAuth  *consolewebauth.CookieAuth
+	rateLimiter *web.IPRateLimiter
+	nodeURL     storj.NodeURL
 
 	stripePublicKey string
 
@@ -103,18 +121,20 @@ type Server struct {
 }
 
 // NewServer creates new instance of console server.
-func NewServer(logger *zap.Logger, config Config, service *console.Service, mailService *mailservice.Service, referralsService *referrals.Service, listener net.Listener, stripePublicKey string) *Server {
+func NewServer(logger *zap.Logger, config Config, service *console.Service, mailService *mailservice.Service, partners *rewards.PartnersService, listener net.Listener, stripePublicKey string, nodeURL storj.NodeURL) *Server {
 	server := Server{
-		log:              logger,
-		config:           config,
-		listener:         listener,
-		service:          service,
-		mailService:      mailService,
-		referralsService: referralsService,
-		stripePublicKey:  stripePublicKey,
+		log:             logger,
+		config:          config,
+		listener:        listener,
+		service:         service,
+		mailService:     mailService,
+		partners:        partners,
+		stripePublicKey: stripePublicKey,
+		rateLimiter:     web.NewIPRateLimiter(config.RateLimit),
+		nodeURL:         nodeURL,
 	}
 
-	logger.Sugar().Debugf("Starting Satellite UI on %s...", server.listener.Addr().String())
+	logger.Debug("Starting Satellite UI.", zap.Stringer("Address", server.listener.Addr()))
 
 	server.cookieAuth = consolewebauth.NewCookieAuth(consolewebauth.CookieSettings{
 		Name: "_tokenKey",
@@ -129,6 +149,10 @@ func NewServer(logger *zap.Logger, config Config, service *console.Service, mail
 		server.config.ExternalAddress = "http://" + server.listener.Addr().String() + "/"
 	}
 
+	if server.config.AccountActivationRedirectURL == "" {
+		server.config.AccountActivationRedirectURL = server.config.ExternalAddress + "login?activated=true"
+	}
+
 	router := mux.NewRouter()
 	fs := http.FileServer(http.Dir(server.config.StaticDir))
 
@@ -136,29 +160,25 @@ func NewServer(logger *zap.Logger, config Config, service *console.Service, mail
 	router.HandleFunc("/populate-promotional-coupons", server.populatePromotionalCoupons).Methods(http.MethodPost)
 	router.HandleFunc("/robots.txt", server.seoHandler)
 
-	router.Handle("/api/v0/graphql", server.withAuth(http.HandlerFunc(server.grapqlHandler)))
+	router.Handle("/api/v0/graphql", server.withAuth(http.HandlerFunc(server.graphqlHandler)))
 
 	router.Handle(
 		"/api/v0/projects/{id}/usage-limits",
 		server.withAuth(http.HandlerFunc(server.projectUsageLimitsHandler)),
 	).Methods(http.MethodGet)
 
-	referralsController := consoleapi.NewReferrals(logger, referralsService, service, mailService, server.config.ExternalAddress)
-	referralsRouter := router.PathPrefix("/api/v0/referrals").Subrouter()
-	referralsRouter.Handle("/tokens", server.withAuth(http.HandlerFunc(referralsController.GetTokens))).Methods(http.MethodGet)
-	referralsRouter.HandleFunc("/register", referralsController.Register).Methods(http.MethodPost)
-
-	authController := consoleapi.NewAuth(logger, service, mailService, server.cookieAuth, server.config.ExternalAddress, config.LetUsKnowURL, config.TermsAndConditionsURL, config.ContactInfoURL)
+	authController := consoleapi.NewAuth(logger, service, mailService, server.cookieAuth, partners, server.config.ExternalAddress, config.LetUsKnowURL, config.TermsAndConditionsURL, config.ContactInfoURL)
 	authRouter := router.PathPrefix("/api/v0/auth").Subrouter()
 	authRouter.Handle("/account", server.withAuth(http.HandlerFunc(authController.GetAccount))).Methods(http.MethodGet)
 	authRouter.Handle("/account", server.withAuth(http.HandlerFunc(authController.UpdateAccount))).Methods(http.MethodPatch)
+	authRouter.Handle("/account/change-email", server.withAuth(http.HandlerFunc(authController.ChangeEmail))).Methods(http.MethodPost)
 	authRouter.Handle("/account/change-password", server.withAuth(http.HandlerFunc(authController.ChangePassword))).Methods(http.MethodPost)
 	authRouter.Handle("/account/delete", server.withAuth(http.HandlerFunc(authController.DeleteAccount))).Methods(http.MethodPost)
-	authRouter.Handle("/logout", server.withAuth(http.HandlerFunc(authController.Logout))).Methods(http.MethodPost)
-	authRouter.HandleFunc("/token", authController.Token).Methods(http.MethodPost)
-	authRouter.HandleFunc("/register", authController.Register).Methods(http.MethodPost)
-	authRouter.HandleFunc("/forgot-password/{email}", authController.ForgotPassword).Methods(http.MethodPost)
-	authRouter.HandleFunc("/resend-email/{id}", authController.ResendEmail).Methods(http.MethodPost)
+	authRouter.HandleFunc("/logout", authController.Logout).Methods(http.MethodPost)
+	authRouter.Handle("/token", server.rateLimiter.Limit(http.HandlerFunc(authController.Token))).Methods(http.MethodPost)
+	authRouter.Handle("/register", server.rateLimiter.Limit(http.HandlerFunc(authController.Register))).Methods(http.MethodPost)
+	authRouter.Handle("/forgot-password/{email}", server.rateLimiter.Limit(http.HandlerFunc(authController.ForgotPassword))).Methods(http.MethodPost)
+	authRouter.Handle("/resend-email/{id}", server.rateLimiter.Limit(http.HandlerFunc(authController.ResendEmail))).Methods(http.MethodPost)
 
 	paymentController := consoleapi.NewPayments(logger, service)
 	paymentsRouter := router.PathPrefix("/api/v0/payments").Subrouter()
@@ -172,18 +192,24 @@ func NewServer(logger *zap.Logger, config Config, service *console.Service, mail
 	paymentsRouter.HandleFunc("/account", paymentController.SetupAccount).Methods(http.MethodPost)
 	paymentsRouter.HandleFunc("/billing-history", paymentController.BillingHistory).Methods(http.MethodGet)
 	paymentsRouter.HandleFunc("/tokens/deposit", paymentController.TokenDeposit).Methods(http.MethodPost)
+	paymentsRouter.HandleFunc("/paywall-enabled/{userId}", paymentController.PaywallEnabled).Methods(http.MethodGet)
+
+	bucketsController := consoleapi.NewBuckets(logger, service)
+	bucketsRouter := router.PathPrefix("/api/v0/buckets").Subrouter()
+	bucketsRouter.Use(server.withAuth)
+	bucketsRouter.HandleFunc("/bucket-names", bucketsController.AllBucketNames).Methods(http.MethodGet)
 
 	if server.config.StaticDir != "" {
 		router.HandleFunc("/activation/", server.accountActivationHandler)
 		router.HandleFunc("/password-recovery/", server.passwordRecoveryHandler)
 		router.HandleFunc("/cancel-password-recovery/", server.cancelPasswordRecoveryHandler)
 		router.HandleFunc("/usage-report", server.bucketUsageReportHandler)
-		router.PathPrefix("/static/").Handler(server.gzipMiddleware(http.StripPrefix("/static", fs)))
+		router.PathPrefix("/static/").Handler(server.brotliMiddleware(http.StripPrefix("/static", fs)))
 		router.PathPrefix("/").Handler(http.HandlerFunc(server.appHandler))
 	}
 
 	server.server = http.Server{
-		Handler:        router,
+		Handler:        server.withRequest(router),
 		MaxHeaderBytes: ContentLengthLimit.Int(),
 	}
 
@@ -212,29 +238,37 @@ func (server *Server) Run(ctx context.Context) (err error) {
 		return server.server.Shutdown(context.Background())
 	})
 	group.Go(func() error {
+		server.rateLimiter.Run(ctx)
+		return nil
+	})
+	group.Go(func() error {
 		defer cancel()
-		return server.server.Serve(server.listener)
+		err := server.server.Serve(server.listener)
+		if errs2.IsCanceled(err) || errors.Is(err, http.ErrServerClosed) {
+			err = nil
+		}
+		return err
 	})
 
 	return group.Wait()
 }
 
-// Close closes server and underlying listener
+// Close closes server and underlying listener.
 func (server *Server) Close() error {
 	return server.server.Close()
 }
 
-// appHandler is web app http handler function
+// appHandler is web app http handler function.
 func (server *Server) appHandler(w http.ResponseWriter, r *http.Request) {
 	header := w.Header()
 
 	cspValues := []string{
 		"default-src 'self'",
-		"connect-src 'self' api.segment.io",
+		"connect-src 'self' api.segment.io *.google-analytics.com " + server.config.GatewayCredentialsRequestURL,
 		"frame-ancestors " + server.config.FrameAncestors,
-		"frame-src 'self' *.stripe.com",
-		"img-src 'self' data: *.customer.io",
-		"script-src 'self' *.stripe.com cdn.segment.com *.customer.io",
+		"frame-src 'self' *.stripe.com *.googletagmanager.com",
+		"img-src 'self' data: *.customer.io *.googletagmanager.com *.google-analytics.com",
+		"script-src 'sha256-wAqYV6m2PHGd1WDyFBnZmSoyfCK0jxFAns0vGbdiWUA=' 'self' *.stripe.com cdn.segment.com *.customer.io *.google-analytics.com *.googletagmanager.com",
 	}
 
 	header.Set(contentType, "text/html; charset=UTF-8")
@@ -243,17 +277,42 @@ func (server *Server) appHandler(w http.ResponseWriter, r *http.Request) {
 	header.Set("Referrer-Policy", "same-origin") // Only expose the referring url when navigating around the satellite itself.
 
 	var data struct {
-		SatelliteName      string
-		SegmentIOPublicKey string
-		StripePublicKey    string
+		ExternalAddress                 string
+		SatelliteName                   string
+		SatelliteNodeURL                string
+		SegmentIOPublicKey              string
+		StripePublicKey                 string
+		VerificationPageURL             string
+		PartneredSatelliteNames         string
+		GoogleTagManagerID              string
+		DefaultProjectLimit             int
+		GeneralRequestURL               string
+		ProjectLimitsIncreaseRequestURL string
+		GatewayCredentialsRequestURL    string
+		IsBetaSatellite                 bool
 	}
 
+	data.ExternalAddress = server.config.ExternalAddress
 	data.SatelliteName = server.config.SatelliteName
+	data.SatelliteNodeURL = server.nodeURL.String()
 	data.SegmentIOPublicKey = server.config.SegmentIOPublicKey
 	data.StripePublicKey = server.stripePublicKey
+	data.VerificationPageURL = server.config.VerificationPageURL
+	data.PartneredSatelliteNames = server.config.PartneredSatelliteNames
+	data.GoogleTagManagerID = server.config.GoogleTagManagerID
+	data.DefaultProjectLimit = server.config.DefaultProjectLimit
+	data.GeneralRequestURL = server.config.GeneralRequestURL
+	data.ProjectLimitsIncreaseRequestURL = server.config.ProjectLimitsIncreaseRequestURL
+	data.GatewayCredentialsRequestURL = server.config.GatewayCredentialsRequestURL
+	data.IsBetaSatellite = server.config.IsBetaSatellite
 
-	if server.templates.index == nil || server.templates.index.Execute(w, data) != nil {
-		server.log.Error("index template could not be executed")
+	if server.templates.index == nil {
+		server.log.Error("index template is not set")
+		return
+	}
+
+	if err := server.templates.index.Execute(w, data); err != nil {
+		server.log.Error("index template could not be executed", zap.Error(err))
 		return
 	}
 }
@@ -272,7 +331,7 @@ func (server *Server) withAuth(handler http.Handler) http.Handler {
 				return console.WithAuthFailure(ctx, err)
 			}
 
-			ctx = auth.WithAPIKey(ctx, []byte(token))
+			ctx = consoleauth.WithAPIKey(ctx, []byte(token))
 
 			auth, err := server.service.Authorize(ctx)
 			if err != nil {
@@ -288,6 +347,13 @@ func (server *Server) withAuth(handler http.Handler) http.Handler {
 	})
 }
 
+// withRequest ensures the http request itself is reachable from the context.
+func (server *Server) withRequest(handler http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		handler.ServeHTTP(w, r.Clone(console.WithRequest(r.Context(), r)))
+	})
+}
+
 // bucketUsageReportHandler generate bucket usage report page for project.
 func (server *Server) bucketUsageReportHandler(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
@@ -300,7 +366,7 @@ func (server *Server) bucketUsageReportHandler(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	auth, err := server.service.Authorize(auth.WithAPIKey(ctx, []byte(token)))
+	auth, err := server.service.Authorize(consoleauth.WithAPIKey(ctx, []byte(token)))
 	if err != nil {
 		server.serveError(w, http.StatusUnauthorized)
 		return
@@ -309,7 +375,7 @@ func (server *Server) bucketUsageReportHandler(w http.ResponseWriter, r *http.Re
 	ctx = console.WithAuth(ctx, auth)
 
 	// parse query params
-	projectID, err := uuid.Parse(r.URL.Query().Get("projectID"))
+	projectID, err := uuid.FromString(r.URL.Query().Get("projectID"))
 	if err != nil {
 		server.serveError(w, http.StatusBadRequest)
 		return
@@ -333,7 +399,7 @@ func (server *Server) bucketUsageReportHandler(w http.ResponseWriter, r *http.Re
 		zap.Stringer("since", since),
 		zap.Stringer("before", before))
 
-	bucketRollups, err := server.service.GetBucketUsageRollups(ctx, *projectID, since, before)
+	bucketRollups, err := server.service.GetBucketUsageRollups(ctx, projectID, since, before)
 	if err != nil {
 		server.log.Error("bucket usage report error", zap.Error(err))
 		server.serveError(w, http.StatusInternalServerError)
@@ -429,7 +495,7 @@ func (server *Server) populatePromotionalCoupons(w http.ResponseWriter, r *http.
 	}
 }
 
-// accountActivationHandler is web app http handler function
+// accountActivationHandler is web app http handler function.
 func (server *Server) accountActivationHandler(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	defer mon.Task()(&ctx)(nil)
@@ -441,15 +507,21 @@ func (server *Server) accountActivationHandler(w http.ResponseWriter, r *http.Re
 			zap.String("token", activationToken),
 			zap.Error(err))
 
-		// TODO: when new error pages will be created - change http.StatusNotFound on appropriate one
+		if console.ErrEmailUsed.Has(err) {
+			server.serveError(w, http.StatusConflict)
+			return
+		}
+
+		if console.Error.Has(err) {
+			server.serveError(w, http.StatusInternalServerError)
+			return
+		}
+
 		server.serveError(w, http.StatusNotFound)
 		return
 	}
 
-	if err = server.templates.activated.Execute(w, nil); err != nil {
-		server.log.Error("account activated template could not be executed", zap.Error(Error.Wrap(err)))
-		return
-	}
+	http.Redirect(w, r, server.config.AccountActivationRedirectURL, http.StatusTemporaryRedirect)
 }
 
 func (server *Server) passwordRecoveryHandler(w http.ResponseWriter, r *http.Request) {
@@ -533,6 +605,7 @@ func (server *Server) projectUsageLimitsHandler(w http.ResponseWriter, r *http.R
 			Error string `json:"error"`
 		}
 
+		// N.B. we are probably leaking internal details to the client
 		jsonError.Error = err.Error()
 
 		if err := json.NewEncoder(w).Encode(jsonError); err != nil {
@@ -544,6 +617,8 @@ func (server *Server) projectUsageLimitsHandler(w http.ResponseWriter, r *http.R
 		switch {
 		case console.ErrUnauthorized.Has(err):
 			handleError(http.StatusUnauthorized, err)
+		case accounting.ErrInvalidArgument.Has(err):
+			handleError(http.StatusBadRequest, err)
 		default:
 			handleError(http.StatusInternalServerError, err)
 		}
@@ -556,13 +631,13 @@ func (server *Server) projectUsageLimitsHandler(w http.ResponseWriter, r *http.R
 		return
 	}
 
-	projectID, err := uuid.Parse(idParam)
+	projectID, err := uuid.FromString(idParam)
 	if err != nil {
 		handleError(http.StatusBadRequest, errs.New("invalid project id: %v", err))
 		return
 	}
 
-	limits, err := server.service.GetProjectUsageLimits(ctx, *projectID)
+	limits, err := server.service.GetProjectUsageLimits(ctx, projectID)
 	if err != nil {
 		handleServiceError(err)
 		return
@@ -574,8 +649,8 @@ func (server *Server) projectUsageLimitsHandler(w http.ResponseWriter, r *http.R
 	}
 }
 
-// grapqlHandler is graphql endpoint http handler function
-func (server *Server) grapqlHandler(w http.ResponseWriter, r *http.Request) {
+// graphqlHandler is graphql endpoint http handler function.
+func (server *Server) graphqlHandler(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	defer mon.Task()(&ctx)(nil)
 
@@ -633,8 +708,6 @@ func (server *Server) grapqlHandler(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case console.ErrUnauthorized.Has(err):
 			return http.StatusUnauthorized, err
-		case console.ErrValidation.Has(err):
-			return http.StatusBadRequest, err
 		case console.Error.Has(err):
 			return http.StatusInternalServerError, err
 		}
@@ -672,7 +745,7 @@ func (server *Server) grapqlHandler(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
-		handleErrors(http.StatusBadRequest, result.Errors)
+		handleErrors(http.StatusOK, result.Errors)
 	}
 
 	if result.HasErrors() {
@@ -686,7 +759,7 @@ func (server *Server) grapqlHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	server.log.Sugar().Debug(result)
+	server.log.Debug(fmt.Sprintf("%s", result))
 }
 
 // serveError serves error static pages.
@@ -699,15 +772,20 @@ func (server *Server) serveError(w http.ResponseWriter, status int) {
 		if err != nil {
 			server.log.Error("cannot parse internalServerError template", zap.Error(Error.Wrap(err)))
 		}
-	default:
+	case http.StatusNotFound:
 		err := server.templates.notFound.Execute(w, nil)
 		if err != nil {
 			server.log.Error("cannot parse pageNotFound template", zap.Error(Error.Wrap(err)))
 		}
+	case http.StatusConflict:
+		err := server.templates.activated.Execute(w, nil)
+		if err != nil {
+			server.log.Error("cannot parse already activated template", zap.Error(Error.Wrap(err)))
+		}
 	}
 }
 
-// seoHandler used to communicate with web crawlers and other web robots
+// seoHandler used to communicate with web crawlers and other web robots.
 func (server *Server) seoHandler(w http.ResponseWriter, req *http.Request) {
 	header := w.Header()
 
@@ -720,19 +798,19 @@ func (server *Server) seoHandler(w http.ResponseWriter, req *http.Request) {
 	}
 }
 
-// gzipMiddleware is used to gzip static content to minify resources if browser support such decoding.
-func (server *Server) gzipMiddleware(fn http.Handler) http.Handler {
+// brotliMiddleware is used to compress static content using brotli to minify resources if browser support such decoding.
+func (server *Server) brotliMiddleware(fn http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Cache-Control", "public, max-age=31536000")
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 
-		isGzipSupported := strings.Contains(r.Header.Get("Accept-Encoding"), "gzip")
-		if !isGzipSupported {
+		isBrotliSupported := strings.Contains(r.Header.Get("Accept-Encoding"), "br")
+		if !isBrotliSupported {
 			fn.ServeHTTP(w, r)
 			return
 		}
 
-		info, err := os.Stat(server.config.StaticDir + strings.TrimPrefix(r.URL.Path, "/static") + ".gz")
+		info, err := os.Stat(server.config.StaticDir + strings.TrimPrefix(r.URL.Path, "/static") + ".br")
 		if err != nil {
 			fn.ServeHTTP(w, r)
 			return
@@ -740,19 +818,19 @@ func (server *Server) gzipMiddleware(fn http.Handler) http.Handler {
 
 		extension := filepath.Ext(info.Name()[:len(info.Name())-3])
 		w.Header().Set(contentType, mime.TypeByExtension(extension))
-		w.Header().Set("Content-Encoding", "gzip")
+		w.Header().Set("Content-Encoding", "br")
 
 		newRequest := new(http.Request)
 		*newRequest = *r
 		newRequest.URL = new(url.URL)
 		*newRequest.URL = *r.URL
-		newRequest.URL.Path += ".gz"
+		newRequest.URL.Path += ".br"
 
 		fn.ServeHTTP(w, newRequest)
 	})
 }
 
-// initializeTemplates is used to initialize all templates
+// initializeTemplates is used to initialize all templates.
 func (server *Server) initializeTemplates() (err error) {
 	server.templates.index, err = template.ParseFiles(filepath.Join(server.config.StaticDir, "dist", "index.html"))
 	if err != nil {

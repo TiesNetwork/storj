@@ -1,11 +1,23 @@
-// Copyright (C) 2019 Storj Labs, Inc.
+// Copyright (C) 2020 Storj Labs, Inc.
 // See LICENSE for copying information.
 
 package version
 
-func init() {
-	buildTimestamp = "1581627119"
-	buildCommitHash = "5d2494a22d506a38a7f4b6fb3260fb754c962f27"
-	buildVersion = "v0.33.4"
-	buildRelease = "true"
-}
+import _ "unsafe" // needed for go:linkname
+
+//go:linkname buildTimestamp storj.io/private/version.buildTimestamp
+var buildTimestamp string
+
+//go:linkname buildCommitHash storj.io/private/version.buildCommitHash
+var buildCommitHash string
+
+//go:linkname buildVersion storj.io/private/version.buildVersion
+var buildVersion string
+
+//go:linkname buildRelease storj.io/private/version.buildRelease
+var buildRelease string
+
+// ensure that linter understands that the variables are being used.
+func init() { use(buildTimestamp, buildCommitHash, buildVersion, buildRelease) }
+
+func use(...interface{}) {}

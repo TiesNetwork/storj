@@ -9,10 +9,15 @@
         />
         <div class="payout-container__wallet-address-section">
             <p class="payout-container__wallet-address-section__label">{{label}}</p>
-            <p><b class="payout-container__wallet-address-section__bold-text">{{walletAddress}}</b></p>
+            <p class="payout-container__wallet-address-section__bold-text">{{walletAddress}}</p>
         </div>
-        <a :href="'https://etherscan.io/address/' + walletAddress + '#tokentxns'" target="_blank" rel="noopener">
-            <div class="payout-container__button"><b class="payout-container-button-label">View on Etherscan</b></div>
+        <a
+            class="payout-container__button"
+            :href="'https://etherscan.io/address/' + walletAddress + '#tokentxns'"
+            target="_blank"
+            rel="noopener noreferrer"
+        >
+            <b class="payout-container-button-label">View on Etherscan</b>
         </a>
     </div>
 </template>
@@ -24,7 +29,7 @@ import WalletIcon from '@/../static/images/wallet.svg';
 
 @Component({
     components: {
-        WalletIcon
+        WalletIcon,
     },
 })
 export default class PayoutArea extends Vue {
@@ -37,12 +42,12 @@ export default class PayoutArea extends Vue {
 
 <style scoped lang="scss">
     .payout-container {
-        background-color: #fff;
+        background-color: var(--block-background-color);
         padding: 40px;
         display: flex;
         justify-content: flex-start;
         align-items: center;
-        border: 1px solid #eaeaea;
+        border: 1px solid var(--block-border-color);
         border-radius: 12px;
         position: relative;
 
@@ -58,13 +63,14 @@ export default class PayoutArea extends Vue {
 
             &__label {
                 font-size: 14px;
-                color: #586c86;
-                user-select: none;
+                color: var(--regular-text-color);
             }
 
             &__bold-text {
+                font-family: 'font_bold', sans-serif;
                 font-size: 18px;
-                color: #535f77;
+                color: var(--regular-text-color);
+                word-break: break-all;
             }
         }
 
@@ -75,13 +81,14 @@ export default class PayoutArea extends Vue {
             display: flex;
             align-items: center;
             justify-content: center;
-            background-color: #f4f6f9;
-            border: 1px solid #e8e8e8;
+            background-color: var(--button-background-color);
+            border: 1px solid var(--block-border-color);
             border-radius: 12px;
             position: absolute;
             top: 42px;
             right: 40px;
-            color: #535f77;
+            color: var(--regular-text-color);
+            text-decoration: none;
 
             &:hover {
                 background-color: #4d72b7;
@@ -90,6 +97,49 @@ export default class PayoutArea extends Vue {
                 .payout-container-button-label {
                     color: #fff;
                 }
+            }
+        }
+    }
+
+    @media screen and (max-width: 1000px) {
+
+        .payout-container {
+            flex-direction: column;
+            justify-content: flex-start;
+            align-items: flex-start;
+
+            &__wallet-address-section {
+
+                &__label {
+                    margin: 20px 0 6px 0;
+                }
+            }
+
+            &__button {
+                position: inherit;
+                left: 0;
+                margin: 20px 0 25px 0;
+            }
+        }
+    }
+
+    @media screen and (max-width: 500px) {
+
+        p {
+            margin: 0;
+        }
+
+        .payout-container {
+
+            &__wallet-address-section {
+
+                &__label {
+                    margin: 20px 0 6px 0;
+                }
+            }
+
+            &__button {
+                margin: 10px 0 25px 0;
             }
         }
     }

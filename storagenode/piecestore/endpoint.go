@@ -5,9 +5,9 @@ package piecestore
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"os"
-	"strings"
 	"sync/atomic"
 	"time"
 
@@ -17,6 +17,7 @@ import (
 	"golang.org/x/sync/errgroup"
 
 	"storj.io/common/bloomfilter"
+	"storj.io/common/context2"
 	"storj.io/common/errs2"
 	"storj.io/common/identity"
 	"storj.io/common/memory"
@@ -26,11 +27,12 @@ import (
 	"storj.io/common/signing"
 	"storj.io/common/storj"
 	"storj.io/common/sync2"
-	"storj.io/storj/private/context2"
 	"storj.io/storj/storagenode/bandwidth"
 	"storj.io/storj/storagenode/monitor"
 	"storj.io/storj/storagenode/orders"
+	"storj.io/storj/storagenode/orders/ordersfile"
 	"storj.io/storj/storagenode/pieces"
+	"storj.io/storj/storagenode/piecestore/usedserials"
 	"storj.io/storj/storagenode/retain"
 	"storj.io/storj/storagenode/trust"
 )
@@ -39,25 +41,28 @@ var (
 	mon = monkit.Package()
 )
 
-var _ pb.PiecestoreServer = (*Endpoint)(nil)
-
-// OldConfig contains everything necessary for a server
+// OldConfig contains everything necessary for a server.
 type OldConfig struct {
 	Path                   string         `help:"path to store data in" default:"$CONFDIR/storage"`
 	WhitelistedSatellites  storj.NodeURLs `help:"a comma-separated list of approved satellite node urls (unused)" devDefault:"" releaseDefault:""`
 	AllocatedDiskSpace     memory.Size    `user:"true" help:"total allocated disk space in bytes" default:"1TB"`
-	AllocatedBandwidth     memory.Size    `user:"true" help:"total allocated bandwidth in bytes" default:"2TB"`
+	AllocatedBandwidth     memory.Size    `user:"true" help:"total allocated bandwidth in bytes (deprecated)" default:"0B"`
 	KBucketRefreshInterval time.Duration  `help:"how frequently Kademlia bucket should be refreshed with node stats" default:"1h0m0s"`
 }
 
 // Config defines parameters for piecestore endpoint.
 type Config struct {
-	ExpirationGracePeriod  time.Duration `help:"how soon before expiration date should things be considered expired" default:"48h0m0s"`
-	MaxConcurrentRequests  int           `help:"how many concurrent requests are allowed, before uploads are rejected. 0 represents unlimited." default:"0"`
-	OrderLimitGracePeriod  time.Duration `help:"how long after OrderLimit creation date are OrderLimits no longer accepted" default:"24h0m0s"`
-	CacheSyncInterval      time.Duration `help:"how often the space used cache is synced to persistent storage" releaseDefault:"1h0m0s" devDefault:"0h1m0s"`
-	StreamOperationTimeout time.Duration `help:"how long to spend waiting for a stream operation before canceling" default:"30m"`
-	RetainTimeBuffer       time.Duration `help:"allows for small differences in the satellite and storagenode clocks" default:"48h0m0s"`
+	DatabaseDir             string        `help:"directory to store databases. if empty, uses data path" default:""`
+	ExpirationGracePeriod   time.Duration `help:"how soon before expiration date should things be considered expired" default:"48h0m0s"`
+	MaxConcurrentRequests   int           `help:"how many concurrent requests are allowed, before uploads are rejected. 0 represents unlimited." default:"0"`
+	DeleteWorkers           int           `help:"how many piece delete workers" default:"1"`
+	DeleteQueueSize         int           `help:"size of the piece delete queue" default:"10000"`
+	OrderLimitGracePeriod   time.Duration `help:"how long after OrderLimit creation date are OrderLimits no longer accepted" default:"1h0m0s"`
+	CacheSyncInterval       time.Duration `help:"how often the space used cache is synced to persistent storage" releaseDefault:"1h0m0s" devDefault:"0h1m0s"`
+	StreamOperationTimeout  time.Duration `help:"how long to spend waiting for a stream operation before canceling" default:"30m"`
+	RetainTimeBuffer        time.Duration `help:"allows for small differences in the satellite and storagenode clocks" default:"48h0m0s"`
+	ReportCapacityThreshold memory.Size   `help:"threshold below which to immediately notify satellite of capacity" default:"500MB" hidden:"true"`
+	MaxUsedSerialsSize      memory.Size   `help:"amount of memory allowed for used serials store - once surpassed, serials will be dropped at random" default:"1MB"`
 
 	Trust trust.Config
 
@@ -73,9 +78,8 @@ type pingStatsSource interface {
 //
 // architecture: Endpoint
 type Endpoint struct {
-	log          *zap.Logger
-	config       Config
-	grpcReqLimit int
+	log    *zap.Logger
+	config Config
 
 	signer    signing.Signer
 	trust     *trust.Pool
@@ -83,37 +87,20 @@ type Endpoint struct {
 	retain    *retain.Service
 	pingStats pingStatsSource
 
-	store       *pieces.Store
-	orders      orders.DB
-	usage       bandwidth.DB
-	usedSerials UsedSerials
+	store        *pieces.Store
+	ordersStore  *orders.FileStore
+	usage        bandwidth.DB
+	usedSerials  *usedserials.Table
+	pieceDeleter *pieces.Deleter
 
-	// liveRequests tracks the total number of incoming rpc requests. For gRPC
-	// requests only, this number is compared to config.MaxConcurrentRequests
-	// and limits the number of gRPC requests. dRPC requests are tracked but
-	// not limited.
 	liveRequests int32
 }
 
-// drpcEndpoint wraps streaming methods so that they can be used with drpc
-type drpcEndpoint struct{ *Endpoint }
-
-// DRPC returns a DRPC form of the endpoint.
-func (endpoint *Endpoint) DRPC() pb.DRPCPiecestoreServer { return &drpcEndpoint{Endpoint: endpoint} }
-
 // NewEndpoint creates a new piecestore endpoint.
-func NewEndpoint(log *zap.Logger, signer signing.Signer, trust *trust.Pool, monitor *monitor.Service, retain *retain.Service, pingStats pingStatsSource, store *pieces.Store, orders orders.DB, usage bandwidth.DB, usedSerials UsedSerials, config Config) (*Endpoint, error) {
-	// If config.MaxConcurrentRequests is set we want to repsect it for grpc.
-	// However, if it is 0 (unlimited) we force a limit.
-	grpcReqLimit := config.MaxConcurrentRequests
-	if grpcReqLimit <= 0 {
-		grpcReqLimit = 7
-	}
-
+func NewEndpoint(log *zap.Logger, signer signing.Signer, trust *trust.Pool, monitor *monitor.Service, retain *retain.Service, pingStats pingStatsSource, store *pieces.Store, pieceDeleter *pieces.Deleter, ordersStore *orders.FileStore, usage bandwidth.DB, usedSerials *usedserials.Table, config Config) (*Endpoint, error) {
 	return &Endpoint{
-		log:          log,
-		config:       config,
-		grpcReqLimit: grpcReqLimit,
+		log:    log,
+		config: config,
 
 		signer:    signer,
 		trust:     trust,
@@ -121,10 +108,11 @@ func NewEndpoint(log *zap.Logger, signer signing.Signer, trust *trust.Pool, moni
 		retain:    retain,
 		pingStats: pingStats,
 
-		store:       store,
-		orders:      orders,
-		usage:       usage,
-		usedSerials: usedSerials,
+		store:        store,
+		ordersStore:  ordersStore,
+		usage:        usage,
+		usedSerials:  usedSerials,
+		pieceDeleter: pieceDeleter,
 
 		liveRequests: 0,
 	}, nil
@@ -134,7 +122,7 @@ var monLiveRequests = mon.TaskNamed("live-request")
 
 // Delete handles deleting a piece on piece store requested by uplink.
 //
-// DEPRECATED in favor of DeletePieces.
+// Deprecated: use DeletePieces instead.
 func (endpoint *Endpoint) Delete(ctx context.Context, delete *pb.PieceDeleteRequest) (_ *pb.PieceDeleteResponse, err error) {
 	defer monLiveRequests(&ctx)(&err)
 	defer mon.Task()(&ctx)(&err)
@@ -184,88 +172,15 @@ func (endpoint *Endpoint) DeletePieces(
 		return nil, rpcstatus.Error(rpcstatus.PermissionDenied, "delete pieces called with untrusted ID")
 	}
 
-	for _, pieceID := range req.PieceIds {
-		err = endpoint.store.Delete(ctx, peer.ID, pieceID)
-		if err != nil {
-			// If a piece cannot be deleted, we just log the error.
-			// No error is returned to the caller.
-			endpoint.log.Error("delete failed",
-				zap.Stringer("Satellite ID", peer.ID),
-				zap.Stringer("Piece ID", pieceID),
-				zap.Error(err),
-			)
-		} else {
-			endpoint.log.Info("deleted",
-				zap.Stringer("Satellite ID", peer.ID),
-				zap.Stringer("Piece ID", pieceID),
-			)
-		}
-	}
-	return &pb.DeletePiecesResponse{}, nil
-}
+	unhandled := endpoint.pieceDeleter.Enqueue(ctx, peer.ID, req.PieceIds)
 
-// DeletePiece handles deleting a piece on piece store requested by satellite.
-//
-// DEPRECATED in favor of DeletePieces.
-func (endpoint *Endpoint) DeletePiece(
-	ctx context.Context, req *pb.PieceDeletePieceRequest,
-) (_ *pb.PieceDeletePieceResponse, err error) {
-	defer mon.Task()(&ctx, req.PieceId.String())(&err)
-
-	peer, err := identity.PeerIdentityFromContext(ctx)
-	if err != nil {
-		return nil, rpcstatus.Wrap(rpcstatus.Unauthenticated, err)
-	}
-
-	err = endpoint.trust.VerifySatelliteID(ctx, peer.ID)
-	if err != nil {
-		return nil, rpcstatus.Error(rpcstatus.PermissionDenied, "delete piece called with untrusted ID")
-	}
-
-	err = endpoint.store.Delete(ctx, peer.ID, req.PieceId)
-	if err != nil {
-		// TODO: https://storjlabs.atlassian.net/browse/V3-3222
-		// Once this method returns error classes change the following conditional
-		if strings.Contains(err.Error(), "file does not exist") {
-			return nil, rpcstatus.Error(rpcstatus.NotFound, "piece not found")
-		}
-
-		endpoint.log.Error("delete failed",
-			zap.Error(err),
-			zap.Stringer("Satellite ID", peer.ID),
-			zap.Stringer("Piece ID", req.PieceId),
-		)
-
-		return nil, rpcstatus.Error(rpcstatus.Internal, "delete failed")
-	}
-
-	endpoint.log.Info("deleted",
-		zap.Stringer("Satellite ID", peer.ID),
-		zap.Stringer("Piece ID", req.PieceId),
-	)
-
-	return &pb.PieceDeletePieceResponse{}, nil
+	return &pb.DeletePiecesResponse{
+		UnhandledCount: int64(unhandled),
+	}, nil
 }
 
 // Upload handles uploading a piece on piece store.
-func (endpoint *Endpoint) Upload(stream pb.Piecestore_UploadServer) (err error) {
-	return endpoint.doUpload(stream, endpoint.grpcReqLimit)
-}
-
-// Upload handles uploading a piece on piece store.
-func (endpoint *drpcEndpoint) Upload(stream pb.DRPCPiecestore_UploadStream) (err error) {
-	return endpoint.doUpload(stream, endpoint.config.MaxConcurrentRequests)
-}
-
-// uploadStream is the minimum interface required to perform settlements.
-type uploadStream interface {
-	Context() context.Context
-	Recv() (*pb.PieceUploadRequest, error)
-	SendAndClose(*pb.PieceUploadResponse) error
-}
-
-// doUpload handles uploading a piece on piece store.
-func (endpoint *Endpoint) doUpload(stream uploadStream, requestLimit int) (err error) {
+func (endpoint *Endpoint) Upload(stream pb.DRPCPiecestore_UploadStream) (err error) {
 	ctx := stream.Context()
 	defer monLiveRequests(&ctx)(&err)
 	defer mon.Task()(&ctx)(&err)
@@ -275,9 +190,13 @@ func (endpoint *Endpoint) doUpload(stream uploadStream, requestLimit int) (err e
 
 	endpoint.pingStats.WasPinged(time.Now())
 
-	if requestLimit > 0 && int(liveRequests) > requestLimit {
-		endpoint.log.Error("upload rejected, too many requests", zap.Int32("live requests", liveRequests))
-		return rpcstatus.Error(rpcstatus.Unavailable, "storage node overloaded")
+	if endpoint.config.MaxConcurrentRequests > 0 && int(liveRequests) > endpoint.config.MaxConcurrentRequests {
+		endpoint.log.Error("upload rejected, too many requests",
+			zap.Int32("live requests", liveRequests),
+			zap.Int("requestLimit", endpoint.config.MaxConcurrentRequests),
+		)
+		errMsg := fmt.Sprintf("storage node overloaded, request limit: %d", endpoint.config.MaxConcurrentRequests)
+		return rpcstatus.Error(rpcstatus.Unavailable, errMsg)
 	}
 
 	startTime := time.Now().UTC()
@@ -301,8 +220,6 @@ func (endpoint *Endpoint) doUpload(stream uploadStream, requestLimit int) (err e
 	}
 	limit := message.Limit
 
-	// TODO: verify that we have have expected amount of storage before continuing
-
 	if limit.Action != pb.PieceAction_PUT && limit.Action != pb.PieceAction_PUT_REPAIR {
 		return rpcstatus.Errorf(rpcstatus.InvalidArgument, "expected put or put repair action got %v", limit.Action)
 	}
@@ -311,17 +228,26 @@ func (endpoint *Endpoint) doUpload(stream uploadStream, requestLimit int) (err e
 		return err
 	}
 
-	availableBandwidth, err := endpoint.monitor.AvailableBandwidth(ctx)
-	if err != nil {
-		return rpcstatus.Wrap(rpcstatus.Internal, err)
-	}
-
 	availableSpace, err := endpoint.monitor.AvailableSpace(ctx)
 	if err != nil {
 		return rpcstatus.Wrap(rpcstatus.Internal, err)
 	}
+	// if availableSpace has fallen below ReportCapacityThreshold, report capacity to satellites
+	defer func() {
+		if availableSpace < endpoint.config.ReportCapacityThreshold.Int64() {
+			endpoint.monitor.NotifyLowDisk()
+		}
+	}()
+
+	if availableSpace < limit.Limit {
+		return rpcstatus.Errorf(rpcstatus.Aborted, "not enough available disk space, have: %v, need: %v", availableSpace, limit.Limit)
+	}
 
 	var pieceWriter *pieces.Writer
+	// committed is set to true when the piece is committed.
+	// It is used to distinguish successful pieces where the uplink cancels the connections,
+	// and pieces that were actually canceled before being completed.
+	var committed bool
 	defer func() {
 		endTime := time.Now().UTC()
 		dt := endTime.Sub(startTime)
@@ -335,18 +261,24 @@ func (endpoint *Endpoint) doUpload(stream uploadStream, requestLimit int) (err e
 		}
 		uploadDuration := dt.Nanoseconds()
 
-		if err != nil {
+		if err != nil && !errs2.IsCanceled(err) {
 			mon.Meter("upload_failure_byte_meter").Mark64(uploadSize)
 			mon.IntVal("upload_failure_size_bytes").Observe(uploadSize)
 			mon.IntVal("upload_failure_duration_ns").Observe(uploadDuration)
 			mon.FloatVal("upload_failure_rate_bytes_per_sec").Observe(uploadRate)
-			endpoint.log.Info("upload failed", zap.Stringer("Piece ID", limit.PieceId), zap.Stringer("Satellite ID", limit.SatelliteId), zap.Stringer("Action", limit.Action), zap.Error(err))
+			endpoint.log.Error("upload failed", zap.Stringer("Piece ID", limit.PieceId), zap.Stringer("Satellite ID", limit.SatelliteId), zap.Stringer("Action", limit.Action), zap.Error(err), zap.Int64("Size", uploadSize))
+		} else if errs2.IsCanceled(err) && !committed {
+			mon.Meter("upload_cancel_byte_meter").Mark64(uploadSize)
+			mon.IntVal("upload_cancel_size_bytes").Observe(uploadSize)
+			mon.IntVal("upload_cancel_duration_ns").Observe(uploadDuration)
+			mon.FloatVal("upload_cancel_rate_bytes_per_sec").Observe(uploadRate)
+			endpoint.log.Info("upload canceled", zap.Stringer("Piece ID", limit.PieceId), zap.Stringer("Satellite ID", limit.SatelliteId), zap.Stringer("Action", limit.Action), zap.Int64("Size", uploadSize))
 		} else {
 			mon.Meter("upload_success_byte_meter").Mark64(uploadSize)
 			mon.IntVal("upload_success_size_bytes").Observe(uploadSize)
 			mon.IntVal("upload_success_duration_ns").Observe(uploadDuration)
 			mon.FloatVal("upload_success_rate_bytes_per_sec").Observe(uploadRate)
-			endpoint.log.Info("uploaded", zap.Stringer("Piece ID", limit.PieceId), zap.Stringer("Satellite ID", limit.SatelliteId), zap.Stringer("Action", limit.Action))
+			endpoint.log.Info("uploaded", zap.Stringer("Piece ID", limit.PieceId), zap.Stringer("Satellite ID", limit.SatelliteId), zap.Stringer("Action", limit.Action), zap.Int64("Size", uploadSize))
 		}
 	}()
 
@@ -354,7 +286,6 @@ func (endpoint *Endpoint) doUpload(stream uploadStream, requestLimit int) (err e
 		zap.Stringer("Piece ID", limit.PieceId),
 		zap.Stringer("Satellite ID", limit.SatelliteId),
 		zap.Stringer("Action", limit.Action),
-		zap.Int64("Available Bandwidth", availableBandwidth),
 		zap.Int64("Available Space", availableSpace))
 
 	pieceWriter, err = endpoint.store.Writer(ctx, limit.SatelliteId, limit.PieceId)
@@ -364,20 +295,22 @@ func (endpoint *Endpoint) doUpload(stream uploadStream, requestLimit int) (err e
 	defer func() {
 		// cancel error if it hasn't been committed
 		if cancelErr := pieceWriter.Cancel(ctx); cancelErr != nil {
+			if errs2.IsCanceled(cancelErr) {
+				return
+			}
 			endpoint.log.Error("error during canceling a piece write", zap.Error(cancelErr))
 		}
 	}()
 
-	orderSaved := false
-	largestOrder := pb.Order{}
 	// Ensure that the order is saved even in the face of an error. In the
 	// success path, the order will be saved just before sending the response
 	// and closing the stream (in which case, orderSaved will be true).
-	defer func() {
-		if !orderSaved {
-			endpoint.saveOrder(ctx, limit, &largestOrder)
-		}
-	}()
+	commitOrderToStore, err := endpoint.beginSaveOrder(limit)
+	if err != nil {
+		return rpcstatus.Wrap(rpcstatus.InvalidArgument, err)
+	}
+	largestOrder := pb.Order{}
+	defer commitOrderToStore(ctx, &largestOrder)
 
 	for {
 		// TODO: reuse messages to avoid allocations
@@ -421,15 +354,10 @@ func (endpoint *Endpoint) doUpload(stream uploadStream, requestLimit int) (err e
 					largestOrder.Amount, pieceWriter.Size()+int64(len(message.Chunk.Data)))
 			}
 
-			availableBandwidth -= chunkSize
-			if availableBandwidth < 0 {
-				return rpcstatus.Error(rpcstatus.Internal, "out of bandwidth")
-			}
 			availableSpace -= chunkSize
 			if availableSpace < 0 {
 				return rpcstatus.Error(rpcstatus.Internal, "out of space")
 			}
-
 			if _, err := pieceWriter.Write(message.Chunk.Data); err != nil {
 				return rpcstatus.Wrap(rpcstatus.Internal, err)
 			}
@@ -456,6 +384,7 @@ func (endpoint *Endpoint) doUpload(stream uploadStream, requestLimit int) (err e
 				if err := pieceWriter.Commit(ctx, info); err != nil {
 					return rpcstatus.Wrap(rpcstatus.Internal, err)
 				}
+				committed = true
 				if !limit.PieceExpiration.IsZero() {
 					err := endpoint.store.SetExpiration(ctx, limit.SatelliteId, limit.PieceId, limit.PieceExpiration)
 					if err != nil {
@@ -474,11 +403,6 @@ func (endpoint *Endpoint) doUpload(stream uploadStream, requestLimit int) (err e
 				return rpcstatus.Wrap(rpcstatus.Internal, err)
 			}
 
-			// Save the order before completing the call. Set orderSaved so
-			// that the defer above does not also save.
-			orderSaved = true
-			endpoint.saveOrder(ctx, limit, &largestOrder)
-
 			closeErr := rpctimeout.Run(ctx, endpoint.config.StreamOperationTimeout, func(_ context.Context) (err error) {
 				return stream.SendAndClose(&pb.PieceUploadResponse{Done: storageNodeHash})
 			})
@@ -493,25 +417,8 @@ func (endpoint *Endpoint) doUpload(stream uploadStream, requestLimit int) (err e
 	}
 }
 
-// Download handles Downloading a piece on piece store.
-func (endpoint *Endpoint) Download(stream pb.Piecestore_DownloadServer) (err error) {
-	return endpoint.doDownload(stream)
-}
-
-// Download handles Downloading a piece on piece store.
-func (endpoint *drpcEndpoint) Download(stream pb.DRPCPiecestore_DownloadStream) (err error) {
-	return endpoint.doDownload(stream)
-}
-
-// downloadStream is the minimum interface required to perform settlements.
-type downloadStream interface {
-	Context() context.Context
-	Recv() (*pb.PieceDownloadRequest, error)
-	Send(*pb.PieceDownloadResponse) error
-}
-
-// Download implements downloading a piece from piece store.
-func (endpoint *Endpoint) doDownload(stream downloadStream) (err error) {
+// Download handles Downloading a piece on piecestore.
+func (endpoint *Endpoint) Download(stream pb.DRPCPiecestore_DownloadStream) (err error) {
 	ctx := stream.Context()
 	defer monLiveRequests(&ctx)(&err)
 	defer mon.Task()(&ctx)(&err)
@@ -540,8 +447,6 @@ func (endpoint *Endpoint) doDownload(stream downloadStream) (err error) {
 	}
 	limit, chunk := message.Limit, message.Chunk
 
-	endpoint.log.Info("download started", zap.Stringer("Piece ID", limit.PieceId), zap.Stringer("Satellite ID", limit.SatelliteId), zap.Stringer("Action", limit.Action))
-
 	if limit.Action != pb.PieceAction_GET && limit.Action != pb.PieceAction_GET_REPAIR && limit.Action != pb.PieceAction_GET_AUDIT {
 		return rpcstatus.Errorf(rpcstatus.InvalidArgument,
 			"expected get or get repair or audit action got %v", limit.Action)
@@ -552,7 +457,11 @@ func (endpoint *Endpoint) doDownload(stream downloadStream) (err error) {
 			"requested more that order limit allows, limit=%v requested=%v", limit.Limit, chunk.ChunkSize)
 	}
 
+	endpoint.log.Info("download started", zap.Stringer("Piece ID", limit.PieceId), zap.Stringer("Satellite ID", limit.SatelliteId), zap.Stringer("Action", limit.Action))
+
 	if err := endpoint.verifyOrderLimit(ctx, limit); err != nil {
+		mon.Meter("download_verify_orderlimit_failed").Mark(1)
+		endpoint.log.Error("download failed", zap.Stringer("Piece ID", limit.PieceId), zap.Stringer("Satellite ID", limit.SatelliteId), zap.Stringer("Action", limit.Action), zap.Error(err))
 		return err
 	}
 
@@ -569,12 +478,18 @@ func (endpoint *Endpoint) doDownload(stream downloadStream) (err error) {
 			downloadRate = float64(downloadSize) / dt.Seconds()
 		}
 		downloadDuration := dt.Nanoseconds()
-		if err != nil {
+		if errs2.IsCanceled(err) {
+			mon.Meter("download_cancel_byte_meter").Mark64(downloadSize)
+			mon.IntVal("download_cancel_size_bytes").Observe(downloadSize)
+			mon.IntVal("download_cancel_duration_ns").Observe(downloadDuration)
+			mon.FloatVal("download_cancel_rate_bytes_per_sec").Observe(downloadRate)
+			endpoint.log.Info("download canceled", zap.Stringer("Piece ID", limit.PieceId), zap.Stringer("Satellite ID", limit.SatelliteId), zap.Stringer("Action", limit.Action))
+		} else if err != nil {
 			mon.Meter("download_failure_byte_meter").Mark64(downloadSize)
 			mon.IntVal("download_failure_size_bytes").Observe(downloadSize)
 			mon.IntVal("download_failure_duration_ns").Observe(downloadDuration)
 			mon.FloatVal("download_failure_rate_bytes_per_sec").Observe(downloadRate)
-			endpoint.log.Info("download failed", zap.Stringer("Piece ID", limit.PieceId), zap.Stringer("Satellite ID", limit.SatelliteId), zap.Stringer("Action", limit.Action), zap.Error(err))
+			endpoint.log.Error("download failed", zap.Stringer("Piece ID", limit.PieceId), zap.Stringer("Satellite ID", limit.SatelliteId), zap.Stringer("Action", limit.Action), zap.Error(err))
 		} else {
 			mon.Meter("download_success_byte_meter").Mark64(downloadSize)
 			mon.IntVal("download_success_size_bytes").Observe(downloadSize)
@@ -587,6 +502,7 @@ func (endpoint *Endpoint) doDownload(stream downloadStream) (err error) {
 	pieceReader, err = endpoint.store.Reader(ctx, limit.SatelliteId, limit.PieceId)
 	if err != nil {
 		if os.IsNotExist(err) {
+			endpoint.monitor.VerifyDirReadableLoop.TriggerWait()
 			return rpcstatus.Wrap(rpcstatus.NotFound, err)
 		}
 		return rpcstatus.Wrap(rpcstatus.Internal, err)
@@ -594,6 +510,9 @@ func (endpoint *Endpoint) doDownload(stream downloadStream) (err error) {
 	defer func() {
 		err := pieceReader.Close() // similarly how transcation Rollback works
 		if err != nil {
+			if errs2.IsCanceled(err) {
+				return
+			}
 			// no reason to report this error to the uplink
 			endpoint.log.Error("failed to close piece reader", zap.Error(err))
 		}
@@ -622,12 +541,6 @@ func (endpoint *Endpoint) doDownload(stream downloadStream) (err error) {
 		return rpcstatus.Errorf(rpcstatus.InvalidArgument,
 			"requested more data than available, requesting=%v available=%v",
 			chunk.Offset+chunk.ChunkSize, pieceReader.Size())
-	}
-
-	availableBandwidth, err := endpoint.monitor.AvailableBandwidth(ctx)
-	if err != nil {
-		endpoint.log.Error("error getting available bandwidth", zap.Error(err))
-		return rpcstatus.Wrap(rpcstatus.Internal, err)
 	}
 
 	throttle := sync2.NewThrottle()
@@ -687,8 +600,12 @@ func (endpoint *Endpoint) doDownload(stream downloadStream) (err error) {
 	})
 
 	recvErr := func() (err error) {
+		commitOrderToStore, err := endpoint.beginSaveOrder(limit)
+		if err != nil {
+			return err
+		}
 		largestOrder := pb.Order{}
-		defer endpoint.saveOrder(ctx, limit, &largestOrder)
+		defer commitOrderToStore(ctx, &largestOrder)
 
 		// ensure that we always terminate sending goroutine
 		defer throttle.Fail(io.EOF)
@@ -705,7 +622,6 @@ func (endpoint *Endpoint) doDownload(stream downloadStream) (err error) {
 				return nil
 			}
 			if errs2.IsCanceled(err) {
-				endpoint.log.Debug("client canceled connection")
 				return nil
 			}
 			if err != nil {
@@ -721,11 +637,6 @@ func (endpoint *Endpoint) doDownload(stream downloadStream) (err error) {
 			}
 
 			chunkSize := message.Order.Amount - largestOrder.Amount
-			availableBandwidth -= chunkSize
-			if availableBandwidth < 0 {
-				return rpcstatus.Error(rpcstatus.ResourceExhausted, "out of bandwidth")
-			}
-
 			if err := throttle.Produce(chunkSize); err != nil {
 				// shouldn't happen since only receiving side is calling Fail
 				return rpcstatus.Wrap(rpcstatus.Internal, err)
@@ -739,33 +650,45 @@ func (endpoint *Endpoint) doDownload(stream downloadStream) (err error) {
 	return rpcstatus.Wrap(rpcstatus.Internal, errs.Combine(sendErr, recvErr))
 }
 
-// saveOrder saves the order with all necessary information. It assumes it has been already verified.
-func (endpoint *Endpoint) saveOrder(ctx context.Context, limit *pb.OrderLimit, order *pb.Order) {
-	// We always want to save order to the database to be able to settle.
-	ctx = context2.WithoutCancellation(ctx)
+// beginSaveOrder saves the order with all necessary information. It assumes it has been already verified.
+func (endpoint *Endpoint) beginSaveOrder(limit *pb.OrderLimit) (_commit func(ctx context.Context, order *pb.Order), err error) {
+	defer mon.Task()(nil)(&err)
 
-	var err error
-	defer mon.Task()(&ctx)(&err)
-
-	// TODO: do this in a goroutine
-	if order == nil || order.Amount <= 0 {
-		return
-	}
-	err = endpoint.orders.Enqueue(ctx, &orders.Info{
-		Limit: limit,
-		Order: order,
-	})
+	commit, err := endpoint.ordersStore.BeginEnqueue(limit.SatelliteId, limit.OrderCreation)
 	if err != nil {
-		endpoint.log.Error("failed to add order", zap.Error(err))
-	} else {
-		err = endpoint.usage.Add(ctx, limit.SatelliteId, limit.Action, order.Amount, time.Now())
-		if err != nil {
-			endpoint.log.Error("failed to add bandwidth usage", zap.Error(err))
-		}
+		return nil, err
 	}
+
+	done := false
+	return func(ctx context.Context, order *pb.Order) {
+		if done {
+			return
+		}
+		done = true
+
+		if order == nil || order.Amount <= 0 {
+			// free unsent orders file for sending without writing anything
+			err = commit(nil)
+			if err != nil {
+				endpoint.log.Error("failed to unlock orders file", zap.Error(err))
+			}
+			return
+		}
+
+		err = commit(&ordersfile.Info{Limit: limit, Order: order})
+		if err != nil {
+			endpoint.log.Error("failed to add order", zap.Error(err))
+		} else {
+			// We always want to save order to the database to be able to settle.
+			err = endpoint.usage.Add(context2.WithoutCancellation(ctx), limit.SatelliteId, limit.Action, order.Amount, time.Now())
+			if err != nil {
+				endpoint.log.Error("failed to add bandwidth usage", zap.Error(err))
+			}
+		}
+	}, nil
 }
 
-// RestoreTrash restores all trashed items for the satellite issuing the call
+// RestoreTrash restores all trashed items for the satellite issuing the call.
 func (endpoint *Endpoint) RestoreTrash(ctx context.Context, restoreTrashReq *pb.RestoreTrashRequest) (res *pb.RestoreTrashResponse, err error) {
 	defer mon.Task()(&ctx)(&err)
 
@@ -787,7 +710,7 @@ func (endpoint *Endpoint) RestoreTrash(ctx context.Context, restoreTrashReq *pb.
 	return &pb.RestoreTrashResponse{}, nil
 }
 
-// Retain keeps only piece ids specified in the request
+// Retain keeps only piece ids specified in the request.
 func (endpoint *Endpoint) Retain(ctx context.Context, retainReq *pb.RetainRequest) (res *pb.RetainResponse, err error) {
 	defer mon.Task()(&ctx)(&err)
 
@@ -829,7 +752,7 @@ func (endpoint *Endpoint) TestLiveRequestCount() int32 {
 	return atomic.LoadInt32(&endpoint.liveRequests)
 }
 
-// min finds the min of two values
+// min finds the min of two values.
 func min(a, b int64) int64 {
 	if a < b {
 		return a

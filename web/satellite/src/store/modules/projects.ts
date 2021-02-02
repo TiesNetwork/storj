@@ -2,13 +2,22 @@
 // See LICENSE for copying information.
 
 import { StoreModule } from '@/store';
-import { CreateProjectModel, Project, ProjectLimits, ProjectsApi, UpdateProjectModel } from '@/types/projects';
+import {
+    Project,
+    ProjectFields,
+    ProjectLimits,
+    ProjectsApi,
+    ProjectsCursor,
+    ProjectsPage,
+} from '@/types/projects';
 
 export const PROJECTS_ACTIONS = {
     FETCH: 'fetchProjects',
+    FETCH_OWNED: 'fetchOwnedProjects',
     CREATE: 'createProject',
     SELECT: 'selectProject',
-    UPDATE: 'updateProject',
+    UPDATE_NAME: 'updateProjectName',
+    UPDATE_DESCRIPTION: 'updateProjectDescription',
     DELETE: 'deleteProject',
     CLEAR: 'clearProjects',
     GET_LIMITS: 'getProjectLimits',
@@ -17,49 +26,60 @@ export const PROJECTS_ACTIONS = {
 export const PROJECTS_MUTATIONS = {
     ADD: 'CREATE_PROJECT',
     REMOVE: 'DELETE_PROJECT',
-    UPDATE_PROJECT: 'UPDATE_PROJECT',
+    UPDATE_PROJECT_NAME: 'UPDATE_PROJECT_NAME',
+    UPDATE_PROJECT_DESCRIPTION: 'UPDATE_PROJECT_DESCRIPTION',
     SET_PROJECTS: 'SET_PROJECTS',
     SELECT_PROJECT: 'SELECT_PROJECT',
     CLEAR_PROJECTS: 'CLEAR_PROJECTS',
     SET_LIMITS: 'SET_PROJECT_LIMITS',
+    SET_PAGE_NUMBER: 'SET_PAGE_NUMBER',
+    SET_PAGE: 'SET_PAGE',
 };
 
-const defaultSelectedProject = new Project('', '', '', '', '', true);
+const defaultSelectedProject = new Project('', '', '', '', '', true, 0);
 
 export class ProjectsState {
     public projects: Project[] = [];
     public selectedProject: Project = defaultSelectedProject;
     public currentLimits: ProjectLimits = new ProjectLimits();
+    public cursor: ProjectsCursor = new ProjectsCursor();
+    public page: ProjectsPage = new ProjectsPage();
 }
 
 const {
     FETCH,
     CREATE,
     SELECT,
-    UPDATE,
+    UPDATE_NAME,
+    UPDATE_DESCRIPTION,
     DELETE,
     CLEAR,
     GET_LIMITS,
+    FETCH_OWNED,
 } = PROJECTS_ACTIONS;
 
 const {
     ADD,
     REMOVE,
-    UPDATE_PROJECT,
+    UPDATE_PROJECT_NAME,
+    UPDATE_PROJECT_DESCRIPTION,
     SET_PROJECTS,
     SELECT_PROJECT,
     CLEAR_PROJECTS,
     SET_LIMITS,
+    SET_PAGE_NUMBER,
+    SET_PAGE,
 } = PROJECTS_MUTATIONS;
+const projectsPageLimit = 7;
 
 export function makeProjectsModule(api: ProjectsApi): StoreModule<ProjectsState> {
     return {
         state: new ProjectsState(),
         mutations: {
-            [ADD](state: any, createdProject: Project): void {
+            [ADD](state: ProjectsState, createdProject: Project): void {
                 state.projects.push(createdProject);
             },
-            [SET_PROJECTS](state: any, projects: Project[]): void {
+            [SET_PROJECTS](state: ProjectsState, projects: Project[]): void {
                 state.projects = projects;
 
                 if (!state.selectedProject.id) {
@@ -82,8 +102,8 @@ export function makeProjectsModule(api: ProjectsApi): StoreModule<ProjectsState>
 
                 state.selectedProject = defaultSelectedProject;
             },
-            [SELECT_PROJECT](state: any, projectID: string): void {
-                const selected = state.projects.find((project: any) => project.id === projectID);
+            [SELECT_PROJECT](state: ProjectsState, projectID: string): void {
+                const selected = state.projects.find((project: Project) => project.id === projectID);
 
                 if (!selected) {
                     return;
@@ -91,15 +111,13 @@ export function makeProjectsModule(api: ProjectsApi): StoreModule<ProjectsState>
 
                 state.selectedProject = selected;
             },
-            [UPDATE_PROJECT](state: any, updateProjectModel: UpdateProjectModel): void {
-                const selected = state.projects.find((project: any) => project.id === updateProjectModel.id);
-                if (!selected) {
-                    return;
-                }
-
-                selected.description = updateProjectModel.description;
+            [UPDATE_PROJECT_NAME](state: ProjectsState, fieldsToUpdate: ProjectFields): void {
+                state.selectedProject.name = fieldsToUpdate.name;
             },
-            [REMOVE](state: any, projectID: string): void {
+            [UPDATE_PROJECT_DESCRIPTION](state: ProjectsState, fieldsToUpdate: ProjectFields): void {
+                state.selectedProject.description = fieldsToUpdate.description;
+            },
+            [REMOVE](state: ProjectsState, projectID: string): void {
                 state.projects = state.projects.filter(project => project.id !== projectID);
 
                 if (state.selectedProject.id === projectID) {
@@ -114,6 +132,13 @@ export function makeProjectsModule(api: ProjectsApi): StoreModule<ProjectsState>
                 state.selectedProject = defaultSelectedProject;
                 state.currentLimits = new ProjectLimits();
             },
+            [SET_PAGE_NUMBER](state: ProjectsState, pageNumber: number) {
+                state.cursor.page = pageNumber;
+                state.cursor.limit = projectsPageLimit;
+            },
+            [SET_PAGE](state: ProjectsState, page: ProjectsPage) {
+                state.page = page;
+            },
         },
         actions: {
             [FETCH]: async function ({commit}: any): Promise<Project[]> {
@@ -123,8 +148,16 @@ export function makeProjectsModule(api: ProjectsApi): StoreModule<ProjectsState>
 
                 return projects;
             },
-            [CREATE]: async function ({commit}: any, createProjectModel: CreateProjectModel): Promise<Project> {
-                const project = await api.create(createProjectModel);
+            [FETCH_OWNED]: async function ({commit, state}, pageNumber: number): Promise<ProjectsPage> {
+                commit(SET_PAGE_NUMBER, pageNumber);
+
+                const projectsPage: ProjectsPage = await api.getOwnedProjects(state.cursor);
+                commit(SET_PAGE, projectsPage);
+
+                return projectsPage;
+            },
+            [CREATE]: async function ({commit}: any, createProjectFields: ProjectFields): Promise<Project> {
+                const project = await api.create(createProjectFields);
 
                 commit(ADD, project);
 
@@ -133,10 +166,15 @@ export function makeProjectsModule(api: ProjectsApi): StoreModule<ProjectsState>
             [SELECT]: function ({commit}: any, projectID: string): void {
                 commit(SELECT_PROJECT, projectID);
             },
-            [UPDATE]: async function ({commit}: any, updateProjectModel: UpdateProjectModel): Promise<void> {
-                await api.update(updateProjectModel.id, updateProjectModel.description);
+            [UPDATE_NAME]: async function ({commit, state}: any, fieldsToUpdate: ProjectFields): Promise<void> {
+                await api.update(state.selectedProject.id, fieldsToUpdate.name, state.selectedProject.description);
 
-                commit(UPDATE_PROJECT, updateProjectModel);
+                commit(UPDATE_PROJECT_NAME, fieldsToUpdate);
+            },
+            [UPDATE_DESCRIPTION]: async function ({commit, state}: any, fieldsToUpdate: ProjectFields): Promise<void> {
+                await api.update(state.selectedProject.id, state.selectedProject.name, fieldsToUpdate.description);
+
+                commit(UPDATE_PROJECT_DESCRIPTION, fieldsToUpdate);
             },
             [DELETE]: async function ({commit}: any, projectID: string): Promise<void> {
                 await api.delete(projectID);
@@ -155,8 +193,8 @@ export function makeProjectsModule(api: ProjectsApi): StoreModule<ProjectsState>
             },
         },
         getters: {
-            projects: (state: any): Project[] => {
-                return state.projects.map((project: any) => {
+            projects: (state: ProjectsState): Project[] => {
+                return state.projects.map((project: Project) => {
                     if (project.id === state.selectedProject.id) {
                         project.isSelected = true;
                     }
@@ -164,7 +202,23 @@ export function makeProjectsModule(api: ProjectsApi): StoreModule<ProjectsState>
                     return project;
                 });
             },
-            selectedProject: (state: any): Project => state.selectedProject,
+            projectsWithoutSelected: (state: ProjectsState): Project[] => {
+                return state.projects.filter((project: Project) => {
+                    return project.id !== state.selectedProject.id;
+                });
+            },
+            selectedProject: (state: ProjectsState): Project => state.selectedProject,
+            projectsCount: (state: ProjectsState, getters: any): number => {
+                let projectsCount: number = 0;
+
+                state.projects.forEach((project: Project) => {
+                    if (project.ownerId === getters.user.id) {
+                        projectsCount++;
+                    }
+                });
+
+                return projectsCount;
+            },
         },
     };
 }

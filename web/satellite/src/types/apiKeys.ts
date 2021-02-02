@@ -6,7 +6,7 @@ import { SortDirection } from '@/types/common';
 export type OnHeaderClickCallback = (sortBy: ApiKeyOrderBy, sortDirection: SortDirection) => Promise<void>;
 
 /**
- * Exposes all apiKey-related functionality
+ * Exposes all apiKey-related functionality.
  */
 export interface ApiKeysApi {
     /**
@@ -34,23 +34,30 @@ export interface ApiKeysApi {
     delete(ids: string[]): Promise<void>;
 }
 
+/**
+ * Holds api keys sorting parameters.
+ */
 export enum ApiKeyOrderBy {
     NAME = 1,
     CREATED_AT,
 }
 
-// ApiKeyCursor is a type, used to describe paged api keys list
+/**
+ * ApiKeyCursor is a type, used to describe paged api keys list.
+  */
 export class ApiKeyCursor {
     public constructor(
         public search: string = '',
         public limit: number = 6,
         public page: number = 1,
         public order: ApiKeyOrderBy = ApiKeyOrderBy.NAME,
-        public orderDirection: SortDirection = SortDirection.ASCENDING) {
-    }
+        public orderDirection: SortDirection = SortDirection.ASCENDING,
+    ) {}
 }
 
-// ApiKeysPage is a type, used to describe paged api keys list
+/**
+ * ApiKeysPage is a type, used to describe paged api keys list.
+ */
 export class ApiKeysPage {
     public constructor(
         public apiKeys: ApiKey[] = [],
@@ -60,44 +67,29 @@ export class ApiKeysPage {
         public limit: number = 6,
         public pageCount: number = 0,
         public currentPage: number = 1,
-        public totalCount: number = 0) {
-    }
+        public totalCount: number = 0,
+    ) {}
 }
 
 /**
  * ApiKey class holds info for ApiKeys entity.
  */
 export class ApiKey {
-    public id: string;
-    public secret: string;
-    public name: string;
-    public createdAt: string;
-    public isSelected: boolean = false;
+    public isSelected: boolean;
 
-    constructor(id: string, name: string, createdAt: string, secret: string) {
-        this.id = id || '';
-        this.name = name || '';
-        this.createdAt = createdAt || '';
-        this.secret = secret || '';
-
+    constructor(
+        public id: string = '',
+        public name: string = '',
+        public createdAt: Date = new Date(),
+        public secret: string = '',
+    ) {
         this.isSelected = false;
     }
 
-    public formattedName(): string {
-        const name = this.name;
-
-        if (name.length < 12) {
-            return name;
-        }
-
-        return name.slice(0, 12) + '...';
-    }
-
-    public getDate(): string {
-        if (!this.createdAt) {
-            return '';
-        }
-
-        return new Date(this.createdAt).toLocaleDateString();
+    /**
+     * Returns created date as a local date string.
+     */
+    public localDate(): string {
+        return this.createdAt.toLocaleDateString();
     }
 }

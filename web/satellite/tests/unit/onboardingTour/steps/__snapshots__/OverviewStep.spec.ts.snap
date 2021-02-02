@@ -1,0 +1,53 @@
+// Jest Snapshot v1, https://goo.gl/fbAQLP
+
+exports[`OverviewStep.vue renders correctly 1`] = `
+<div class="overview-area">
+  <h1 class="overview-area__title">
+    Welcome to Storj.
+    <br>
+    Let’s Get Started.
+  </h1>
+  <p class="overview-area__sub-title">
+    Follow the docs to start storing data using method below.
+  </p>
+  <div class="overview-area__steps-area">
+    <div class="overview-area__steps-area__step"><img src="@/../static/images/onboardingTour/cli.png" alt="cli image" class="overview-area__steps-area__step__image">
+      <h2 class="overview-area__steps-area__step__title">CLI Tool</h2>
+      <p class="overview-area__steps-area__step__info">
+        Quickly upload data directly through the command line interface.
+      </p> <a href="https://documentation.storj.io/setup/cli" target="_blank" class="overview-area__steps-area__step__link">
+        CLI Docs &gt;
+      </a>
+    </div>
+  </div>
+  <div class="overview-area__divider"></div>
+  <p class="overview-area__next-label">Next</p>
+  <div class="overview-area__cta container" style="width: 252px; height: 48px;"><span class="label">Add a Payment Method</span></div>
+</div>
+`;
+
+exports[`OverviewStep.vue renders correctly 2`] = `
+<div class="overview-area">
+  <h1 class="overview-area__title">
+    Welcome to Storj.
+    <br>
+    Let’s Get Started.
+  </h1>
+  <p class="overview-area__sub-title">
+    Follow the docs to start storing data using method below.
+  </p>
+  <div class="overview-area__steps-area">
+    <div class="overview-area__steps-area__step"><img src="@/../static/images/onboardingTour/cli.png" alt="cli image" class="overview-area__steps-area__step__image">
+      <h2 class="overview-area__steps-area__step__title">CLI Tool</h2>
+      <p class="overview-area__steps-area__step__info">
+        Quickly upload data directly through the command line interface.
+      </p> <a href="https://documentation.storj.io/setup/cli" target="_blank" class="overview-area__steps-area__step__link">
+        CLI Docs &gt;
+      </a>
+    </div>
+  </div>
+  <div class="overview-area__divider"></div>
+  <p class="overview-area__next-label">Next</p>
+  <div class="overview-area__cta container" style="width: 252px; height: 48px;"><span class="label">Create an Access Grant</span></div>
+</div>
+`;

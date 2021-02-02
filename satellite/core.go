@@ -20,31 +20,31 @@ import (
 	"storj.io/common/rpc"
 	"storj.io/common/signing"
 	"storj.io/common/storj"
-	"storj.io/storj/pkg/debug"
+	"storj.io/private/debug"
+	"storj.io/private/version"
 	"storj.io/storj/private/lifecycle"
-	"storj.io/storj/private/version"
 	version_checker "storj.io/storj/private/version/checker"
 	"storj.io/storj/satellite/accounting"
-	"storj.io/storj/satellite/accounting/reportedrollup"
+	"storj.io/storj/satellite/accounting/projectbwcleanup"
 	"storj.io/storj/satellite/accounting/rollup"
+	"storj.io/storj/satellite/accounting/rolluparchive"
 	"storj.io/storj/satellite/accounting/tally"
 	"storj.io/storj/satellite/audit"
 	"storj.io/storj/satellite/contact"
-	"storj.io/storj/satellite/dbcleanup"
-	"storj.io/storj/satellite/downtime"
 	"storj.io/storj/satellite/gc"
 	"storj.io/storj/satellite/gracefulexit"
 	"storj.io/storj/satellite/metainfo"
+	"storj.io/storj/satellite/metainfo/expireddeletion"
 	"storj.io/storj/satellite/metrics"
 	"storj.io/storj/satellite/orders"
 	"storj.io/storj/satellite/overlay"
+	"storj.io/storj/satellite/overlay/straynodes"
 	"storj.io/storj/satellite/payments"
-	"storj.io/storj/satellite/payments/mockpayments"
 	"storj.io/storj/satellite/payments/stripecoinpayments"
 	"storj.io/storj/satellite/repair/checker"
 )
 
-// Core is the satellite core process that runs chores
+// Core is the satellite core process that runs chores.
 //
 // architecture: Peer
 type Core struct {
@@ -58,7 +58,10 @@ type Core struct {
 
 	Dialer rpc.Dialer
 
-	Version *version_checker.Service
+	Version struct {
+		Chore   *version_checker.Chore
+		Service *version_checker.Service
+	}
 
 	Debug struct {
 		Listener net.Listener
@@ -71,8 +74,9 @@ type Core struct {
 	}
 
 	Overlay struct {
-		DB      overlay.DB
-		Service *overlay.Service
+		DB           overlay.DB
+		Service      *overlay.Service
+		DQStrayNodes *straynodes.Chore
 	}
 
 	Metainfo struct {
@@ -90,8 +94,9 @@ type Core struct {
 	Repair struct {
 		Checker *checker.Checker
 	}
+
 	Audit struct {
-		Queue    *audit.Queue
+		Queues   *audit.Queues
 		Worker   *audit.Worker
 		Chore    *audit.Chore
 		Verifier *audit.Verifier
@@ -102,15 +107,15 @@ type Core struct {
 		Service *gc.Service
 	}
 
-	DBCleanup struct {
-		Chore *dbcleanup.Chore
+	ExpiredDeletion struct {
+		Chore *expireddeletion.Chore
 	}
 
 	Accounting struct {
-		Tally               *tally.Service
-		Rollup              *rollup.Service
-		ProjectUsage        *accounting.Service
-		ReportedRollupChore *reportedrollup.Chore
+		Tally                 *tally.Service
+		Rollup                *rollup.Service
+		RollupArchiveChore    *rolluparchive.Chore
+		ProjectBWCleanupChore *projectbwcleanup.Chore
 	}
 
 	LiveAccounting struct {
@@ -129,19 +134,13 @@ type Core struct {
 	Metrics struct {
 		Chore *metrics.Chore
 	}
-
-	DowntimeTracking struct {
-		DetectionChore  *downtime.DetectionChore
-		EstimationChore *downtime.EstimationChore
-		Service         *downtime.Service
-	}
 }
 
-// New creates a new satellite
+// New creates a new satellite.
 func New(log *zap.Logger, full *identity.FullIdentity, db DB,
 	pointerDB metainfo.PointerDB, revocationDB extensions.RevocationDB, liveAccounting accounting.Cache,
 	rollupsWriteCache *orders.RollupsWriteCache,
-	versionInfo version.Info, config *Config) (*Core, error) {
+	versionInfo version.Info, config *Config, atomicLogLevel *zap.AtomicLevel) (*Core, error) {
 	peer := &Core{
 		Log:      log,
 		Identity: full,
@@ -163,7 +162,7 @@ func New(log *zap.Logger, full *identity.FullIdentity, db DB,
 		}
 		debugConfig := config.Debug
 		debugConfig.ControlTitle = "Core"
-		peer.Debug.Server = debug.NewServer(log.Named("debug"), peer.Debug.Listener, monkit.Default, debugConfig)
+		peer.Debug.Server = debug.NewServerWithAtomicLevel(log.Named("debug"), peer.Debug.Listener, monkit.Default, debugConfig, atomicLogLevel)
 		peer.Servers.Add(lifecycle.Item{
 			Name:  "debug",
 			Run:   peer.Debug.Server.Run,
@@ -174,20 +173,22 @@ func New(log *zap.Logger, full *identity.FullIdentity, db DB,
 	var err error
 
 	{ // setup version control
-		if !versionInfo.IsZero() {
-			peer.Log.Sugar().Debugf("Binary Version: %s with CommitHash %s, built at %s as Release %v",
-				versionInfo.Version.String(), versionInfo.CommitHash, versionInfo.Timestamp.String(), versionInfo.Release)
-		}
-		peer.Version = version_checker.NewService(log.Named("version"), config.Version, versionInfo, "Satellite")
+		peer.Log.Info("Version info",
+			zap.Stringer("Version", versionInfo.Version.Version),
+			zap.String("Commit Hash", versionInfo.CommitHash),
+			zap.Stringer("Build Timestamp", versionInfo.Timestamp),
+			zap.Bool("Release Build", versionInfo.Release),
+		)
+		peer.Version.Service = version_checker.NewService(log.Named("version"), config.Version, versionInfo, "Satellite")
+		peer.Version.Chore = version_checker.NewChore(peer.Version.Service, config.Version.CheckInterval)
 
 		peer.Services.Add(lifecycle.Item{
 			Name: "version",
-			Run:  peer.Version.Run,
+			Run:  peer.Version.Chore.Run,
 		})
 	}
 
 	{ // setup listener and server
-		log.Debug("Starting listener and server")
 		sc := config.Server
 
 		tlsOptions, err := tlsopts.NewOptions(peer.Identity, sc.Config, revocationDB)
@@ -214,7 +215,7 @@ func New(log *zap.Logger, full *identity.FullIdentity, db DB,
 			Type:    pb.NodeType_SATELLITE,
 			Version: *pbVersion,
 		}
-		peer.Contact.Service = contact.NewService(peer.Log.Named("contact:service"), self, peer.Overlay.Service, peer.DB.PeerIdentities(), peer.Dialer)
+		peer.Contact.Service = contact.NewService(peer.Log.Named("contact:service"), self, peer.Overlay.Service, peer.DB.PeerIdentities(), peer.Dialer, config.Contact.Timeout)
 		peer.Services.Add(lifecycle.Item{
 			Name:  "contact:service",
 			Close: peer.Contact.Service.Close,
@@ -222,24 +223,30 @@ func New(log *zap.Logger, full *identity.FullIdentity, db DB,
 	}
 
 	{ // setup overlay
-		peer.Overlay.DB = overlay.NewCombinedCache(peer.DB.OverlayCache())
-		peer.Overlay.Service = overlay.NewService(peer.Log.Named("overlay"), peer.Overlay.DB, config.Overlay)
+		peer.Overlay.DB = peer.DB.OverlayCache()
+		peer.Overlay.Service, err = overlay.NewService(peer.Log.Named("overlay"), peer.Overlay.DB, config.Overlay)
+		if err != nil {
+			return nil, errs.Combine(err, peer.Close())
+		}
 		peer.Services.Add(lifecycle.Item{
 			Name:  "overlay",
 			Close: peer.Overlay.Service.Close,
 		})
+
+		if config.StrayNodes.EnableDQ {
+			peer.Overlay.DQStrayNodes = straynodes.NewChore(peer.Log.Named("overlay:dq-stray-nodes"), peer.Overlay.DB, config.StrayNodes)
+			peer.Services.Add(lifecycle.Item{
+				Name:  "overlay:dq-stray-nodes",
+				Run:   peer.Overlay.DQStrayNodes.Run,
+				Close: peer.Overlay.DQStrayNodes.Close,
+			})
+			peer.Debug.Server.Panel.Add(
+				debug.Cycle("Overlay DQ Stray Nodes", peer.Overlay.DQStrayNodes.Loop))
+		}
 	}
 
 	{ // setup live accounting
 		peer.LiveAccounting.Cache = liveAccounting
-	}
-
-	{ // setup accounting project usage
-		peer.Accounting.ProjectUsage = accounting.NewService(
-			peer.DB.ProjectAccounting(),
-			peer.LiveAccounting.Cache,
-			config.Rollup.MaxAlphaUsage,
-		)
 	}
 
 	{ // setup orders
@@ -250,19 +257,18 @@ func New(log *zap.Logger, full *identity.FullIdentity, db DB,
 			Run:   peer.Orders.Chore.Run,
 			Close: peer.Orders.Chore.Close,
 		})
-		peer.Orders.Service = orders.NewService(
+		var err error
+		peer.Orders.Service, err = orders.NewService(
 			peer.Log.Named("orders:service"),
 			signing.SignerFromFullIdentity(peer.Identity),
 			peer.Overlay.Service,
 			peer.Orders.DB,
-			config.Orders.Expiration,
-			&pb.NodeAddress{
-				Transport: pb.NodeTransport_TCP_TLS_GRPC,
-				Address:   config.Contact.ExternalAddress,
-			},
-			config.Repairer.MaxExcessRateOptimalThreshold,
-			config.Orders.NodeStatusLogging,
+			peer.DB.Buckets(),
+			config.Orders,
 		)
+		if err != nil {
+			return nil, errs.Combine(err, peer.Close())
+		}
 	}
 
 	{ // setup metainfo
@@ -303,7 +309,7 @@ func New(log *zap.Logger, full *identity.FullIdentity, db DB,
 	{ // setup audit
 		config := config.Audit
 
-		peer.Audit.Queue = &audit.Queue{}
+		peer.Audit.Queues = audit.NewQueues()
 
 		peer.Audit.Verifier = audit.NewVerifier(log.Named("audit:verifier"),
 			peer.Metainfo.Service,
@@ -324,7 +330,7 @@ func New(log *zap.Logger, full *identity.FullIdentity, db DB,
 		)
 
 		peer.Audit.Worker, err = audit.NewWorker(peer.Log.Named("audit:worker"),
-			peer.Audit.Queue,
+			peer.Audit.Queues,
 			peer.Audit.Verifier,
 			peer.Audit.Reporter,
 			config,
@@ -342,7 +348,7 @@ func New(log *zap.Logger, full *identity.FullIdentity, db DB,
 		}
 
 		peer.Audit.Chore = audit.NewChore(peer.Log.Named("audit:chore"),
-			peer.Audit.Queue,
+			peer.Audit.Queues,
 			peer.Metainfo.Loop,
 			config,
 		)
@@ -355,31 +361,37 @@ func New(log *zap.Logger, full *identity.FullIdentity, db DB,
 			debug.Cycle("Audit Chore", peer.Audit.Chore.Loop))
 	}
 
-	{ // setup garbage collection
-		peer.GarbageCollection.Service = gc.NewService(
-			peer.Log.Named("garbage-collection"),
-			config.GarbageCollection,
-			peer.Dialer,
-			peer.Overlay.DB,
+	{ // setup garbage collection if configured to run with the core
+		if config.GarbageCollection.RunInCore {
+			peer.GarbageCollection.Service = gc.NewService(
+				peer.Log.Named("core-garbage-collection"),
+				config.GarbageCollection,
+				peer.Dialer,
+				peer.Overlay.DB,
+				peer.Metainfo.Loop,
+			)
+			peer.Services.Add(lifecycle.Item{
+				Name: "core-garbage-collection",
+				Run:  peer.GarbageCollection.Service.Run,
+			})
+			peer.Debug.Server.Panel.Add(
+				debug.Cycle("Core Garbage Collection", peer.GarbageCollection.Service.Loop))
+		}
+	}
+
+	{ // setup expired segment cleanup
+		peer.ExpiredDeletion.Chore = expireddeletion.NewChore(
+			peer.Log.Named("core-expired-deletion"),
+			config.ExpiredDeletion,
+			peer.Metainfo.Service,
 			peer.Metainfo.Loop,
 		)
 		peer.Services.Add(lifecycle.Item{
-			Name: "garbage-collection",
-			Run:  peer.GarbageCollection.Service.Run,
+			Name: "expireddeletion:chore",
+			Run:  peer.ExpiredDeletion.Chore.Run,
 		})
 		peer.Debug.Server.Panel.Add(
-			debug.Cycle("Garbage Collection", peer.GarbageCollection.Service.Loop))
-	}
-
-	{ // setup db cleanup
-		peer.DBCleanup.Chore = dbcleanup.NewChore(peer.Log.Named("dbcleanup"), peer.DB.Orders(), config.DBCleanup)
-		peer.Services.Add(lifecycle.Item{
-			Name:  "dbcleanup",
-			Run:   peer.DBCleanup.Chore.Run,
-			Close: peer.DBCleanup.Chore.Close,
-		})
-		peer.Debug.Server.Panel.Add(
-			debug.Cycle("DB Cleanup Serials", peer.DBCleanup.Chore.Serials))
+			debug.Cycle("Expired Segments Chore", peer.ExpiredDeletion.Chore.Loop))
 	}
 
 	{ // setup accounting
@@ -392,7 +404,9 @@ func New(log *zap.Logger, full *identity.FullIdentity, db DB,
 		peer.Debug.Server.Panel.Add(
 			debug.Cycle("Accounting Tally", peer.Accounting.Tally.Loop))
 
-		peer.Accounting.Rollup = rollup.New(peer.Log.Named("accounting:rollup"), peer.DB.StoragenodeAccounting(), config.Rollup.Interval, config.Rollup.DeleteTallies)
+		// Lets add 1 more day so we catch any off by one errors when deleting tallies
+		orderExpirationPlusDay := config.Orders.Expiration + config.Rollup.Interval
+		peer.Accounting.Rollup = rollup.New(peer.Log.Named("accounting:rollup"), peer.DB.StoragenodeAccounting(), config.Rollup.Interval, config.Rollup.DeleteTallies, orderExpirationPlusDay)
 		peer.Services.Add(lifecycle.Item{
 			Name:  "accounting:rollup",
 			Run:   peer.Accounting.Rollup.Run,
@@ -401,57 +415,81 @@ func New(log *zap.Logger, full *identity.FullIdentity, db DB,
 		peer.Debug.Server.Panel.Add(
 			debug.Cycle("Accounting Rollup", peer.Accounting.Rollup.Loop))
 
-		peer.Accounting.ReportedRollupChore = reportedrollup.NewChore(peer.Log.Named("accounting:reported-rollup"), peer.DB.Orders(), config.ReportedRollup)
+		peer.Accounting.ProjectBWCleanupChore = projectbwcleanup.NewChore(peer.Log.Named("accounting:chore"), peer.DB.ProjectAccounting(), config.ProjectBWCleanup)
 		peer.Services.Add(lifecycle.Item{
-			Name:  "accounting:reported-rollup",
-			Run:   peer.Accounting.ReportedRollupChore.Run,
-			Close: peer.Accounting.ReportedRollupChore.Close,
+			Name:  "accounting:project-bw-rollup",
+			Run:   peer.Accounting.ProjectBWCleanupChore.Run,
+			Close: peer.Accounting.ProjectBWCleanupChore.Close,
 		})
 		peer.Debug.Server.Panel.Add(
-			debug.Cycle("Accounting Reported Rollup", peer.Accounting.ReportedRollupChore.Loop))
+			debug.Cycle("Accounting Project Bandwidth Rollup", peer.Accounting.ProjectBWCleanupChore.Loop))
+
+		if config.RollupArchive.Enabled {
+			peer.Accounting.RollupArchiveChore = rolluparchive.New(peer.Log.Named("accounting:rollup-archive"), peer.DB.StoragenodeAccounting(), peer.DB.ProjectAccounting(), config.RollupArchive)
+			peer.Services.Add(lifecycle.Item{
+				Name:  "accounting:rollup-archive",
+				Run:   peer.Accounting.RollupArchiveChore.Run,
+				Close: peer.Accounting.RollupArchiveChore.Close,
+			})
+			peer.Debug.Server.Panel.Add(
+				debug.Cycle("Accounting Rollup Archive", peer.Accounting.RollupArchiveChore.Loop))
+		} else {
+			peer.Log.Named("rolluparchive").Info("disabled")
+		}
 	}
 
 	// TODO: remove in future, should be in API
 	{ // setup payments
 		pc := config.Payments
 
+		var stripeClient stripecoinpayments.StripeClient
 		switch pc.Provider {
 		default:
-			peer.Payments.Accounts = mockpayments.Accounts()
+			stripeClient = stripecoinpayments.NewStripeMock(
+				peer.ID(),
+				peer.DB.StripeCoinPayments().Customers(),
+				peer.DB.Console().Users(),
+			)
 		case "stripecoinpayments":
-			service, err := stripecoinpayments.NewService(
-				peer.Log.Named("payments.stripe:service"),
-				pc.StripeCoinPayments,
-				peer.DB.StripeCoinPayments(),
-				peer.DB.Console().Projects(),
-				peer.DB.ProjectAccounting(),
-				pc.StorageTBPrice,
-				pc.EgressTBPrice,
-				pc.ObjectPrice,
-				pc.BonusRate)
-
-			if err != nil {
-				return nil, errs.Combine(err, peer.Close())
-			}
-
-			peer.Payments.Accounts = service.Accounts()
-
-			peer.Payments.Chore = stripecoinpayments.NewChore(
-				peer.Log.Named("payments.stripe:clearing"),
-				service,
-				pc.StripeCoinPayments.TransactionUpdateInterval,
-				pc.StripeCoinPayments.AccountBalanceUpdateInterval,
-			)
-			peer.Services.Add(lifecycle.Item{
-				Name: "payments.stripe:service",
-				Run:  peer.Payments.Chore.Run,
-			})
-			peer.Debug.Server.Panel.Add(
-				debug.Cycle("Payments Stripe Transactions", peer.Payments.Chore.TransactionCycle),
-				debug.Cycle("Payments Stripe Coupons", peer.Payments.Chore.CouponUsageCycle),
-				debug.Cycle("Payments Stripe Account Balance", peer.Payments.Chore.AccountBalanceCycle),
-			)
+			stripeClient = stripecoinpayments.NewStripeClient(log, pc.StripeCoinPayments)
 		}
+
+		service, err := stripecoinpayments.NewService(
+			peer.Log.Named("payments.stripe:service"),
+			stripeClient,
+			pc.StripeCoinPayments,
+			peer.DB.StripeCoinPayments(),
+			peer.DB.Console().Projects(),
+			peer.DB.ProjectAccounting(),
+			pc.StorageTBPrice,
+			pc.EgressTBPrice,
+			pc.ObjectPrice,
+			pc.BonusRate,
+			pc.CouponValue,
+			pc.CouponDuration,
+			pc.CouponProjectLimit,
+			pc.MinCoinPayment,
+			pc.PaywallProportion)
+		if err != nil {
+			return nil, errs.Combine(err, peer.Close())
+		}
+
+		peer.Payments.Accounts = service.Accounts()
+
+		peer.Payments.Chore = stripecoinpayments.NewChore(
+			peer.Log.Named("payments.stripe:clearing"),
+			service,
+			pc.StripeCoinPayments.TransactionUpdateInterval,
+			pc.StripeCoinPayments.AccountBalanceUpdateInterval,
+		)
+		peer.Services.Add(lifecycle.Item{
+			Name: "payments.stripe:service",
+			Run:  peer.Payments.Chore.Run,
+		})
+		peer.Debug.Server.Panel.Add(
+			debug.Cycle("Payments Stripe Transactions", peer.Payments.Chore.TransactionCycle),
+			debug.Cycle("Payments Stripe Account Balance", peer.Payments.Chore.AccountBalanceCycle),
+		)
 	}
 
 	{ // setup graceful exit
@@ -482,39 +520,6 @@ func New(log *zap.Logger, full *identity.FullIdentity, db DB,
 		})
 		peer.Debug.Server.Panel.Add(
 			debug.Cycle("Metrics", peer.Metrics.Chore.Loop))
-	}
-
-	{ // setup downtime tracking
-		peer.DowntimeTracking.Service = downtime.NewService(peer.Log.Named("downtime"), peer.Overlay.Service, peer.Contact.Service)
-
-		peer.DowntimeTracking.DetectionChore = downtime.NewDetectionChore(
-			peer.Log.Named("downtime:detection"),
-			config.Downtime,
-			peer.Overlay.Service,
-			peer.DowntimeTracking.Service,
-		)
-		peer.Services.Add(lifecycle.Item{
-			Name:  "downtime:detection",
-			Run:   peer.DowntimeTracking.DetectionChore.Run,
-			Close: peer.DowntimeTracking.DetectionChore.Close,
-		})
-		peer.Debug.Server.Panel.Add(
-			debug.Cycle("Downtime Detection", peer.DowntimeTracking.DetectionChore.Loop))
-
-		peer.DowntimeTracking.EstimationChore = downtime.NewEstimationChore(
-			peer.Log.Named("downtime:estimation"),
-			config.Downtime,
-			peer.Overlay.Service,
-			peer.DowntimeTracking.Service,
-			peer.DB.DowntimeTracking(),
-		)
-		peer.Services.Add(lifecycle.Item{
-			Name:  "downtime:estimation",
-			Run:   peer.DowntimeTracking.EstimationChore.Run,
-			Close: peer.DowntimeTracking.EstimationChore.Close,
-		})
-		peer.Debug.Server.Panel.Add(
-			debug.Cycle("Downtime Estimation", peer.DowntimeTracking.EstimationChore.Loop))
 	}
 
 	return peer, nil

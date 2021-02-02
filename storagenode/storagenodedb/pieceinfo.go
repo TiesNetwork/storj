@@ -8,7 +8,6 @@ import (
 	"os"
 	"time"
 
-	"github.com/gogo/protobuf/proto"
 	"github.com/zeebo/errs"
 
 	"storj.io/common/pb"
@@ -32,12 +31,12 @@ type v0PieceInfoDB struct {
 func (db *v0PieceInfoDB) Add(ctx context.Context, info *pieces.Info) (err error) {
 	defer mon.Task()(&ctx)(&err)
 
-	orderLimit, err := proto.Marshal(info.OrderLimit)
+	orderLimit, err := pb.Marshal(info.OrderLimit)
 	if err != nil {
 		return ErrPieceInfo.Wrap(err)
 	}
 
-	uplinkPieceHash, err := proto.Marshal(info.UplinkPieceHash)
+	uplinkPieceHash, err := pb.Marshal(info.UplinkPieceHash)
 	if err != nil {
 		return ErrPieceInfo.Wrap(err)
 	}
@@ -137,13 +136,13 @@ func (db *v0PieceInfoDB) Get(ctx context.Context, satelliteID storj.NodeID, piec
 	}
 
 	info.OrderLimit = &pb.OrderLimit{}
-	err = proto.Unmarshal(orderLimit, info.OrderLimit)
+	err = pb.Unmarshal(orderLimit, info.OrderLimit)
 	if err != nil {
 		return nil, ErrPieceInfo.Wrap(err)
 	}
 
 	info.UplinkPieceHash = &pb.PieceHash{}
-	err = proto.Unmarshal(uplinkPieceHash, info.UplinkPieceHash)
+	err = pb.Unmarshal(uplinkPieceHash, info.UplinkPieceHash)
 	if err != nil {
 		return nil, ErrPieceInfo.Wrap(err)
 	}
@@ -216,17 +215,17 @@ type v0StoredPieceAccess struct {
 	blobInfo       storage.BlobInfo
 }
 
-// PieceID returns the piece ID for the piece
+// PieceID returns the piece ID for the piece.
 func (v0Access v0StoredPieceAccess) PieceID() storj.PieceID {
 	return v0Access.pieceID
 }
 
-// Satellite returns the satellite ID that owns the piece
+// Satellite returns the satellite ID that owns the piece.
 func (v0Access v0StoredPieceAccess) Satellite() (storj.NodeID, error) {
 	return v0Access.satellite, nil
 }
 
-// BlobRef returns the relevant storage.BlobRef locator for the piece
+// BlobRef returns the relevant storage.BlobRef locator for the piece.
 func (v0Access v0StoredPieceAccess) BlobRef() storage.BlobRef {
 	return storage.BlobRef{
 		Namespace: v0Access.satellite.Bytes(),
@@ -248,7 +247,7 @@ func (v0Access v0StoredPieceAccess) fillInBlobAccess(ctx context.Context) error 
 	return nil
 }
 
-// Size gives the size of the piece, and the piece content size (not including the piece header, if applicable)
+// Size gives the size of the piece, and the piece content size (not including the piece header, if applicable).
 func (v0Access v0StoredPieceAccess) Size(ctx context.Context) (int64, int64, error) {
 	return v0Access.pieceSize, v0Access.pieceSize, nil
 }
@@ -266,7 +265,7 @@ func (v0Access v0StoredPieceAccess) ModTime(ctx context.Context) (time.Time, err
 	return v0Access.creationTime, nil
 }
 
-// FullPath gives the full path to the on-disk blob file
+// FullPath gives the full path to the on-disk blob file.
 func (v0Access v0StoredPieceAccess) FullPath(ctx context.Context) (string, error) {
 	if err := v0Access.fillInBlobAccess(ctx); err != nil {
 		return "", err
@@ -274,12 +273,12 @@ func (v0Access v0StoredPieceAccess) FullPath(ctx context.Context) (string, error
 	return v0Access.blobInfo.FullPath(ctx)
 }
 
-// StorageFormatVersion indicates the storage format version used to store the piece
+// StorageFormatVersion indicates the storage format version used to store the piece.
 func (v0Access v0StoredPieceAccess) StorageFormatVersion() storage.FormatVersion {
 	return filestore.FormatV0
 }
 
-// Stat does a stat on the on-disk blob file
+// Stat does a stat on the on-disk blob file.
 func (v0Access v0StoredPieceAccess) Stat(ctx context.Context) (os.FileInfo, error) {
 	if err := v0Access.fillInBlobAccess(ctx); err != nil {
 		return nil, err

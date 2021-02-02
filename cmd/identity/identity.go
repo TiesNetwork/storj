@@ -10,12 +10,12 @@ import (
 	"github.com/zeebo/errs"
 
 	"storj.io/common/identity"
-	"storj.io/storj/pkg/cfgstruct"
-	"storj.io/storj/pkg/process"
+	"storj.io/private/cfgstruct"
+	"storj.io/private/process"
 )
 
 var (
-	// ErrSetup is used when an error occurs while setting up
+	// ErrSetup is used when an error occurs while setting up.
 	ErrSetup = errs.Class("setup error")
 
 	idCmd = &cobra.Command{

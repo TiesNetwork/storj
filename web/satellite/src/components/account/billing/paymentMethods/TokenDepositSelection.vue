@@ -1,10 +1,11 @@
+import {PaymentsHistoryItemType} from "@/types/payments";
 // Copyright (C) 2019 Storj Labs, Inc.
 // See LICENSE for copying information.
 
 <template>
     <div class="form-container">
         <div class="selected-container" v-if="!isCustomAmount">
-            <div id="paymentSelectButton" class="selected-container__label-container" @click="open">
+            <div class="selected-container__label-container" @click="open">
                 <p class="selected-container__label-container__label">{{current.label}}</p>
                 <div class="selected-container__label-container__svg">
                     <svg width="14" height="8" viewBox="0 0 14 8" fill="none" xmlns="http://www.w3.org/2000/svg">
@@ -29,14 +30,14 @@
             </div>
         </label>
         <div
-            id="paymentSelect"
             class="options-container"
+            :class="{ 'top-expand': isExpandingTop }"
             v-if="isSelectionShown"
             v-click-outside="close"
         >
             <div
                 class="options-container__item"
-                v-for="option in paymentOptions"
+                v-for="option in options"
                 :key="option.label"
                 @click.prevent.stop="select(option)"
             >
@@ -63,77 +64,142 @@
 <script lang="ts">
 import { Component, Vue } from 'vue-property-decorator';
 
-import { PaymentAmountOption } from '@/types/payments';
+import { RouteConfig } from '@/router';
+import { PaymentAmountOption, PaymentsHistoryItem } from '@/types/payments';
 import { APP_STATE_ACTIONS } from '@/utils/constants/actionNames';
 
 @Component
 export default class TokenDepositSelection extends Vue {
     /**
-     * Set of default payment options
+     * Set of default payment options.
      */
     public paymentOptions: PaymentAmountOption[] = [
-        new PaymentAmountOption(20, `USD $20`),
-        new PaymentAmountOption(5, `USD $5`),
         new PaymentAmountOption(10, `USD $10`),
+        new PaymentAmountOption(20, `USD $20`),
+        new PaymentAmountOption(50, `USD $50`),
         new PaymentAmountOption(100, `USD $100`),
         new PaymentAmountOption(1000, `USD $1000`),
     ];
 
+    /**
+     * Set of payment options for the first ever transaction.
+     */
+    public initialPaymentOptions: PaymentAmountOption[] = [
+        new PaymentAmountOption(10, `USD $10`),
+        new PaymentAmountOption(20, `USD $20`),
+        new PaymentAmountOption(50, `USD $50`),
+        new PaymentAmountOption(100, `USD $100`),
+        new PaymentAmountOption(200, `USD $200`),
+    ];
+
+    /**
+     * current selected payment option from default ones.
+     */
     public current: PaymentAmountOption = this.paymentOptions[0];
     public customAmount: string = '';
+    /**
+     * Indicates if custom amount selection state is active.
+     */
     public isCustomAmount = false;
 
+    /**
+     * Indicates if concrete payment option is currently selected.
+     */
     public isOptionSelected(option: PaymentAmountOption): boolean {
-        return option.value === this.current.value && !this.isCustomAmount;
+        return (option.value === this.current.value) && !this.isCustomAmount;
     }
 
     /**
-     * isSelectionShown flag that indicate is token amount selection shown
+     * Indicates if dropdown expands top.
+     */
+    public get isExpandingTop(): boolean {
+        const hasNoTransactionsOrDepositBonuses: boolean =
+            !this.$store.state.paymentsModule.paymentsHistory.some((item: PaymentsHistoryItem) => item.isTransactionOrDeposit(),
+        );
+
+        return hasNoTransactionsOrDepositBonuses && !this.isOnboardingTour;
+    }
+
+    /**
+     * Returns payment options depending on user having his own project.
+     */
+    public get options(): PaymentAmountOption[] {
+        if (this.$store.getters.projectsCount === 0 && this.noCreditCards) {
+            return this.initialPaymentOptions;
+        }
+
+        return this.paymentOptions;
+    }
+
+    /**
+     * isSelectionShown flag that indicate is token amount selection shown.
      */
     public get isSelectionShown(): boolean {
         return this.$store.state.appStateModule.appState.isPaymentSelectionShown;
     }
 
     /**
-     * opens token amount selection
+     * opens token amount selection.
      */
     public open(): void {
         setTimeout(() => this.$store.dispatch(APP_STATE_ACTIONS.TOGGLE_PAYMENT_SELECTION, true), 0);
     }
 
     /**
-     * closes token amount selection
+     * closes token amount selection.
      */
     public close(): void {
-        this.$store.dispatch(APP_STATE_ACTIONS.TOGGLE_PAYMENT_SELECTION, false);
+        if (!this.isSelectionShown) return;
+
+        this.$store.dispatch(APP_STATE_ACTIONS.CLOSE_POPUPS);
     }
 
     /**
-     * onCustomAmountChange input event handle that emits value to parent component
+     * onCustomAmountChange input event handle that emits value to parent component.
      */
     public onCustomAmountChange(): void {
         this.$emit('onChangeTokenValue', parseInt(this.customAmount, 10));
     }
 
+    /**
+     * Sets view state to custom amount selection.
+     */
     public openCustomAmountSelection(): void {
         this.isCustomAmount = true;
         this.close();
         this.$emit('onChangeTokenValue', 0);
     }
 
+    /**
+     * Sets view state to default.
+     */
     public closeCustomAmountSelection(): void {
         this.open();
         this.$emit('onChangeTokenValue', this.current.value);
     }
 
     /**
-     * select standard value from list and emits it value to parent component
+     * select standard value from list and emits it value to parent component.
      */
     public select(option: PaymentAmountOption): void {
         this.isCustomAmount = false;
         this.current = option;
         this.$emit('onChangeTokenValue', option.value);
         this.close();
+    }
+
+    /**
+     * Indicates if user has no credit cards.
+     */
+    private get noCreditCards(): boolean {
+        return this.$store.state.paymentsModule.creditCards.length === 0;
+    }
+
+    /**
+     * Indicates if app state is in onboarding tour state.
+     */
+    private get isOnboardingTour(): boolean {
+        return this.$route.path.includes(RouteConfig.OnboardingTour.path);
     }
 }
 </script>
@@ -221,6 +287,7 @@ export default class TokenDepositSelection extends Vue {
 
             &__svg {
                 cursor: pointer;
+                min-height: 25px;
             }
         }
     }
@@ -235,7 +302,6 @@ export default class TokenDepositSelection extends Vue {
         color: #354049;
         background-color: white;
         z-index: 102;
-        margin: 0 10px 100px 0;
         border-radius: 12px;
         top: 50px;
         box-shadow: 0 4px 4px rgba(0, 0, 0, 0.25);
@@ -290,5 +356,10 @@ export default class TokenDepositSelection extends Vue {
         position: absolute;
         top: 0;
         left: 0;
+    }
+
+    .top-expand {
+        top: -290px;
+        box-shadow: 0 -1px 2px rgba(0, 0, 0, 0.25);
     }
 </style>

@@ -7,26 +7,27 @@ import (
 	"context"
 	"strconv"
 
-	"github.com/skyrings/skyring-common/tools/uuid"
 	"github.com/spacemonkeygo/monkit/v3"
 	"github.com/zeebo/errs"
 	"go.uber.org/zap"
 
 	"storj.io/common/pb"
 	"storj.io/common/storj"
+	"storj.io/common/uuid"
+	"storj.io/storj/satellite/internalpb"
 	"storj.io/storj/satellite/metainfo"
 	"storj.io/storj/satellite/overlay"
 )
 
 var (
 	mon = monkit.Package()
-	// Error wraps errors returned from Server struct methods
+	// Error wraps errors returned from Server struct methods.
 	Error = errs.Class("Endpoint error")
 )
 
 const lastSegmentIndex = int64(-1)
 
-// Endpoint for checking object and segment health
+// Endpoint for checking object and segment health.
 //
 // architecture: Endpoint
 type Endpoint struct {
@@ -35,7 +36,7 @@ type Endpoint struct {
 	metainfo *metainfo.Service
 }
 
-// NewEndpoint will initialize an Endpoint struct
+// NewEndpoint will initialize an Endpoint struct.
 func NewEndpoint(log *zap.Logger, cache *overlay.Service, metainfo *metainfo.Service) *Endpoint {
 	return &Endpoint{
 		log:      log,
@@ -44,11 +45,11 @@ func NewEndpoint(log *zap.Logger, cache *overlay.Service, metainfo *metainfo.Ser
 	}
 }
 
-// ObjectHealth will check the health of an object
-func (endpoint *Endpoint) ObjectHealth(ctx context.Context, in *pb.ObjectHealthRequest) (resp *pb.ObjectHealthResponse, err error) {
+// ObjectHealth will check the health of an object.
+func (endpoint *Endpoint) ObjectHealth(ctx context.Context, in *internalpb.ObjectHealthRequest) (resp *internalpb.ObjectHealthResponse, err error) {
 	defer mon.Task()(&ctx)(&err)
 
-	var segmentHealthResponses []*pb.SegmentHealth
+	var segmentHealthResponses []*internalpb.SegmentHealth
 	var redundancy *pb.RedundancyScheme
 
 	limit := int64(100)
@@ -76,7 +77,7 @@ func (endpoint *Endpoint) ObjectHealth(ctx context.Context, in *pb.ObjectHealthR
 			break
 		}
 
-		segment := &pb.SegmentHealthRequest{
+		segment := &internalpb.SegmentHealthRequest{
 			Bucket:        bucket,
 			EncryptedPath: encryptedPath,
 			SegmentIndex:  segmentIndex,
@@ -103,29 +104,29 @@ func (endpoint *Endpoint) ObjectHealth(ctx context.Context, in *pb.ObjectHealthR
 		segmentIndex++
 	}
 
-	return &pb.ObjectHealthResponse{
+	return &internalpb.ObjectHealthResponse{
 		Segments:   segmentHealthResponses,
 		Redundancy: redundancy,
 	}, nil
 }
 
-// SegmentHealth will check the health of a segment
-func (endpoint *Endpoint) SegmentHealth(ctx context.Context, in *pb.SegmentHealthRequest) (resp *pb.SegmentHealthResponse, err error) {
+// SegmentHealth will check the health of a segment.
+func (endpoint *Endpoint) SegmentHealth(ctx context.Context, in *internalpb.SegmentHealthRequest) (resp *internalpb.SegmentHealthResponse, err error) {
 	defer mon.Task()(&ctx)(&err)
 
-	health := &pb.SegmentHealth{}
+	health := &internalpb.SegmentHealth{}
 
-	projectID, err := uuid.Parse(string(in.GetProjectId()))
+	projectID, err := uuid.FromString(string(in.GetProjectId()))
 	if err != nil {
 		return nil, Error.Wrap(err)
 	}
 
-	path, err := metainfo.CreatePath(ctx, *projectID, in.GetSegmentIndex(), in.GetBucket(), in.GetEncryptedPath())
+	location, err := metainfo.CreatePath(ctx, projectID, in.GetSegmentIndex(), in.GetBucket(), in.GetEncryptedPath())
 	if err != nil {
 		return nil, Error.Wrap(err)
 	}
 
-	pointer, err := endpoint.metainfo.Get(ctx, path)
+	pointer, err := endpoint.metainfo.Get(ctx, location.Encode())
 	if err != nil {
 		return nil, Error.Wrap(err)
 	}
@@ -180,7 +181,7 @@ func (endpoint *Endpoint) SegmentHealth(ctx context.Context, in *pb.SegmentHealt
 		health.Segment = []byte("l")
 	}
 
-	return &pb.SegmentHealthResponse{
+	return &internalpb.SegmentHealthResponse{
 		Health:     health,
 		Redundancy: pointer.GetRemote().GetRedundancy(),
 	}, nil

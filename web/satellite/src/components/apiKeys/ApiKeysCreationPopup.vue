@@ -33,11 +33,14 @@ import VButton from '@/components/common/VButton.vue';
 
 import CloseCrossIcon from '@/../static/images/common/closeCross.svg';
 
+import { API_KEYS_ACTIONS } from '@/store/modules/apiKeys';
 import { ApiKey } from '@/types/apiKeys';
-import { API_KEYS_ACTIONS } from '@/utils/constants/actionNames';
 import { SegmentEvent } from '@/utils/constants/analyticsEventNames';
 
-const CREATE = API_KEYS_ACTIONS.CREATE;
+const {
+    CREATE,
+    FETCH,
+} = API_KEYS_ACTIONS;
 
 @Component({
     components: {
@@ -47,6 +50,9 @@ const CREATE = API_KEYS_ACTIONS.CREATE;
     },
 })
 export default class ApiKeysCreationPopup extends Vue {
+    /**
+     * Indicates if component should be rendered.
+     */
     @Prop({default: false})
     private readonly isPopupShown: boolean;
 
@@ -67,6 +73,9 @@ export default class ApiKeysCreationPopup extends Vue {
         this.$emit('closePopup');
     }
 
+    /**
+     * Creates api key.
+     */
     public async onNextClick(): Promise<void> {
         if (this.isLoading) {
             return;
@@ -101,7 +110,7 @@ export default class ApiKeysCreationPopup extends Vue {
         });
 
         try {
-            await this.$store.dispatch(API_KEYS_ACTIONS.FETCH, this.FIRST_PAGE);
+            await this.$store.dispatch(FETCH, this.FIRST_PAGE);
         } catch (error) {
             await this.$notify.error(`Unable to fetch API keys. ${error.message}`);
         }
@@ -127,7 +136,6 @@ export default class ApiKeysCreationPopup extends Vue {
             font-size: 24px;
             line-height: 29px;
             margin-bottom: 26px;
-            user-select: none;
         }
 
         .next-button {

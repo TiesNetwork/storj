@@ -29,7 +29,7 @@ import (
 
 type mockServer struct {
 	localTime time.Time
-	pb.NodeServer
+	pb.DRPCNodeServer
 }
 
 func TestLocalTime_InSync(t *testing.T) {
@@ -76,13 +76,14 @@ func TestLocalTime_OutOfSync(t *testing.T) {
 		var group errgroup.Group
 		defer ctx.Check(group.Wait)
 
-		contactServer, err := server.New(log, mockSatTLSOptions, config.Address, config.PrivateAddress, nil)
+		contactServer, err := server.New(log, mockSatTLSOptions, config)
 		require.NoError(t, err)
 		defer ctx.Check(contactServer.Close)
 
-		pb.DRPCRegisterNode(contactServer.DRPC(), &mockServer{
-			localTime: time.Now().UTC().Add(-25 * time.Minute),
+		err = pb.DRPCRegisterNode(contactServer.DRPC(), &mockServer{
+			localTime: time.Now().Add(-25 * time.Minute),
 		})
+		require.NoError(t, err)
 
 		group.Go(func() error {
 			return contactServer.Run(ctx)
@@ -131,13 +132,14 @@ func TestLocalTime_OutOfSync(t *testing.T) {
 		var group errgroup.Group
 		defer ctx.Check(group.Wait)
 
-		contactServer, err := server.New(log, mockSatTLSOptions, config.Address, config.PrivateAddress, nil)
+		contactServer, err := server.New(log, mockSatTLSOptions, config)
 		require.NoError(t, err)
 		defer ctx.Check(contactServer.Close)
 
-		pb.DRPCRegisterNode(contactServer.DRPC(), &mockServer{
-			localTime: time.Now().UTC().Add(-31 * time.Minute),
+		err = pb.DRPCRegisterNode(contactServer.DRPC(), &mockServer{
+			localTime: time.Now().Add(-31 * time.Minute),
 		})
+		require.NoError(t, err)
 
 		group.Go(func() error {
 			return contactServer.Run(ctx)

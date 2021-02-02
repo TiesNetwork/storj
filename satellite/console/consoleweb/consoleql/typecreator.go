@@ -11,16 +11,16 @@ import (
 	"storj.io/storj/satellite/mailservice"
 )
 
-// TypeCreator handles graphql type creation and error checking
+// TypeCreator handles graphql type creation and error checking.
 type TypeCreator struct {
 	query    *graphql.Object
 	mutation *graphql.Object
 
 	user              *graphql.Object
 	reward            *graphql.Object
-	creditUsage       *graphql.Object
 	project           *graphql.Object
 	projectUsage      *graphql.Object
+	projectsPage      *graphql.Object
 	bucketUsage       *graphql.Object
 	bucketUsagePage   *graphql.Object
 	projectMember     *graphql.Object
@@ -31,12 +31,13 @@ type TypeCreator struct {
 
 	userInput            *graphql.InputObject
 	projectInput         *graphql.InputObject
+	projectsCursor       *graphql.InputObject
 	bucketUsageCursor    *graphql.InputObject
 	projectMembersCursor *graphql.InputObject
 	apiKeysCursor        *graphql.InputObject
 }
 
-// Create create types and check for error
+// Create create types and check for error.
 func (c *TypeCreator) Create(log *zap.Logger, service *console.Service, mailService *mailservice.Service) error {
 	// inputs
 	c.userInput = graphqlUserInput()
@@ -72,11 +73,6 @@ func (c *TypeCreator) Create(log *zap.Logger, service *console.Service, mailServ
 
 	c.reward = graphqlReward()
 	if err := c.reward.Error(); err != nil {
-		return err
-	}
-
-	c.creditUsage = graphqlCreditUsage()
-	if err := c.creditUsage.Error(); err != nil {
 		return err
 	}
 
@@ -125,6 +121,16 @@ func (c *TypeCreator) Create(log *zap.Logger, service *console.Service, mailServ
 		return err
 	}
 
+	c.projectsCursor = graphqlProjectsCursor()
+	if err := c.projectsCursor.Error(); err != nil {
+		return err
+	}
+
+	c.projectsPage = graphqlProjectsPage(c)
+	if err := c.projectsPage.Error(); err != nil {
+		return err
+	}
+
 	// root objects
 	c.query = rootQuery(service, mailService, c)
 	if err := c.query.Error(); err != nil {
@@ -139,12 +145,12 @@ func (c *TypeCreator) Create(log *zap.Logger, service *console.Service, mailServ
 	return nil
 }
 
-// RootQuery returns instance of query *graphql.Object
+// RootQuery returns instance of query *graphql.Object.
 func (c *TypeCreator) RootQuery() *graphql.Object {
 	return c.query
 }
 
-// RootMutation returns instance of mutation *graphql.Object
+// RootMutation returns instance of mutation *graphql.Object.
 func (c *TypeCreator) RootMutation() *graphql.Object {
 	return c.mutation
 }

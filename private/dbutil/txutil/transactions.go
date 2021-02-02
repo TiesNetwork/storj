@@ -8,13 +8,12 @@ package txutil
 import (
 	"context"
 	"database/sql"
-	"fmt"
 	"time"
 
-	"github.com/lib/pq"
 	"github.com/spacemonkeygo/monkit/v3"
 	"github.com/zeebo/errs"
 
+	"storj.io/storj/private/dbutil/pgutil/pgerrcode"
 	"storj.io/storj/private/tagsql"
 )
 
@@ -33,15 +32,25 @@ func WithTx(ctx context.Context, db tagsql.DB, txOpts *sql.TxOptions, fn func(co
 	start := time.Now()
 
 	for i := 0; ; i++ {
+		var retryErr error
 		err, rollbackErr := withTxOnce(ctx, db, txOpts, fn)
-		if time.Since(start) < 5*time.Minute && i < 10 {
-			if code := errCode(err); code == "CR000" || code == "40001" {
-				mon.Event(fmt.Sprintf("transaction_retry_%d", i+1))
-				continue
+		// if we had any error, check to see if we should retry.
+		if err != nil || rollbackErr != nil {
+			// we will only retry if we have enough resources (duration and count).
+			if dur := time.Since(start); dur < 5*time.Minute && i < 10 {
+				// even though the resources (duration and count) allow us to issue a retry,
+				// we only should if the error claims we should.
+				if code := pgerrcode.FromError(err); code == "CR000" || code == "40001" {
+					continue
+				}
+			} else {
+				// we aren't issuing a retry due to resources (duration and count), so
+				// include a retry error in the output so that we know something is wrong.
+				retryErr = errs.New("unable to retry: duration:%v attempts:%d", dur, i)
 			}
 		}
 		mon.IntVal("transaction_retries").Observe(int64(i))
-		return errs.Wrap(errs.Combine(err, rollbackErr))
+		return errs.Wrap(errs.Combine(err, rollbackErr, retryErr))
 	}
 }
 
@@ -64,17 +73,4 @@ func withTxOnce(ctx context.Context, db tagsql.DB, txOpts *sql.TxOptions, fn fun
 	}()
 
 	return fn(ctx, tx), nil
-}
-
-// errCode returns the error code associated with any postgres error in the chain of
-// errors walked by unwrapping.
-func errCode(err error) (code string) {
-	errs.IsFunc(err, func(err error) bool {
-		if pgerr, ok := err.(*pq.Error); ok {
-			code = string(pgerr.Code)
-			return true
-		}
-		return false
-	})
-	return code
 }

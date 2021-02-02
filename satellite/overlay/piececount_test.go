@@ -4,8 +4,10 @@
 package overlay_test
 
 import (
+	"fmt"
 	"math"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 
@@ -33,15 +35,18 @@ func TestDB_PieceCounts(t *testing.T) {
 			nodes[i].PieceCount = int(math.Pow10(i + 1))
 		}
 
-		for _, node := range nodes {
-			require.NoError(t, overlaydb.UpdateAddress(ctx, &pb.Node{
-				Id: node.ID,
-				Address: &pb.NodeAddress{
-					Transport: pb.NodeTransport_TCP_TLS_GRPC,
-					Address:   "0.0.0.0",
-				},
-				LastIp: "0.0.0.0",
-			}, overlay.NodeSelectionConfig{}))
+		for i, node := range nodes {
+			addr := fmt.Sprintf("127.0.%d.0:8080", i)
+			lastNet := fmt.Sprintf("127.0.%d", i)
+			d := overlay.NodeCheckInInfo{
+				NodeID:     node.ID,
+				Address:    &pb.NodeAddress{Address: addr, Transport: pb.NodeTransport_TCP_TLS_GRPC},
+				LastIPPort: addr,
+				LastNet:    lastNet,
+				Version:    &pb.NodeVersion{Version: "v1.0.0"},
+			}
+			err := overlaydb.UpdateCheckIn(ctx, d, time.Now().UTC(), overlay.NodeSelectionConfig{})
+			require.NoError(t, err)
 		}
 
 		// check that they are initialized to zero
@@ -77,22 +82,32 @@ func BenchmarkDB_PieceCounts(b *testing.B) {
 		ctx := testcontext.New(b)
 		defer ctx.Cleanup()
 
+		var NumberOfNodes = 10000
+		if testing.Short() {
+			NumberOfNodes = 1000
+		}
+
 		overlaydb := db.OverlayCache()
 
 		counts := make(map[storj.NodeID]int)
-		for i := 0; i < 10000; i++ {
+		for i := 0; i < NumberOfNodes; i++ {
 			counts[testrand.NodeID()] = testrand.Intn(100000)
 		}
 
+		var i int
 		for nodeID := range counts {
-			require.NoError(b, overlaydb.UpdateAddress(ctx, &pb.Node{
-				Id: nodeID,
-				Address: &pb.NodeAddress{
-					Transport: pb.NodeTransport_TCP_TLS_GRPC,
-					Address:   "0.0.0.0",
-				},
-				LastIp: "0.0.0.0",
-			}, overlay.NodeSelectionConfig{}))
+			addr := fmt.Sprintf("127.0.%d.0:8080", i)
+			lastNet := fmt.Sprintf("127.0.%d", i)
+			i++
+			d := overlay.NodeCheckInInfo{
+				NodeID:     nodeID,
+				Address:    &pb.NodeAddress{Address: addr, Transport: pb.NodeTransport_TCP_TLS_GRPC},
+				LastIPPort: addr,
+				LastNet:    lastNet,
+				Version:    &pb.NodeVersion{Version: "v1.0.0"},
+			}
+			err := overlaydb.UpdateCheckIn(ctx, d, time.Now().UTC(), overlay.NodeSelectionConfig{})
+			require.NoError(b, err)
 		}
 
 		b.Run("Update", func(b *testing.B) {

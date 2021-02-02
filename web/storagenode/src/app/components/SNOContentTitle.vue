@@ -3,6 +3,13 @@
 
 <template>
     <div class="title-area">
+        <div class="title-area__node-id-container" v-clipboard="this.nodeId">
+            <b class="title-area__node-id-container__title">Node ID</b>
+            <div class="title-area__node-id-container__right-area">
+                <p class="title-area__node-id-container__id">{{ this.nodeId }}</p>
+                <CopyIcon />
+            </div>
+        </div>
         <h1 class="title-area__title">Your Storage Node Stats</h1>
         <div class="title-area__info-container">
             <div class="title-area__info-container__info-item">
@@ -13,12 +20,12 @@
             <div class="title-area-divider"></div>
             <div class="title-area__info-container__info-item">
                 <p class="title-area__info-container__info-item__title">UPTIME</p>
-                <P class="title-area__info-container__info-item__content">{{uptime}}</P>
+                <p class="title-area__info-container__info-item__content">{{ uptime }}</p>
             </div>
             <div class="title-area-divider"></div>
             <div class="title-area__info-container__info-item">
                 <p class="title-area__info-container__info-item__title">LAST CONTACT</p>
-                <P class="title-area__info-container__info-item__content">{{lastPinged}} ago</P>
+                <p class="title-area__info-container__info-item__content">{{ lastPinged }} ago</p>
             </div>
             <div class="title-area-divider"></div>
             <VInfo
@@ -28,23 +35,23 @@
             >
                 <div class="title-area__info-container__info-item">
                     <p class="title-area__info-container__info-item__title">VERSION</p>
-                    <P class="title-area__info-container__info-item__content">{{info.version}}</P>
+                    <p class="title-area__info-container__info-item__content">{{ info.version }}</p>
                 </div>
             </VInfo>
             <VInfo
                 v-if="!info.isLastVersion"
                 text="Your node is outdated. Please update to:"
-                bold-text="v0.0.0"
+                :bold-text="info.allowedVersion"
             >
                 <div class="title-area__info-container__info-item">
                     <p class="title-area__info-container__info-item__title">VERSION</p>
-                    <P class="title-area__info-container__info-item__content">{{info.version}}</P>
+                    <p class="title-area__info-container__info-item__content">{{ info.version }}</p>
                 </div>
             </VInfo>
             <div class="title-area-divider"></div>
             <div class="title-area__info-container__info-item">
                 <p class="title-area__info-container__info-item__title">PERIOD</p>
-                <P class="title-area__info-container__info-item__content">{{currentMonth}}</P>
+                <p class="title-area__info-container__info-item__content">{{ currentMonth }}</p>
             </div>
         </div>
     </div>
@@ -54,6 +61,8 @@
 import { Component, Vue } from 'vue-property-decorator';
 
 import VInfo from '@/app/components/VInfo.vue';
+
+import CopyIcon from '@/../static/images/Copy.svg';
 
 import { StatusOnline } from '@/app/store/modules/node';
 import { Duration, millisecondsInSecond, minutesInHour, secondsInHour, secondsInMinute } from '@/app/utils/duration';
@@ -86,6 +95,7 @@ class NodeInfo {
 @Component ({
     components: {
         VInfo,
+        CopyIcon,
     },
 })
 export default class SNOContentTitle extends Vue {
@@ -95,6 +105,10 @@ export default class SNOContentTitle extends Vue {
         window.setInterval(() => {
             this.timeNow = new Date();
         }, 1000);
+    }
+
+    public get nodeId(): string {
+        return this.$store.state.node.info.id;
     }
 
     public get info(): NodeInfo {
@@ -108,17 +122,17 @@ export default class SNOContentTitle extends Vue {
         return this.$store.state.node.info.status === StatusOnline;
     }
 
-    public get lastPinged(): string {
-        return this.timePassed(this.$store.state.node.info.lastPinged);
-    }
-
     public get uptime(): string {
         return this.timePassed(this.$store.state.node.info.startedAt);
     }
 
+    public get lastPinged(): string {
+        return this.timePassed(this.$store.state.node.info.lastPinged);
+    }
+
     public get currentMonth(): string {
         const monthNames = ['January', 'February', 'March', 'April', 'May', 'June',
-            'July', 'August', 'September', 'October', 'November', 'December'
+            'July', 'August', 'September', 'October', 'November', 'December',
         ];
         const date = new Date();
 
@@ -141,23 +155,71 @@ export default class SNOContentTitle extends Vue {
 </script>
 
 <style scoped lang="scss">
+    .svg {
+
+        path {
+            fill: var(--node-id-copy-icon-color);
+        }
+    }
+
     .title-area {
         font-family: 'font_regular', sans-serif;
         margin-bottom: 9px;
+
+        &__node-id-container {
+            color: var(--regular-text-color);
+            height: 44px;
+            padding: 14px;
+            border: 1px solid var(--node-id-border-color);
+            border-radius: 12px;
+            font-size: 14px;
+            margin-right: 30px;
+            display: none;
+            cursor: pointer;
+
+            &__title {
+                font-family: 'font_bold', sans-serif;
+                min-width: 55px;
+                margin-right: 5px;
+            }
+
+            &__id {
+                margin-right: 20px;
+                font-size: 11px;
+            }
+
+            &__right-area {
+                display: flex;
+                align-items: center;
+                justify-content: flex-end;
+            }
+
+            &:hover {
+                border-color: var(--node-id-border-hover-color);
+                color: var(--node-id-hover-text-color);
+
+                .svg {
+
+                    path {
+                        fill: var(--node-id-border-hover-color) !important;
+                    }
+                }
+            }
+        }
 
         &__title {
             font-family: 'font_bold', sans-serif;
             margin: 0 0 21px 0;
             font-size: 32px;
             line-height: 57px;
-            color: #535f77;
-            user-select: none;
+            color: var(--regular-text-color);
         }
 
         &__info-container {
             display: flex;
             justify-content: space-between;
             align-items: center;
+            flex-wrap: wrap;
 
             &__info-item {
                 padding: 15px 0;
@@ -167,14 +229,14 @@ export default class SNOContentTitle extends Vue {
                     line-height: 20px;
                     color: #9ca5b6;
                     margin: 0 0 5px 0;
-                    user-select: none;
                 }
 
                 &__content {
                     font-size: 18px;
                     line-height: 20px;
                     font-family: 'font_medium', sans-serif;
-                    color: #535f77;
+                    color: var(--regular-text-color);
+                    margin: 0;
                 }
             }
         }
@@ -195,7 +257,7 @@ export default class SNOContentTitle extends Vue {
     }
 
     /deep/ .info__message-box {
-        background-image: url('../../../static/images/MessageTitle.png');
+        background-image: var(--info-image-arrow-left-path);
         bottom: 100%;
         left: 220%;
         padding: 20px 20px 25px 20px;
@@ -205,6 +267,55 @@ export default class SNOContentTitle extends Vue {
 
             &__regular-text {
                 margin-bottom: 5px;
+            }
+        }
+    }
+
+    @media screen and (max-width: 780px) {
+
+        .title-area {
+
+            &__node-id-container {
+                display: flex;
+                align-items: center;
+                justify-content: space-between;
+                margin: 0 0 20px 0;
+                height: auto;
+
+                &__id {
+                    word-break: break-all;
+                }
+            }
+        }
+    }
+
+    @media screen and (max-width: 600px) {
+
+        .title-area {
+
+            &__title {
+                font-size: 20px;
+            }
+
+            &__info-container {
+
+                &__info-item {
+                    padding: 12px 8px;
+                }
+            }
+        }
+
+        .title-area-divider {
+            display: none;
+        }
+    }
+
+    @media screen and (max-width: 600px) {
+
+        .title-area {
+
+            &__info-container {
+                justify-content: flex-start;
             }
         }
     }

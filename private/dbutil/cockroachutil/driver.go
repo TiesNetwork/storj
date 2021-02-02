@@ -8,60 +8,73 @@ import (
 	"database/sql"
 	"database/sql/driver"
 	"errors"
-	"reflect"
+	"io"
+	"net"
 	"strings"
+	"syscall"
 
-	"github.com/jackc/pgx"
-	"github.com/lib/pq"
+	"github.com/jackc/pgx/v4/stdlib"
 	"github.com/zeebo/errs"
+
+	"storj.io/storj/private/dbutil/pgutil/pgerrcode"
 )
 
-// Driver is the type for the "cockroach" sql/database driver.
-// It uses github.com/lib/pq under the covers because of Cockroach's
-// PostgreSQL compatibility, but allows differentiation between pg and
-// crdb connections.
+// Driver is the type for the "cockroach" sql/database driver. It uses
+// github.com/jackc/pgx/v4/stdlib under the covers because of Cockroach's
+// PostgreSQL compatibility, but allows differentiation between pg and crdb
+// connections.
 type Driver struct {
-	pq.Driver
+	pgxDriver stdlib.Driver
 }
 
 // Open opens a new cockroachDB connection.
 func (cd *Driver) Open(name string) (driver.Conn, error) {
 	name = translateName(name)
-	return pq.Open(name)
+	conn, err := cd.pgxDriver.Open(name)
+	if err != nil {
+		return nil, err
+	}
+	pgxStdlibConn, ok := conn.(*stdlib.Conn)
+	if !ok {
+		return nil, errs.New("Conn from pgx is not a *stdlib.Conn??? T: %T", conn)
+	}
+	return &cockroachConn{pgxStdlibConn}, nil
 }
 
 // OpenConnector obtains a new db Connector, which sql.DB can use to
 // obtain each needed connection at the appropriate time.
 func (cd *Driver) OpenConnector(name string) (driver.Connector, error) {
 	name = translateName(name)
-	pgConnector, err := pq.NewConnector(name)
+	pgxConnector, err := cd.pgxDriver.OpenConnector(name)
 	if err != nil {
 		return nil, err
 	}
-	return &cockroachConnector{pgConnector}, nil
+	return &cockroachConnector{driver: cd, pgxConnector: pgxConnector}, nil
 }
 
 // cockroachConnector is a thin wrapper around a pq-based connector. This allows
 // Driver to supply our custom cockroachConn type for connections.
 type cockroachConnector struct {
-	pgConnector driver.Connector
+	driver       *Driver
+	pgxConnector driver.Connector
 }
 
 // Driver returns the driver being used for this connector.
 func (c *cockroachConnector) Driver() driver.Driver {
-	return &Driver{}
+	return c.driver
 }
 
 // Connect creates a new connection using the connector.
 func (c *cockroachConnector) Connect(ctx context.Context) (driver.Conn, error) {
-	pgConn, err := c.pgConnector.Connect(ctx)
+	pgxConn, err := c.pgxConnector.Connect(ctx)
 	if err != nil {
 		return nil, err
 	}
-	if pgConnAll, ok := pgConn.(connAll); ok {
-		return &cockroachConn{pgConnAll}, nil
+	pgxStdlibConn, ok := pgxConn.(*stdlib.Conn)
+	if !ok {
+		return nil, errs.New("Conn from pgx is not a *stdlib.Conn??? T: %T", pgxConn)
 	}
-	return nil, errs.New("Underlying connector type %T does not implement connAll?!", pgConn)
+	return &cockroachConn{pgxStdlibConn}, nil
 }
 
 type connAll interface {
@@ -73,7 +86,7 @@ type connAll interface {
 
 // cockroachConn is a connection to a database. It is not used concurrently by multiple goroutines.
 type cockroachConn struct {
-	underlying connAll
+	underlying *stdlib.Conn
 }
 
 // Assert that cockroachConn fulfills connAll.
@@ -89,21 +102,88 @@ func (c *cockroachConn) Close() error {
 // retry semantics for single statements.
 func (c *cockroachConn) ExecContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Result, error) {
 	result, err := c.underlying.ExecContext(ctx, query, args)
-	for err != nil && !c.isInTransaction() && needsRetry(err) {
+	for err != nil && !c.isInTransaction() && NeedsRetry(err) {
+		mon.Event("needed_retry")
 		result, err = c.underlying.ExecContext(ctx, query, args)
 	}
 	return result, err
 }
 
+type cockroachRows struct {
+	rows         driver.Rows
+	firstResults []driver.Value
+	eof          bool
+}
+
+// Columns returns the names of the columns.
+func (rows *cockroachRows) Columns() []string {
+	return rows.rows.Columns()
+}
+
+// Close closes the rows iterator.
+func (rows *cockroachRows) Close() error {
+	return rows.rows.Close()
+}
+
+// Next implements the Next method on driver.Rows.
+func (rows *cockroachRows) Next(dest []driver.Value) error {
+	if rows.eof {
+		return io.EOF
+	}
+	if rows.firstResults == nil {
+		return rows.rows.Next(dest)
+	}
+	copy(dest, rows.firstResults)
+	rows.firstResults = nil
+	return nil
+}
+
+func wrapRows(rows driver.Rows) (crdbRows *cockroachRows, err error) {
+	columns := rows.Columns()
+	dest := make([]driver.Value, len(columns))
+	err = rows.Next(dest)
+	if err != nil {
+		if errors.Is(err, io.EOF) {
+			return &cockroachRows{rows: rows, firstResults: nil, eof: true}, nil
+		}
+		return nil, err
+	}
+	return &cockroachRows{rows: rows, firstResults: dest}, nil
+}
+
 // QueryContext (when implemented by a driver.Conn) provides QueryContext
 // functionality to a sql.DB instance. This implementation provides
 // retry semantics for single statements.
-func (c *cockroachConn) QueryContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Rows, error) {
-	result, err := c.underlying.QueryContext(ctx, query, args)
-	for err != nil && !c.isInTransaction() && needsRetry(err) {
-		result, err = c.underlying.QueryContext(ctx, query, args)
+func (c *cockroachConn) QueryContext(ctx context.Context, query string, args []driver.NamedValue) (_ driver.Rows, err error) {
+	defer mon.Task()(&ctx)(&err)
+	for {
+		result, err := c.underlying.QueryContext(ctx, query, args)
+		if err != nil {
+			if NeedsRetry(err) {
+				if c.isInTransaction() {
+					return nil, err
+				}
+				mon.Event("needed_retry")
+				continue
+			}
+			return nil, err
+		}
+		wrappedResult, err := wrapRows(result)
+		if err != nil {
+			// If this returns an error it's probably the same error
+			// we got from calling Next inside wrapRows.
+			_ = result.Close()
+			if NeedsRetry(err) {
+				if c.isInTransaction() {
+					return nil, err
+				}
+				mon.Event("needed_retry")
+				continue
+			}
+			return nil, err
+		}
+		return wrappedResult, nil
 	}
-	return result, err
 }
 
 // Begin starts a new transaction.
@@ -138,11 +218,8 @@ const (
 )
 
 func (c *cockroachConn) txnStatus() transactionStatus {
-	// access c.underlying -> c.underlying.(*pq.conn) -> (*c.underlying.(*pq.conn)).txnStatus
-	//
-	// this is of course brittle if lib/pq internals change, so a test is necessary to make
-	// sure we stay on the same page.
-	return transactionStatus(reflect.ValueOf(c.underlying).Elem().Field(4).Uint())
+	pgConn := c.underlying.Conn().PgConn()
+	return transactionStatus(pgConn.TxStatus())
 }
 
 func (c *cockroachConn) isInTransaction() bool {
@@ -183,7 +260,8 @@ func (stmt *cockroachStmt) Exec(args []driver.Value) (driver.Result, error) {
 		namedArgs[i] = driver.NamedValue{Ordinal: i + 1, Value: arg}
 	}
 	result, err := stmt.underlyingStmt.ExecContext(context.Background(), namedArgs)
-	for err != nil && !stmt.conn.isInTransaction() && needsRetry(err) {
+	for err != nil && !stmt.conn.isInTransaction() && NeedsRetry(err) {
+		mon.Event("needed_retry")
 		result, err = stmt.underlyingStmt.ExecContext(context.Background(), namedArgs)
 	}
 	return result, err
@@ -197,33 +275,54 @@ func (stmt *cockroachStmt) Query(args []driver.Value) (driver.Rows, error) {
 	for i, arg := range args {
 		namedArgs[i] = driver.NamedValue{Ordinal: i + 1, Value: arg}
 	}
-	result, err := stmt.underlyingStmt.QueryContext(context.Background(), namedArgs)
-	for err != nil && !stmt.conn.isInTransaction() && needsRetry(err) {
-		result, err = stmt.underlyingStmt.QueryContext(context.Background(), namedArgs)
-	}
-	return result, err
+	return stmt.QueryContext(context.Background(), namedArgs)
 }
 
 // ExecContext executes SQL statements in the specified context.
 func (stmt *cockroachStmt) ExecContext(ctx context.Context, args []driver.NamedValue) (driver.Result, error) {
 	result, err := stmt.underlyingStmt.ExecContext(ctx, args)
-	for err != nil && !stmt.conn.isInTransaction() && needsRetry(err) {
+	for err != nil && !stmt.conn.isInTransaction() && NeedsRetry(err) {
+		mon.Event("needed_retry")
 		result, err = stmt.underlyingStmt.ExecContext(ctx, args)
 	}
 	return result, err
 }
 
 // QueryContext executes a query in the specified context.
-func (stmt *cockroachStmt) QueryContext(ctx context.Context, args []driver.NamedValue) (driver.Rows, error) {
-	rows, err := stmt.underlyingStmt.QueryContext(ctx, args)
-	for err != nil && !stmt.conn.isInTransaction() && needsRetry(err) {
-		rows, err = stmt.underlyingStmt.QueryContext(ctx, args)
+func (stmt *cockroachStmt) QueryContext(ctx context.Context, args []driver.NamedValue) (_ driver.Rows, err error) {
+	defer mon.Task()(&ctx)(&err)
+	for {
+		result, err := stmt.underlyingStmt.QueryContext(ctx, args)
+		if err != nil {
+			if NeedsRetry(err) {
+				if stmt.conn.isInTransaction() {
+					return nil, err
+				}
+				mon.Event("needed_retry")
+				continue
+			}
+			return nil, err
+		}
+		wrappedResult, err := wrapRows(result)
+		if err != nil {
+			// If this returns an error it's probably the same error
+			// we got from calling Next inside wrapRows.
+			_ = result.Close()
+			if NeedsRetry(err) {
+				if stmt.conn.isInTransaction() {
+					return nil, err
+				}
+				mon.Event("needed_retry")
+				continue
+			}
+			return nil, err
+		}
+		return wrappedResult, nil
 	}
-	return rows, err
 }
 
 // translateName changes the scheme name in a `cockroach://` URL to
-// `postgres://`, as that is what lib/pq will expect.
+// `postgres://`, as that is what jackc/pgx will expect.
 func translateName(name string) string {
 	if strings.HasPrefix(name, "cockroach://") {
 		name = "postgres://" + name[12:]
@@ -231,38 +330,40 @@ func translateName(name string) string {
 	return name
 }
 
-// borrowed from code in crdb
-func needsRetry(err error) bool {
-	code := errCode(err)
-	return code == "40001" || code == "CR000"
-}
-
-// borrowed from crdb
-func errCode(err error) string {
-	switch t := errorCause(err).(type) {
-	case *pq.Error:
-		return string(t.Code)
-	case *pgx.PgError:
-		return t.Code
-	default:
-		return ""
+// NeedsRetry checks if the error code means a retry is needed,
+// borrowed from code in crdb.
+func NeedsRetry(err error) bool {
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+		mon.Event("crdb_error_eof")
+		// Currently we don't retry with EOF because it's unclear if
+		// a query succeeded or failed.
+		return false
 	}
-}
-
-func errorCause(err error) error {
-	for err != nil {
-		cause := errors.Unwrap(err)
-		if cause == nil {
-			break
-		}
-		err = cause
+	if errors.Is(err, syscall.ECONNRESET) {
+		mon.Event("crdb_error_conn_reset_needed_retry")
+		return true
 	}
-	return err
+	if errors.Is(err, syscall.ECONNREFUSED) {
+		mon.Event("crdb_error_conn_refused_needed_retry")
+		return true
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) {
+		mon.Event("crdb_net_error_needed_retry")
+		return true
+	}
+
+	code := pgerrcode.FromError(err)
+
+	// 57P01 occurs when a CRDB node rejoins the cluster but is not ready to accept connections
+	// CRDB support recommended a retry at this point
+	// Support ticket: https://support.cockroachlabs.com/hc/en-us/requests/5510
+	// TODO re-evaluate this if support provides a better solution
+	return code == "40001" || code == "CR000" || code == "57P01"
 }
 
-// Assert that Driver satisfies DriverContext.
-var _ driver.DriverContext = &Driver{}
+var defaultDriver = &Driver{}
 
 func init() {
-	sql.Register("cockroach", &Driver{})
+	sql.Register("cockroach", defaultDriver)
 }

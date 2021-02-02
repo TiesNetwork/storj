@@ -6,10 +6,10 @@ package stripecoinpayments
 import (
 	"context"
 
-	"github.com/skyrings/skyring-common/tools/uuid"
 	"github.com/stripe/stripe-go"
 	"github.com/zeebo/errs"
 
+	"storj.io/common/uuid"
 	"storj.io/storj/satellite/payments"
 )
 
@@ -29,7 +29,7 @@ func (creditCards *creditCards) List(ctx context.Context, userID uuid.UUID) (car
 		return nil, Error.Wrap(err)
 	}
 
-	customer, err := creditCards.service.stripeClient.Customers.Get(customerID, nil)
+	customer, err := creditCards.service.stripeClient.Customers().Get(customerID, nil)
 	if err != nil {
 		return nil, Error.Wrap(err)
 	}
@@ -39,7 +39,7 @@ func (creditCards *creditCards) List(ctx context.Context, userID uuid.UUID) (car
 		Type:     stripe.String(string(stripe.PaymentMethodTypeCard)),
 	}
 
-	paymentMethodsIterator := creditCards.service.stripeClient.PaymentMethods.List(params)
+	paymentMethodsIterator := creditCards.service.stripeClient.PaymentMethods().List(params)
 	for paymentMethodsIterator.Next() {
 		stripeCard := paymentMethodsIterator.PaymentMethod()
 
@@ -79,7 +79,7 @@ func (creditCards *creditCards) Add(ctx context.Context, userID uuid.UUID, cardT
 		Card: &stripe.PaymentMethodCardParams{Token: &cardToken},
 	}
 
-	card, err := creditCards.service.stripeClient.PaymentMethods.New(cardParams)
+	card, err := creditCards.service.stripeClient.PaymentMethods().New(cardParams)
 	if err != nil {
 		return Error.Wrap(err)
 	}
@@ -88,7 +88,7 @@ func (creditCards *creditCards) Add(ctx context.Context, userID uuid.UUID, cardT
 		Customer: &customerID,
 	}
 
-	card, err = creditCards.service.stripeClient.PaymentMethods.Attach(card.ID, attachParams)
+	card, err = creditCards.service.stripeClient.PaymentMethods().Attach(card.ID, attachParams)
 	if err != nil {
 		return Error.Wrap(err)
 	}
@@ -99,7 +99,7 @@ func (creditCards *creditCards) Add(ctx context.Context, userID uuid.UUID, cardT
 		},
 	}
 
-	_, err = creditCards.service.stripeClient.Customers.Update(customerID, params)
+	_, err = creditCards.service.stripeClient.Customers().Update(customerID, params)
 
 	// TODO: handle created but not attached card manually?
 	return Error.Wrap(err)
@@ -121,7 +121,7 @@ func (creditCards *creditCards) MakeDefault(ctx context.Context, userID uuid.UUI
 		},
 	}
 
-	_, err = creditCards.service.stripeClient.Customers.Update(customerID, params)
+	_, err = creditCards.service.stripeClient.Customers().Update(customerID, params)
 
 	return Error.Wrap(err)
 }
@@ -135,7 +135,7 @@ func (creditCards *creditCards) Remove(ctx context.Context, userID uuid.UUID, ca
 		return payments.ErrAccountNotSetup.Wrap(err)
 	}
 
-	customer, err := creditCards.service.stripeClient.Customers.Get(customerID, nil)
+	customer, err := creditCards.service.stripeClient.Customers().Get(customerID, nil)
 	if err != nil {
 		return Error.Wrap(err)
 	}
@@ -145,7 +145,25 @@ func (creditCards *creditCards) Remove(ctx context.Context, userID uuid.UUID, ca
 		return Error.Wrap(errs.New("can not detach default payment method."))
 	}
 
-	_, err = creditCards.service.stripeClient.PaymentMethods.Detach(cardID, nil)
+	_, err = creditCards.service.stripeClient.PaymentMethods().Detach(cardID, nil)
 
 	return Error.Wrap(err)
+}
+
+// RemoveAll is used to detach all credit cards from payment account.
+// It should only be used in case of a user deletion. In case of an error, some cards could have been deleted already.
+func (creditCards *creditCards) RemoveAll(ctx context.Context, userID uuid.UUID) (err error) {
+	defer mon.Task()(&ctx)(&err)
+
+	ccList, err := creditCards.List(ctx, userID)
+	if err != nil {
+		return Error.Wrap(err)
+	}
+	for _, cc := range ccList {
+		_, err = creditCards.service.stripeClient.PaymentMethods().Detach(cc.ID, nil)
+		if err != nil {
+			return Error.Wrap(err)
+		}
+	}
+	return nil
 }

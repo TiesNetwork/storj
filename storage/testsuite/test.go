@@ -18,12 +18,11 @@ import (
 	"storj.io/storj/storage"
 )
 
-// RunTests runs common storage.KeyValueStore tests
+// RunTests runs common storage.KeyValueStore tests.
 func RunTests(t *testing.T, store storage.KeyValueStore) {
 	// store = storelogger.NewTest(t, store)
 	ctx := testcontext.New(t)
 	defer ctx.Cleanup()
-
 	t.Run("CRUD", func(t *testing.T) { testCRUD(t, ctx, store) })
 	t.Run("Constraints", func(t *testing.T) { testConstraints(t, ctx, store) })
 	t.Run("Iterate", func(t *testing.T) { testIterate(t, ctx, store) })
@@ -78,7 +77,7 @@ func testConstraints(t *testing.T, ctx *testcontext.Context, store storage.KeyVa
 		}
 
 		_, err = store.GetAll(ctx, items[:lookupLimit+1].GetKeys())
-		if err == nil && err == storage.ErrLimitExceeded {
+		if !storage.ErrLimitExceeded.Has(err) {
 			t.Fatalf("GetAll LookupLimit+1 should fail: %v", err)
 		}
 	})
@@ -164,16 +163,18 @@ func testConstraints(t *testing.T, ctx *testcontext.Context, store storage.KeyVa
 			{storage.Value("old-value"), nil},
 			{storage.Value("old-value"), storage.Value("new-value")},
 		} {
-			errTag := fmt.Sprintf("%d. %+v", i, tt)
-			key := storage.Key("test-key")
-			val := storage.Value("test-value")
-			defer func() { _ = store.Delete(ctx, key) }()
+			func() {
+				errTag := fmt.Sprintf("%d. %+v", i, tt)
+				key := storage.Key("test-key")
+				val := storage.Value("test-value")
+				defer func() { _ = store.Delete(ctx, key) }()
 
-			err := store.Put(ctx, key, val)
-			require.NoError(t, err, errTag)
+				err := store.Put(ctx, key, val)
+				require.NoError(t, err, errTag)
 
-			err = store.CompareAndSwap(ctx, key, tt.old, tt.new)
-			assert.True(t, storage.ErrValueChanged.Has(err), "%s: unexpected error: %+v", errTag, err)
+				err = store.CompareAndSwap(ctx, key, tt.old, tt.new)
+				assert.True(t, storage.ErrValueChanged.Has(err), "%s: unexpected error: %+v", errTag, err)
+			}()
 		}
 	})
 

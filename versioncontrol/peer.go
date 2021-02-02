@@ -7,16 +7,20 @@ import (
 	"context"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"net"
 	"net/http"
 	"reflect"
+	"strings"
 
+	"github.com/gorilla/mux"
 	"github.com/zeebo/errs"
 	"go.uber.org/zap"
 	"golang.org/x/sync/errgroup"
 
 	"storj.io/common/errs2"
-	"storj.io/storj/private/version"
+	"storj.io/private/version"
 )
 
 // seedLength is the number of bytes in a rollout seed.
@@ -38,7 +42,8 @@ type Config struct {
 }
 
 // OldVersionConfig provides a list of allowed Versions per process.
-// NB: this will be deprecated in favor of `ProcessesConfig`.
+//
+// NB: use `ProcessesConfig` for newer code instead.
 type OldVersionConfig struct {
 	Satellite   string `user:"true" help:"Allowed Satellite Versions" default:"v0.0.1"`
 	Storagenode string `user:"true" help:"Allowed Storagenode Versions" default:"v0.0.1"`
@@ -88,31 +93,11 @@ type Peer struct {
 		Endpoint http.Server
 		Listener net.Listener
 	}
+
 	Versions version.AllowedVersions
 
 	// response contains the byte version of current allowed versions
 	response []byte
-}
-
-// HandleGet contains the request handler for the version control web server.
-func (peer *Peer) HandleGet(w http.ResponseWriter, r *http.Request) {
-	// Only handle GET Requests
-	if r.Method != http.MethodGet {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	var xfor string
-	if xfor = r.Header.Get("X-Forwarded-For"); xfor == "" {
-		xfor = r.RemoteAddr
-	}
-	peer.Log.Sugar().Debugf("Request from: %s for %s", r.RemoteAddr, xfor)
-
-	w.Header().Set("Content-Type", "application/json")
-	_, err := w.Write(peer.response)
-	if err != nil {
-		peer.Log.Sugar().Errorf("error writing response to client: %v", err)
-	}
 }
 
 // New creates a new VersionControl Server.
@@ -151,7 +136,6 @@ func New(log *zap.Logger, config *Config) (peer *Peer, err error) {
 		return &Peer{}, err
 	}
 
-	peer.Versions.Processes = version.Processes{}
 	peer.Versions.Processes.Satellite, err = configToProcess(config.Binary.Satellite)
 	if err != nil {
 		return nil, RolloutErr.Wrap(err)
@@ -184,27 +168,107 @@ func New(log *zap.Logger, config *Config) (peer *Peer, err error) {
 
 	peer.response, err = json.Marshal(peer.Versions)
 	if err != nil {
-		peer.Log.Sugar().Fatalf("Error marshalling version info: %v", err)
+		peer.Log.Error("Error marshalling version info.", zap.Error(err))
+		return nil, RolloutErr.Wrap(err)
 	}
 
-	peer.Log.Sugar().Debugf("setting version info to: %v", string(peer.response))
+	peer.Log.Debug("Setting version info.", zap.ByteString("Value", peer.response))
 
-	mux := http.NewServeMux()
-	mux.HandleFunc("/", peer.HandleGet)
-	peer.Server.Endpoint = http.Server{
-		Handler: mux,
+	{
+		router := mux.NewRouter()
+		router.HandleFunc("/", peer.versionHandle).Methods(http.MethodGet)
+		router.HandleFunc("/processes/{service}/{version}/url", peer.processURLHandle).Methods(http.MethodGet)
+
+		peer.Server.Endpoint = http.Server{
+			Handler: router,
+		}
+
+		peer.Server.Listener, err = net.Listen("tcp", config.Address)
+		if err != nil {
+			return nil, errs.Combine(err, peer.Close())
+		}
 	}
 
-	peer.Server.Listener, err = net.Listen("tcp", config.Address)
-	if err != nil {
-		return nil, errs.Combine(err, peer.Close())
-	}
 	return peer, nil
+}
+
+// versionHandle handles all process versions request.
+func (peer *Peer) versionHandle(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+
+	_, err := w.Write(peer.response)
+	if err != nil {
+		peer.Log.Error("Error writing response to client.", zap.Error(err))
+	}
+}
+
+// processURLHandle handles process binary url resolving.
+func (peer *Peer) processURLHandle(w http.ResponseWriter, r *http.Request) {
+	params := mux.Vars(r)
+	service := params["service"]
+	versionType := params["version"]
+
+	var process version.Process
+	switch service {
+	case "satellite":
+		process = peer.Versions.Processes.Satellite
+	case "storagenode":
+		process = peer.Versions.Processes.Storagenode
+	case "storagenode-updater":
+		process = peer.Versions.Processes.StoragenodeUpdater
+	case "uplink":
+		process = peer.Versions.Processes.Uplink
+	case "gateway":
+		process = peer.Versions.Processes.Gateway
+	case "identity":
+		process = peer.Versions.Processes.Identity
+	default:
+		http.Error(w, "service does not exists", http.StatusNotFound)
+		return
+	}
+
+	var url string
+	switch versionType {
+	case "minimum":
+		url = process.Minimum.URL
+	case "suggested":
+		url = process.Suggested.URL
+	default:
+		http.Error(w, "invalid version, should be minimum or suggested", http.StatusBadRequest)
+		return
+	}
+
+	query := r.URL.Query()
+
+	os := query.Get("os")
+	if os == "" {
+		http.Error(w, "goos is not specified", http.StatusBadRequest)
+		return
+	}
+
+	arch := query.Get("arch")
+	if arch == "" {
+		http.Error(w, "goarch is not specified", http.StatusBadRequest)
+		return
+	}
+
+	if scheme, ok := isBinarySupported(service, os, arch); !ok {
+		http.Error(w, fmt.Sprintf("binary scheme %s is not supported", scheme), http.StatusNotFound)
+		return
+	}
+
+	url = strings.Replace(url, "{os}", os, 1)
+	url = strings.Replace(url, "{arch}", arch, 1)
+
+	w.Header().Set("Content-Type", "text/plain")
+	_, err := w.Write([]byte(url))
+	if err != nil {
+		peer.Log.Error("Error writing response to client.", zap.Error(err))
+	}
 }
 
 // Run runs versioncontrol server until it's either closed or it errors.
 func (peer *Peer) Run(ctx context.Context) (err error) {
-
 	ctx, cancel := context.WithCancel(ctx)
 	var group errgroup.Group
 
@@ -214,8 +278,12 @@ func (peer *Peer) Run(ctx context.Context) (err error) {
 	})
 	group.Go(func() error {
 		defer cancel()
-		peer.Log.Sugar().Infof("Versioning server started on %s", peer.Addr())
-		return errs2.IgnoreCanceled(peer.Server.Endpoint.Serve(peer.Server.Listener))
+		peer.Log.Info("Versioning server started.", zap.String("Address", peer.Addr()))
+		err := peer.Server.Endpoint.Serve(peer.Server.Listener)
+		if errs2.IsCanceled(err) || errors.Is(err, http.ErrServerClosed) {
+			err = nil
+		}
+		return err
 	})
 	return group.Wait()
 }
@@ -240,7 +308,7 @@ func (versions ProcessesConfig) ValidateRollouts(log *zap.Logger) error {
 			continue
 		}
 		if err := binary.Rollout.Validate(); err != nil {
-			if err == EmptySeedErr {
+			if errors.Is(err, EmptySeedErr) {
 				log.Warn(err.Error(), zap.String("binary", value.Type().Field(i).Name))
 				continue
 			}

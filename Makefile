@@ -1,10 +1,10 @@
-GO_VERSION ?= 1.13.7
+GO_VERSION ?= 1.15.7
 GOOS ?= linux
 GOARCH ?= amd64
 GOPATH ?= $(shell go env GOPATH)
 COMPOSE_PROJECT_NAME := ${TAG}-$(shell git rev-parse --abbrev-ref HEAD)
 BRANCH_NAME ?= $(shell git rev-parse --abbrev-ref HEAD | sed "s!/!-!g")
-ifeq (${BRANCH_NAME},master)
+ifeq (${BRANCH_NAME},main)
 TAG    := $(shell git rev-parse --short HEAD)-go${GO_VERSION}
 TRACKED_BRANCH := true
 LATEST_TAG := latest
@@ -73,6 +73,11 @@ build-storagenode-npm:
 
 ##@ Simulator
 
+# Allow the caller to set GATEWAYPATH if desired. This controls where the new
+# go module is created to install the specific gateway version.
+ifndef GATEWAYPATH
+GATEWAYPATH=.build/gateway-tmp
+endif
 .PHONY: install-sim
 install-sim: ## install storj-sim
 	@echo "Running ${@}"
@@ -82,9 +87,13 @@ install-sim: ## install storj-sim
 		storj.io/storj/cmd/storj-sim \
 		storj.io/storj/cmd/versioncontrol \
 		storj.io/storj/cmd/uplink \
-		storj.io/storj/cmd/gateway \
 		storj.io/storj/cmd/identity \
 		storj.io/storj/cmd/certificates
+
+	## install exact version of storj/gateway
+	mkdir -p ${GATEWAYPATH}
+	-cd ${GATEWAYPATH} && go mod init gatewaybuild
+	cd ${GATEWAYPATH} && GO111MODULE=on go get storj.io/gateway@latest
 
 ##@ Test
 
@@ -108,27 +117,6 @@ test-docker: ## Run tests in Docker
 	docker-compose up -d --remove-orphans test
 	docker-compose run test make test
 
-.PHONY: test-libuplink-gomobile
-test-libuplink-gomobile: ## Run gomobile tests
-	@./lib/uplink-gomobile/test-sim.sh
-
-.PHONY: check-satellite-config-lock
-check-satellite-config-lock: ## Test if the satellite config file has changed (jenkins)
-	@echo "Running ${@}"
-	@cd scripts; ./check-satellite-config-lock.sh
-
-.PHONY: all-in-one
-all-in-one: ## Deploy docker images with one storagenode locally
-	export VERSION="${TAG}${CUSTOMTAG}" \
-	&& $(MAKE) satellite-image storagenode-image gateway-image \
-	&& docker-compose up --scale storagenode=1 satellite gateway
-
-.PHONY: test-all-in-one
-test-all-in-one: ## Test docker images locally
-	export VERSION="${TAG}${CUSTOMTAG}" \
-	&& $(MAKE) satellite-image storagenode-image gateway-image \
-	&& ./scripts/test-aio.sh
-
 .PHONY: test-sim-backwards-compatible
 test-sim-backwards-compatible: ## Test uploading a file with lastest release (jenkins)
 	@echo "Running ${@}"
@@ -140,6 +128,11 @@ check-monitoring: ## Check for locked monkit calls that have changed
 	@check-monitoring ./... | diff -U0 ./monkit.lock - \
 	|| (echo "Locked monkit metrics have been changed. Notify #data-science and run \`go run github.com/storj/ci/check-monitoring -out monkit.lock ./...\` to update monkit.lock file." \
 	&& exit 1)
+
+.PHONY: test-wasm-size
+test-wasm-size: ## Test that the built .wasm code has not increased in size
+	@echo "Running ${@}"
+	@./scripts/test-wasm-size.sh
 
 ##@ Build
 
@@ -153,7 +146,7 @@ storagenode-console:
 		-w /go/src/storj.io/storj/web/storagenode \
 		-e HOME=/tmp \
 		-u $(shell id -u):$(shell id -g) \
-		node:10.15.1 \
+		node:14.15.3 \
 	  /bin/bash -c "npm ci && npm run build"
 	# embed web assets into go
 	go-bindata -prefix web/storagenode/ -fs -o storagenode/console/consoleassets/bindata.resource.go -pkg consoleassets web/storagenode/dist/... web/storagenode/static/...
@@ -161,20 +154,18 @@ storagenode-console:
 	/usr/bin/env echo -e '\nfunc init() { FileSystem = AssetFile() }' >> storagenode/console/consoleassets/bindata.resource.go
 	gofmt -w -s storagenode/console/consoleassets/bindata.resource.go
 
+.PHONY: satellite-wasm
+satellite-wasm:
+	docker run --rm -i -v "${PWD}":/go/src/storj.io/storj -e GO111MODULE=on \
+	-e GOOS=js -e GOARCH=wasm -e GOARM=6 -e CGO_ENABLED=1 \
+	-v /tmp/go-cache:/tmp/.cache/go-build -v /tmp/go-pkg:/go/pkg \
+	-w /go/src/storj.io/storj -e GOPROXY -e TAG=${TAG} -u $(shell id -u):$(shell id -g) storjlabs/golang:${GO_VERSION} \
+	scripts/build-wasm.sh ;\
+
 .PHONY: images
-images: gateway-image satellite-image storagenode-image uplink-image versioncontrol-image ## Build gateway, satellite, storagenode, uplink, and versioncontrol Docker images
+images: satellite-image segment-reaper-image storagenode-image uplink-image versioncontrol-image ## Build satellite, segment-reaper, storagenode, uplink, and versioncontrol Docker images
 	echo Built version: ${TAG}
 
-.PHONY: gateway-image
-gateway-image: gateway_linux_arm gateway_linux_arm64 gateway_linux_amd64 ## Build gateway Docker image
-	${DOCKER_BUILD} --pull=true -t storjlabs/gateway:${TAG}${CUSTOMTAG}-amd64 \
-		-f cmd/gateway/Dockerfile .
-	${DOCKER_BUILD} --pull=true -t storjlabs/gateway:${TAG}${CUSTOMTAG}-arm32v6 \
-		--build-arg=GOARCH=arm --build-arg=DOCKER_ARCH=arm32v6 \
-		-f cmd/gateway/Dockerfile .
-	${DOCKER_BUILD} --pull=true -t storjlabs/gateway:${TAG}${CUSTOMTAG}-aarch64 \
-		--build-arg=GOARCH=arm --build-arg=DOCKER_ARCH=aarch64 \
-		-f cmd/gateway/Dockerfile .
 .PHONY: satellite-image
 satellite-image: satellite_linux_arm satellite_linux_arm64 satellite_linux_amd64 ## Build satellite Docker image
 	${DOCKER_BUILD} --pull=true -t storjlabs/satellite:${TAG}${CUSTOMTAG}-amd64 \
@@ -182,9 +173,21 @@ satellite-image: satellite_linux_arm satellite_linux_arm64 satellite_linux_amd64
 	${DOCKER_BUILD} --pull=true -t storjlabs/satellite:${TAG}${CUSTOMTAG}-arm32v6 \
 		--build-arg=GOARCH=arm --build-arg=DOCKER_ARCH=arm32v6 \
 		-f cmd/satellite/Dockerfile .
-	${DOCKER_BUILD} --pull=true -t storjlabs/satellite:${TAG}${CUSTOMTAG}-aarch64 \
-		--build-arg=GOARCH=arm --build-arg=DOCKER_ARCH=aarch64 \
+	${DOCKER_BUILD} --pull=true -t storjlabs/satellite:${TAG}${CUSTOMTAG}-arm64v8 \
+		--build-arg=GOARCH=arm --build-arg=DOCKER_ARCH=arm64v8 \
 		-f cmd/satellite/Dockerfile .
+
+.PHONY: segment-reaper-image
+segment-reaper-image: segment-reaper_linux_amd64 segment-reaper_linux_arm segment-reaper_linux_arm64 ## Build segment-reaper Docker image
+	${DOCKER_BUILD} --pull=true -t storjlabs/segment-reaper:${TAG}${CUSTOMTAG}-amd64 \
+		-f cmd/segment-reaper/Dockerfile .
+	${DOCKER_BUILD} --pull=true -t storjlabs/segment-reaper:${TAG}${CUSTOMTAG}-arm32v6 \
+		--build-arg=GOARCH=arm --build-arg=DOCKER_ARCH=arm32v6 \
+		-f cmd/segment-reaper/Dockerfile .
+	${DOCKER_BUILD} --pull=true -t storjlabs/segment-reaper:${TAG}${CUSTOMTAG}-arm64v8 \
+		--build-arg=GOARCH=arm --build-arg=DOCKER_ARCH=arm64v8 \
+		-f cmd/segment-reaper/Dockerfile .
+
 .PHONY: storagenode-image
 storagenode-image: storagenode_linux_arm storagenode_linux_arm64 storagenode_linux_amd64 ## Build storagenode Docker image
 	${DOCKER_BUILD} --pull=true -t storjlabs/storagenode:${TAG}${CUSTOMTAG}-amd64 \
@@ -192,8 +195,8 @@ storagenode-image: storagenode_linux_arm storagenode_linux_arm64 storagenode_lin
 	${DOCKER_BUILD} --pull=true -t storjlabs/storagenode:${TAG}${CUSTOMTAG}-arm32v6 \
 		--build-arg=GOARCH=arm --build-arg=DOCKER_ARCH=arm32v6 \
 		-f cmd/storagenode/Dockerfile .
-	${DOCKER_BUILD} --pull=true -t storjlabs/storagenode:${TAG}${CUSTOMTAG}-aarch64 \
-		--build-arg=GOARCH=arm --build-arg=DOCKER_ARCH=aarch64 \
+	${DOCKER_BUILD} --pull=true -t storjlabs/storagenode:${TAG}${CUSTOMTAG}-arm64v8 \
+		--build-arg=GOARCH=arm --build-arg=DOCKER_ARCH=arm64v8 \
 		-f cmd/storagenode/Dockerfile .
 .PHONY: uplink-image
 uplink-image: uplink_linux_arm uplink_linux_arm64 uplink_linux_amd64 ## Build uplink Docker image
@@ -202,8 +205,8 @@ uplink-image: uplink_linux_arm uplink_linux_arm64 uplink_linux_amd64 ## Build up
 	${DOCKER_BUILD} --pull=true -t storjlabs/uplink:${TAG}${CUSTOMTAG}-arm32v6 \
 		--build-arg=GOARCH=arm --build-arg=DOCKER_ARCH=arm32v6 \
 		-f cmd/uplink/Dockerfile .
-	${DOCKER_BUILD} --pull=true -t storjlabs/uplink:${TAG}${CUSTOMTAG}-aarch64 \
-		--build-arg=GOARCH=arm --build-arg=DOCKER_ARCH=aarch64 \
+	${DOCKER_BUILD} --pull=true -t storjlabs/uplink:${TAG}${CUSTOMTAG}-arm64v8 \
+		--build-arg=GOARCH=arm --build-arg=DOCKER_ARCH=arm64v8 \
 		-f cmd/uplink/Dockerfile .
 .PHONY: versioncontrol-image
 versioncontrol-image: versioncontrol_linux_arm versioncontrol_linux_arm64 versioncontrol_linux_amd64 ## Build versioncontrol Docker image
@@ -212,8 +215,8 @@ versioncontrol-image: versioncontrol_linux_arm versioncontrol_linux_arm64 versio
 	${DOCKER_BUILD} --pull=true -t storjlabs/versioncontrol:${TAG}${CUSTOMTAG}-arm32v6 \
 		--build-arg=GOARCH=arm --build-arg=DOCKER_ARCH=arm32v6 \
 		-f cmd/versioncontrol/Dockerfile .
-	${DOCKER_BUILD} --pull=true -t storjlabs/versioncontrol:${TAG}${CUSTOMTAG}-aarch64 \
-		--build-arg=GOARCH=arm --build-arg=DOCKER_ARCH=aarch64 \
+	${DOCKER_BUILD} --pull=true -t storjlabs/versioncontrol:${TAG}${CUSTOMTAG}-arm64v8 \
+		--build-arg=GOARCH=arm --build-arg=DOCKER_ARCH=arm64v8 \
 		-f cmd/versioncontrol/Dockerfile .
 
 .PHONY: binary
@@ -243,6 +246,13 @@ binary:
 	-w /go/src/storj.io/storj -e GOPROXY -u $(shell id -u):$(shell id -g) storjlabs/golang:${GO_VERSION} \
 	scripts/release.sh build $(EXTRA_ARGS) -o release/${TAG}/$(COMPONENT)_${GOOS}_${GOARCH}${FILEEXT} \
 	storj.io/storj/cmd/${COMPONENT}
+
+	if [ "${COMPONENT}" = "satellite" ] && [ "${GOOS}" = "linux" ] && [ "${GOARCH}" = "amd64" ]; \
+	then \
+		echo "Building wasm code"; \
+		$(MAKE) satellite-wasm; \
+	fi
+
 	chmod 755 release/${TAG}/$(COMPONENT)_${GOOS}_${GOARCH}${FILEEXT}
 	[ "${FILEEXT}" = ".exe" ] && storj-sign release/${TAG}/$(COMPONENT)_${GOOS}_${GOARCH}${FILEEXT} || echo "Skipping signing"
 	rm -f release/${TAG}/${COMPONENT}_${GOOS}_${GOARCH}.zip
@@ -260,27 +270,24 @@ binary-check:
 .PHONY: certificates_%
 certificates_%:
 	$(MAKE) binary-check COMPONENT=certificates GOARCH=$(word 3, $(subst _, ,$@)) GOOS=$(word 2, $(subst _, ,$@))
-.PHONY: gateway_%
-gateway_%:
-	$(MAKE) binary-check COMPONENT=gateway GOARCH=$(word 3, $(subst _, ,$@)) GOOS=$(word 2, $(subst _, ,$@))
 .PHONY: identity_%
 identity_%:
 	$(MAKE) binary-check COMPONENT=identity GOARCH=$(word 3, $(subst _, ,$@)) GOOS=$(word 2, $(subst _, ,$@))
 .PHONY: inspector_%
 inspector_%:
 	$(MAKE) binary-check COMPONENT=inspector GOARCH=$(word 3, $(subst _, ,$@)) GOOS=$(word 2, $(subst _, ,$@))
-.PHONY: linksharing_%
-linksharing_%:
-	$(MAKE) binary-check COMPONENT=linksharing GOARCH=$(word 3, $(subst _, ,$@)) GOOS=$(word 2, $(subst _, ,$@))
 .PHONY: satellite_%
 satellite_%:
 	$(MAKE) binary-check COMPONENT=satellite GOARCH=$(word 3, $(subst _, ,$@)) GOOS=$(word 2, $(subst _, ,$@))
+.PHONY: segment-reaper_%
+segment-reaper_%:
+	$(MAKE) binary-check COMPONENT=segment-reaper GOARCH=$(word 3, $(subst _, ,$@)) GOOS=$(word 2, $(subst _, ,$@))
 .PHONY: storagenode_%
 storagenode_%: storagenode-console
 	$(MAKE) binary-check COMPONENT=storagenode GOARCH=$(word 3, $(subst _, ,$@)) GOOS=$(word 2, $(subst _, ,$@))
 .PHONY: storagenode-updater_%
 storagenode-updater_%:
-	$(MAKE) binary-check COMPONENT=storagenode-updater GOARCH=$(word 3, $(subst _, ,$@)) GOOS=$(word 2, $(subst _, ,$@))
+	EXTRA_ARGS="-tags=service" $(MAKE) binary-check COMPONENT=storagenode-updater GOARCH=$(word 3, $(subst _, ,$@)) GOOS=$(word 2, $(subst _, ,$@))
 .PHONY: uplink_%
 uplink_%:
 	$(MAKE) binary-check COMPONENT=uplink GOARCH=$(word 3, $(subst _, ,$@)) GOOS=$(word 2, $(subst _, ,$@))
@@ -289,24 +296,15 @@ versioncontrol_%:
 	$(MAKE) binary-check COMPONENT=versioncontrol GOARCH=$(word 3, $(subst _, ,$@)) GOOS=$(word 2, $(subst _, ,$@))
 
 
-COMPONENTLIST := certificates gateway identity inspector linksharing satellite storagenode storagenode-updater uplink versioncontrol
+COMPONENTLIST := certificates identity inspector satellite storagenode storagenode-updater uplink versioncontrol
 OSARCHLIST    := darwin_amd64 linux_amd64 linux_arm linux_arm64 windows_amd64 freebsd_amd64
 BINARIES      := $(foreach C,$(COMPONENTLIST),$(foreach O,$(OSARCHLIST),$C_$O))
 .PHONY: binaries
-binaries: ${BINARIES} ## Build certificates, gateway, identity, inspector, linksharing, satellite, storagenode, uplink, and versioncontrol binaries (jenkins)
+binaries: ${BINARIES} ## Build certificates, identity, inspector, satellite, storagenode, uplink, and versioncontrol binaries (jenkins)
 
 .PHONY: sign-windows-installer
 sign-windows-installer:
 	storj-sign release/${TAG}/storagenode_windows_amd64.msi
-
-.PHONY: libuplink
-libuplink:
-	go build -ldflags="-s -w" -buildmode c-shared -o uplink.so storj.io/storj/lib/uplinkc
-	cp lib/uplinkc/uplink_definitions.h uplink_definitions.h
-
-.PHONY: libuplink-gomobile
-libuplink-gomobile:
-	@./lib/uplink-gomobile/build.sh
 
 ##@ Deploy
 
@@ -314,18 +312,18 @@ libuplink-gomobile:
 push-images: ## Push Docker images to Docker Hub (jenkins)
 	# images have to be pushed before a manifest can be created
 	# satellite
-	for c in gateway satellite storagenode uplink versioncontrol ; do \
+	for c in satellite segment-reaper storagenode uplink versioncontrol ; do \
 		docker push storjlabs/$$c:${TAG}${CUSTOMTAG}-amd64 \
 		&& docker push storjlabs/$$c:${TAG}${CUSTOMTAG}-arm32v6 \
-		&& docker push storjlabs/$$c:${TAG}${CUSTOMTAG}-aarch64 \
+		&& docker push storjlabs/$$c:${TAG}${CUSTOMTAG}-arm64v8 \
 		&& for t in ${TAG}${CUSTOMTAG} ${LATEST_TAG}; do \
 			docker manifest create storjlabs/$$c:$$t \
 			storjlabs/$$c:${TAG}${CUSTOMTAG}-amd64 \
 			storjlabs/$$c:${TAG}${CUSTOMTAG}-arm32v6 \
-			storjlabs/$$c:${TAG}${CUSTOMTAG}-aarch64 \
+			storjlabs/$$c:${TAG}${CUSTOMTAG}-arm64v8 \
 			&& docker manifest annotate storjlabs/$$c:$$t storjlabs/$$c:${TAG}${CUSTOMTAG}-amd64 --os linux --arch amd64 \
 			&& docker manifest annotate storjlabs/$$c:$$t storjlabs/$$c:${TAG}${CUSTOMTAG}-arm32v6 --os linux --arch arm --variant v6 \
-			&& docker manifest annotate storjlabs/$$c:$$t storjlabs/$$c:${TAG}${CUSTOMTAG}-aarch64 --os linux --arch arm64 \
+			&& docker manifest annotate storjlabs/$$c:$$t storjlabs/$$c:${TAG}${CUSTOMTAG}-arm64v8 --os linux --arch arm64 --variant v8 \
 			&& docker manifest push --purge storjlabs/$$c:$$t \
 		; done \
 	; done
@@ -333,16 +331,8 @@ push-images: ## Push Docker images to Docker Hub (jenkins)
 .PHONY: binaries-upload
 binaries-upload: ## Upload binaries to Google Storage (jenkins)
 	cd "release/${TAG}"; for f in *; do \
-		c="$${f%%_*}" \
-		&& if [ "$${f##*.}" != "$${f}" ]; then \
-			ln -s "$${f}" "$${f%%_*}.$${f##*.}" \
-			&& zip "$${f}.zip" "$${f%%_*}.$${f##*.}" \
-			&& rm "$${f%%_*}.$${f##*.}" \
-		; else \
-			ln -sf "$${f}" "$${f%%_*}" \
-			&& zip "$${f}.zip" "$${f%%_*}" \
-			&& rm "$${f%%_*}" \
-		; fi \
+		zipname=$$(echo $${f} | sed 's/.exe//g') && \
+		zip -r "$${zipname}.zip" "$${f}" \
 	; done
 	cd "release/${TAG}"; gsutil -m cp -r *.zip "gs://storj-v3-alpha-builds/${TAG}/"
 
@@ -357,11 +347,11 @@ binaries-clean: ## Remove all local release binaries (jenkins)
 
 .PHONY: clean-images
 clean-images:
-	-docker rmi storjlabs/gateway:${TAG}${CUSTOMTAG}
 	-docker rmi storjlabs/satellite:${TAG}${CUSTOMTAG}
 	-docker rmi storjlabs/storagenode:${TAG}${CUSTOMTAG}
 	-docker rmi storjlabs/uplink:${TAG}${CUSTOMTAG}
 	-docker rmi storjlabs/versioncontrol:${TAG}${CUSTOMTAG}
+	-docker rmi storjlabs/segment-reaper:${TAG}${CUSTOMTAG}
 
 .PHONY: test-docker-clean
 test-docker-clean: ## Clean up Docker environment used in test-docker target
@@ -386,13 +376,7 @@ diagrams-graphml:
 	archview -skip-class "Peer,Master Database" -trim-prefix storj.io/storj/satellite/   -out satellite.graphml    ./satellite/...
 	archview -skip-class "Peer,Master Database" -trim-prefix storj.io/storj/storagenode/ -out storage-node.graphml ./storagenode/...
 
-.PHONY: update-satellite-config-lock
-update-satellite-config-lock: ## Update the satellite config lock file
-	@docker run -ti --rm \
-		-v ${GOPATH}/pkg/mod:/go/pkg/mod \
-		-v ${CURDIR}:/storj \
-		-v $(shell go env GOCACHE):/go-cache \
-		-e "GOCACHE=/go-cache" \
-		-u root:root \
-		golang:${GO_VERSION} \
-		/bin/bash -c "cd /storj/scripts; ./update-satellite-config-lock.sh"
+.PHONY: bump-dependencies
+bump-dependencies:
+	go get storj.io/common@main storj.io/private@main storj.io/uplink@main
+	go mod tidy

@@ -2,8 +2,8 @@
 
 # This file contains the first part of Stage 2 for the rolling upgrade test.
 # Description of file functionality:
-#  * Download the inline, remote, and multisegment file from the network using the master uplink and the new satellite api.
-#  * Download the inline, remote, and multisegment file from the network using the master uplink and the old satellite api.
+#  * Download the inline, remote, and multisegment file from the network using the main uplink and the new satellite api.
+#  * Download the inline, remote, and multisegment file from the network using the main uplink and the old satellite api.
 
 set -ueo pipefail
 
@@ -11,6 +11,7 @@ set -ueo pipefail
 # uploaded via scripts/test-versions.sh
 main_cfg_dir=$1
 existing_bucket_name_suffixes=$2
+update_access_script_path=$3
 
 bucket="bucket-123"
 test_files_dir="${main_cfg_dir}/testfiles"
@@ -26,8 +27,10 @@ shasum $(which storj-sim)
 if [ ! -d ${main_cfg_dir}/uplink-old-api ]; then
     mkdir -p ${main_cfg_dir}/uplink-old-api
     access=$(storj-sim --config-dir=$main_cfg_dir network env GATEWAY_0_ACCESS)
-    old_sat_api_addr="127.0.0.1:30000"
-    uplink import --satellite-addr="$old_sat_api_addr" --config-dir="${main_cfg_dir}/uplink-old-api" "$access"  --client.segment-size="64.0 KiB"
+    new_access=$(go run $update_access_script_path $(storj-sim --config-dir=$main_cfg_dir network env SATELLITE_0_DIR) $access)
+    sat_id=$(storj-sim --config-dir=$main_cfg_dir network env SATELLITE_0_ID)
+    old_sat_api_addr="$sat_id@127.0.0.1:30000"
+    uplink import --satellite-address="$old_sat_api_addr" --config-dir="${main_cfg_dir}/uplink-old-api" "$new_access"
 fi
 
 echo -e "\nConfig directory for uplink:"

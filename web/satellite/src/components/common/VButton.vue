@@ -7,7 +7,7 @@
         :class="containerClassName"
         :style="style"
         @click="onPress">
-        <h1 class="label">{{label}}</h1>
+        <span class="label">{{label}}</span>
     </div>
 </template>
 
@@ -28,7 +28,11 @@ export default class VButton extends Vue {
     @Prop({default: false})
     private readonly isWhite: boolean;
     @Prop({default: false})
+    private readonly isTransparent: boolean;
+    @Prop({default: false})
     private readonly isDeletion: boolean;
+    @Prop({default: false})
+    private readonly isBlueWhite: boolean;
     @Prop({default: false})
     private isDisabled: boolean;
     @Prop({default: () => { return; }})
@@ -43,7 +47,11 @@ export default class VButton extends Vue {
 
         if (this.isWhite) return 'container white';
 
+        if (this.isTransparent) return 'container transparent';
+
         if (this.isDeletion) return 'container red';
+
+        if (this.isBlueWhite) return 'container blue-white';
 
         return 'container';
     }
@@ -51,8 +59,7 @@ export default class VButton extends Vue {
 </script>
 
 <style scoped lang="scss">
-    .white,
-    .red {
+    .transparent {
         background-color: transparent !important;
         border: 1px solid #afb7c1 !important;
 
@@ -61,12 +68,40 @@ export default class VButton extends Vue {
         }
     }
 
+    .white {
+        background-color: #fff !important;
+        border: 1px solid #afb7c1 !important;
+
+        .label {
+            color: #354049 !important;
+        }
+    }
+
+    .blue-white {
+        background-color: #fff !important;
+        border: 2px solid #2683ff !important;
+
+        .label {
+            color: #2683ff !important;
+        }
+    }
+
     .disabled {
         background-color: #dadde5 !important;
         border-color: #dadde5 !important;
+        pointer-events: none !important;
 
         .label {
             color: #acb0bc !important;
+        }
+    }
+
+    .red {
+        background-color: #fff3f2 !important;
+        border: 2px solid #e30011 !important;
+
+        .label {
+            color: #e30011 !important;
         }
     }
 
@@ -77,18 +112,21 @@ export default class VButton extends Vue {
         background-color: #2683ff;
         border-radius: 6px;
         cursor: pointer;
-        user-select: none;
 
         .label {
             font-family: 'font_medium', sans-serif;
             font-size: 16px;
             line-height: 23px;
             color: #fff;
+            margin: 0;
+            white-space: nowrap;
         }
 
         &:hover {
             background-color: #0059d0;
 
+            &.transparent,
+            &.blue-white,
             &.white {
                 box-shadow: none !important;
                 background-color: #2683ff !important;
@@ -97,6 +135,10 @@ export default class VButton extends Vue {
                 .label {
                     color: white !important;
                 }
+            }
+
+            &.blue-white {
+                border: 2px solid #2683ff !important;
             }
 
             &.red {

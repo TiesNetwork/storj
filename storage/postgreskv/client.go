@@ -6,8 +6,9 @@ package postgreskv
 import (
 	"context"
 	"database/sql"
+	"errors"
+	"sort"
 
-	"github.com/lib/pq"
 	"github.com/spacemonkeygo/monkit/v3"
 	"github.com/zeebo/errs"
 
@@ -22,35 +23,37 @@ var (
 	mon = monkit.Package()
 )
 
-// Client is the entrypoint into a postgreskv data store
+// Client is the entrypoint into a postgreskv data store.
 type Client struct {
-	db tagsql.DB
-
+	db          tagsql.DB
+	dbURL       string
 	lookupLimit int
 }
 
-// New instantiates a new postgreskv client given db URL
-func New(dbURL string) (*Client, error) {
-	dbURL = pgutil.CheckApplicationName(dbURL)
-
-	db, err := tagsql.Open("postgres", dbURL)
+// Open connects a new postgreskv client given db URL.
+func Open(ctx context.Context, dbURL string, app string) (*Client, error) {
+	dbURL, err := pgutil.CheckApplicationName(dbURL, app)
 	if err != nil {
 		return nil, err
 	}
 
-	dbutil.Configure(db, mon)
-	//TODO: Fix the parameters!!
-	err = schema.PrepareDB(context.TODO(), db, dbURL)
+	db, err := tagsql.Open(ctx, "pgx", dbURL)
 	if err != nil {
 		return nil, err
 	}
 
-	return NewWith(db), nil
+	dbutil.Configure(ctx, db, "postgreskv", mon)
+	return NewWith(db, dbURL), nil
 }
 
 // NewWith instantiates a new postgreskv client given db.
-func NewWith(db tagsql.DB) *Client {
-	return &Client{db: db, lookupLimit: storage.DefaultLookupLimit}
+func NewWith(db tagsql.DB, dbURL string) *Client {
+	return &Client{db: db, lookupLimit: storage.DefaultLookupLimit, dbURL: dbURL}
+}
+
+// MigrateToLatest migrates to latest schema version.
+func (client *Client) MigrateToLatest(ctx context.Context) error {
+	return schema.PrepareDB(ctx, client.db, client.dbURL)
 }
 
 // SetLookupLimit sets the lookup limit.
@@ -59,7 +62,7 @@ func (client *Client) SetLookupLimit(v int) { client.lookupLimit = v }
 // LookupLimit returns the maximum limit that is allowed.
 func (client *Client) LookupLimit() int { return client.lookupLimit }
 
-// Close closes the client
+// Close closes the client.
 func (client *Client) Close() error {
 	return client.db.Close()
 }
@@ -95,7 +98,7 @@ func (client *Client) Get(ctx context.Context, key storage.Key) (_ storage.Value
 
 	var val []byte
 	err = row.Scan(&val)
-	if err == sql.ErrNoRows {
+	if errors.Is(err, sql.ErrNoRows) {
 		return nil, storage.ErrKeyNotFound.New("%q", key)
 	}
 
@@ -108,7 +111,7 @@ func (client *Client) GetAll(ctx context.Context, keys storage.Keys) (_ storage.
 	defer mon.Task()(&ctx)(&err)
 
 	if len(keys) > client.lookupLimit {
-		return nil, storage.ErrLimitExceeded
+		return nil, storage.ErrLimitExceeded.New("lookup limit exceeded")
 	}
 
 	q := `
@@ -119,7 +122,7 @@ func (client *Client) GetAll(ctx context.Context, keys storage.Keys) (_ storage.
 			ON (pd.fullpath = pk.request)
 		ORDER BY pk.ord
 	`
-	rows, err := client.db.Query(ctx, q, pq.ByteaArray(keys.ByteSlices()))
+	rows, err := client.db.Query(ctx, q, pgutil.ByteaArray(keys.ByteSlices()))
 	if err != nil {
 		return nil, errs.Wrap(err)
 	}
@@ -161,15 +164,20 @@ func (client *Client) Delete(ctx context.Context, key storage.Key) (err error) {
 	return nil
 }
 
-// DeleteMultiple deletes keys ignoring missing keys
+// DeleteMultiple deletes keys ignoring missing keys.
 func (client *Client) DeleteMultiple(ctx context.Context, keys []storage.Key) (_ storage.Items, err error) {
 	defer mon.Task()(&ctx, len(keys))(&err)
+
+	// make sure deletes always happen in the same order
+	sort.Slice(keys, func(i, j int) bool {
+		return keys[i].Less(keys[j])
+	})
 
 	rows, err := client.db.QueryContext(ctx, `
 		DELETE FROM pathdata
 		WHERE fullpath = any($1::BYTEA[])
 		RETURNING fullpath, metadata`,
-		pq.ByteaArray(storage.Keys(keys).ByteSlices()))
+		pgutil.ByteaArray(storage.Keys(keys).ByteSlices()))
 	if err != nil {
 		return nil, err
 	}
@@ -207,6 +215,13 @@ func (client *Client) Iterate(ctx context.Context, opts storage.IterateOptions, 
 		opts.Limit = client.lookupLimit
 	}
 
+	return client.IterateWithoutLookupLimit(ctx, opts, fn)
+}
+
+// IterateWithoutLookupLimit calls the callback with an iterator over the keys, but doesn't enforce default limit on opts.
+func (client *Client) IterateWithoutLookupLimit(ctx context.Context, opts storage.IterateOptions, fn func(context.Context, storage.Iterator) error) (err error) {
+	defer mon.Task()(&ctx)(&err)
+
 	opi, err := newOrderedPostgresIterator(ctx, client, opts)
 	if err != nil {
 		return err
@@ -218,7 +233,7 @@ func (client *Client) Iterate(ctx context.Context, opts storage.IterateOptions, 
 	return fn(ctx, opi)
 }
 
-// CompareAndSwap atomically compares and swaps oldValue with newValue
+// CompareAndSwap atomically compares and swaps oldValue with newValue.
 func (client *Client) CompareAndSwap(ctx context.Context, key storage.Key, oldValue, newValue storage.Value) (err error) {
 	defer mon.Task()(&ctx)(&err)
 
@@ -232,7 +247,7 @@ func (client *Client) CompareAndSwap(ctx context.Context, key storage.Key, oldVa
 
 		var val []byte
 		err = row.Scan(&val)
-		if err == sql.ErrNoRows {
+		if errors.Is(err, sql.ErrNoRows) {
 			return nil
 		}
 
@@ -253,7 +268,7 @@ func (client *Client) CompareAndSwap(ctx context.Context, key storage.Key, oldVa
 
 		var val []byte
 		err = row.Scan(&val)
-		if err == sql.ErrNoRows {
+		if errors.Is(err, sql.ErrNoRows) {
 			return storage.ErrValueChanged.New("%q", key)
 		}
 

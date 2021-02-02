@@ -20,18 +20,27 @@ populate_sno_versions(){
     seq $number_of_nodes | xargs -n1 -I{} echo $version
 }
 
+# set this var to anything else than `jenkins` to run tests locally
+RUN_TYPE=${RUN_TYPE:-"jenkins"}
+
 # set peers' versions
 # in stage 1: satellite and storagenode use latest release version, uplink uses all highest point release from all major releases starting from v0.15
-# in stage 2: satellite core uses latest release version and satellite api uses master. Storage nodes are split into half on latest release version and half on master. Uplink uses the all versions from stage 1 plus master
+# in stage 2: satellite core uses latest release version and satellite api uses main. Storage nodes are split into half on latest release version and half on main. Uplink uses the all versions from stage 1 plus main
 git fetch --tags
-current_release_version=$(git describe --tags `git rev-list --tags --max-count=1`)
-major_release_tags=$(git tag -l --sort -version:refname | sort -n -k2,2 -t'.' --unique | awk 'BEGIN{FS="[v.]"} $2 >= 0 && $3 >= 15 {print $0}')
+major_release_tags=$(
+    git tag -l --sort -version:refname |                             # get the tag list
+    grep -v rc |                                                     # remove release candidates
+    sort -n -k2,2 -t'.' --unique |                                   # only keep the largest patch version
+    sort -V |                                                        # resort based using "version sort"
+    awk 'BEGIN{FS="[v.]"} $2 >= 0 && $3 >= 35 || $2 >= 1 && $3 != 3 {print $0}' # keep only >= v0.31.x and v1.0.0 except v1.3.x
+)
+current_release_version=$(echo $major_release_tags | xargs -n 1 | tail -1)
 stage1_sat_version=$current_release_version
 stage1_uplink_versions=$major_release_tags
 stage1_storagenode_versions=$(populate_sno_versions $current_release_version 10)
-stage2_sat_version="master"
-stage2_uplink_versions=$major_release_tags\ "master"
-stage2_storagenode_versions=$(populate_sno_versions $current_release_version 5)\ $(populate_sno_versions "master" 5)
+stage2_sat_version="main"
+stage2_uplink_versions=$major_release_tags\ "main"
+stage2_storagenode_versions=$(populate_sno_versions $current_release_version 5)\ $(populate_sno_versions "main" 5)
 
 echo "stage1_sat_version" $stage1_sat_version
 echo "stage1_uplink_versions" $stage1_uplink_versions
@@ -62,20 +71,30 @@ replace_in_file(){
     esac
 }
 
+scriptdir="$( cd "$( dirname "${BASH_SOURCE[0]}" )" >/dev/null 2>&1 && pwd )"
+
 # mirroring install-sim from the Makefile since it won't work on private Jenkins
 install_sim(){
-    local bin_dir="$1"
+    local work_dir="$1"
+    local bin_dir="$2"
     mkdir -p ${bin_dir}
 
-    go install -race -v -o ${bin_dir}/storagenode storj.io/storj/cmd/storagenode >/dev/null 2>&1
-    go install -race -v -o ${bin_dir}/satellite storj.io/storj/cmd/satellite >/dev/null 2>&1
-    go install -race -v -o ${bin_dir}/storj-sim storj.io/storj/cmd/storj-sim >/dev/null 2>&1
-    go install -race -v -o ${bin_dir}/versioncontrol storj.io/storj/cmd/versioncontrol >/dev/null 2>&1
-    go install -race -v -o ${bin_dir}/uplink storj.io/storj/cmd/uplink >/dev/null 2>&1
-    go install -race -v -o ${bin_dir}/gateway storj.io/storj/cmd/gateway >/dev/null 2>&1
-    go install -race -v -o ${bin_dir}/identity storj.io/storj/cmd/identity >/dev/null 2>&1
-    go install -race -v -o ${bin_dir}/certificates storj.io/storj/cmd/certificates >/dev/null 2>&1
+    go build -race -v -o ${bin_dir}/storagenode storj.io/storj/cmd/storagenode >/dev/null 2>&1
+    go build -race -v -o ${bin_dir}/satellite storj.io/storj/cmd/satellite >/dev/null 2>&1
+    go build -race -v -o ${bin_dir}/storj-sim storj.io/storj/cmd/storj-sim >/dev/null 2>&1
+    go build -race -v -o ${bin_dir}/versioncontrol storj.io/storj/cmd/versioncontrol >/dev/null 2>&1
 
+    go build -race -v -o ${bin_dir}/uplink storj.io/storj/cmd/uplink >/dev/null 2>&1
+    go build -race -v -o ${bin_dir}/identity storj.io/storj/cmd/identity >/dev/null 2>&1
+    go build -race -v -o ${bin_dir}/certificates storj.io/storj/cmd/certificates >/dev/null 2>&1
+
+    if [ -d "${work_dir}/cmd/gateway" ]; then
+        (cd ${work_dir}/cmd/gateway && go build -race -v -o ${bin_dir}/gateway storj.io/storj/cmd/gateway >/dev/null 2>&1)
+    else
+	mkdir -p ${work_dir}/build/gateway-tmp
+	(cd ${work_dir}/build/gateway-tmp && go mod init gatewaybuild && GOBIN=${bin_dir} GO111MODULE=on go get storj.io/gateway@latest;)
+        rm -rf ${work_dir}/build/gateway-tmp
+    fi
 }
 
 setup_stage(){
@@ -92,6 +111,7 @@ setup_stage(){
     PATH=$test_dir/bin:$PATH dest_sat_cfg_dir=$(storj-sim network env --config-dir=${test_dir}/local-network/ SATELLITE_0_DIR)
 
     # ln binary and copy config.yaml for desired version
+    ln -f $(version_dir ${sat_version})/bin/storj-sim $test_dir/bin/storj-sim
     ln -f $src_sat_version_dir/bin/satellite $dest_sat_cfg_dir/satellite
     cp $src_sat_cfg_dir/config.yaml $dest_sat_cfg_dir
     replace_in_file "${src_sat_version_dir}" "${test_dir}" "${dest_sat_cfg_dir}/config.yaml"
@@ -139,34 +159,52 @@ fi
 
 echo "Setting up environments for versions" ${unique_versions}
 
+# create a result file for each child process' exit code
+exit_statuses_dir=${TMP}/exit_statuses
+mkdir ${exit_statuses_dir}
+write_exit_status(){
+    # we need to capture the exit status first so it won't be overwritten
+    local exit_status=$?
+    local version=$1
+    echo $exit_status > ${exit_statuses_dir}/${version} # write exit code to a file named with the current installing version
+    echo "installation for ${version} exited with status $exit_status"
+}
 # clean up git worktree
 git worktree prune
 for version in ${unique_versions}; do
     # run in parallel
     (
+        trap "write_exit_status ${version}" EXIT
         dir=$(version_dir ${version})
         bin_dir=${dir}/bin
 
         echo -e "\nAdding worktree for ${version} in ${dir}."
-        if [[ $version = "master" ]]
+        if [[ $version = "main" ]]
         then
-            git worktree add -f "$dir" "origin/master"
+            git worktree add -f "$dir" "origin/main"
         else
             git worktree add -f "$dir" "${version}"
         fi
-        rm -f ${dir}/private/version/release.go
+
         rm -f ${dir}/internal/version/release.go
-        if [[ $version = $current_release_version || $version = "master" ]]
+        if [ -d "${dir}/private/version/release.go" ]; then
+            # clear out release information
+            cat > ${dir}/private/version/release.go <<-EOF
+		// Copyright (C) 2020 Storj Labs, Inc.
+		// See LICENSE for copying information.
+		package version
+		EOF
+        fi
+
+        if [[ $version = $current_release_version || $version = "main" ]]
         then
+
             echo "Installing storj-sim for ${version} in ${dir}."
-            pushd ${dir}
-            install_sim ${bin_dir}
+            install_sim ${dir} ${bin_dir}
             echo "finished installing"
-            popd
-            # uncomment for local testing
-            # GOBIN=${bin_dir} make -C ${dir} install-sim >/dev/null 2>&1
+
             echo "Setting up storj-sim for ${version}. Bin: ${bin_dir}, Config: ${dir}/local-network"
-            PATH=${bin_dir}:$PATH storj-sim -x --host="${STORJ_NETWORK_HOST4}" --postgres="${STORJ_SIM_POSTGRES}" --config-dir "${dir}/local-network" network setup > /dev/null 2>&1
+            PATH=${bin_dir}:$PATH storj-sim -x --host="${STORJ_NETWORK_HOST4}" --postgres="${STORJ_SIM_POSTGRES}" --config-dir "${dir}/local-network" network setup >/dev/null 2>&1
             echo "Finished setting up. ${dir}/local-network:" $(ls ${dir}/local-network)
             echo "Binary shasums:"
             shasum ${bin_dir}/satellite
@@ -174,32 +212,24 @@ for version in ${unique_versions}; do
             shasum ${bin_dir}/uplink
             shasum ${bin_dir}/gateway
         else
-            echo "Installing uplink and gateway for ${version} in ${dir}."
+            echo "Installing uplink for ${version} in ${dir}."
             pushd ${dir}
             mkdir -p ${bin_dir}
-            go install -race -v -o ${bin_dir}/uplink storj.io/storj/cmd/uplink >/dev/null 2>&1
-            go install -race -v -o ${bin_dir}/gateway storj.io/storj/cmd/gateway >/dev/null 2>&1
-            # uncomment for local testing
-            # GOBIN=${bin_dir} go install -race -v storj.io/storj/cmd/uplink >/dev/null 2>&1
-            # GOBIN=${bin_dir} go install -race -v storj.io/storj/cmd/gateway >/dev/null 2>&1
+
+            go build -race -v -o ${bin_dir}/uplink storj.io/storj/cmd/uplink >/dev/null 2>&1
+
             popd
             echo "Finished installing. ${bin_dir}:" $(ls ${bin_dir})
             echo "Binary shasums:"
             shasum ${bin_dir}/uplink
-            shasum ${bin_dir}/gateway
         fi
     ) &
 done
 
-for job in `jobs -p`
-do
-    echo "wait for $job"
-    RESULT=0
-    wait $job || RESULT=1
-    if [ "$RESULT" == "1" ]; then
-           exit $?
-    fi
-done
+wait # wait for all child processes to finish
+# iterate through those result files to check their exit code
+# if there's any exit code that's non-zero, exit the test
+grep -qvwr "0" ${exit_statuses_dir} && exit 1
 
 # Use stage 1 satellite version as the starting state. Create a cp of that
 # version folder so we don't worry about dirty states. Then copy/link/mv
@@ -207,15 +237,15 @@ done
 test_dir=$(version_dir "test_dir")
 cp -r $(version_dir ${stage1_sat_version}) ${test_dir}
 echo -e "\nSetting up stage 1 in ${test_dir}"
-scriptdir="$( cd "$( dirname "${BASH_SOURCE[0]}" )" >/dev/null 2>&1 && pwd )"
 setup_stage "${test_dir}" "${stage1_sat_version}" "${stage1_storagenode_versions}"
+update_access_script_path="$(version_dir "main")/scripts/update-access.go"
 
 # Uploading files to the network using the latest release version for each uplink version
 for ul_version in ${stage1_uplink_versions}; do
     echo "Stage 1 Uplink version: ${ul_version}"
     src_ul_version_dir=$(version_dir ${ul_version})
     ln -f ${src_ul_version_dir}/bin/uplink $test_dir/bin/uplink
-    PATH=$test_dir/bin:$PATH storj-sim -x --host "${STORJ_NETWORK_HOST4}" --config-dir "${test_dir}/local-network" network test bash "${scriptdir}/test-versions.sh" "${test_dir}/local-network" "upload" "${ul_version}"
+    PATH=$test_dir/bin:$PATH storj-sim -x --host "${STORJ_NETWORK_HOST4}" --config-dir "${test_dir}/local-network" network test bash "${scriptdir}/test-versions.sh" "${test_dir}/local-network" "upload" "${ul_version}" "$update_access_script_path"
 done
 # Remove current uplink config to regenerate uplink config for older uplink version
 rm -rf "${test_dir}/local-network/uplink"
@@ -224,14 +254,14 @@ echo -e "\nSetting up stage 2 in ${test_dir}"
 setup_stage "${test_dir}" "${stage2_sat_version}" "${stage2_storagenode_versions}"
 echo -e "\nRunning stage 2."
 
-# Downloading every file uploaded in stage 1 from the network using the latest commit from master branch for each uplink version
+# Downloading every file uploaded in stage 1 from the network using the latest commit from main branch for each uplink version
 for ul_version in ${stage2_uplink_versions}; do
     echo "Stage 2 Uplink version: ${ul_version}"
     src_ul_version_dir=$(version_dir ${ul_version})
     ln -f ${src_ul_version_dir}/bin/uplink $test_dir/bin/uplink
-    PATH=$test_dir/bin:$PATH storj-sim -x --host "${STORJ_NETWORK_HOST4}" --config-dir "${test_dir}/local-network" network test bash "${scriptdir}/test-versions.sh" "${test_dir}/local-network" "download" "${ul_version}" "${stage1_uplink_versions}"
+    PATH=$test_dir/bin:$PATH storj-sim -x --host "${STORJ_NETWORK_HOST4}" --config-dir "${test_dir}/local-network" network test bash "${scriptdir}/test-versions.sh" "${test_dir}/local-network" "download" "${ul_version}" "$update_access_script_path" "${stage1_uplink_versions}"
 done
 
 
 echo -e "\nCleaning up."
-PATH=$test_dir/bin:$PATH storj-sim -x --host "${STORJ_NETWORK_HOST4}" --config-dir "${test_dir}/local-network" network test bash "${scriptdir}/test-versions.sh" "${test_dir}/local-network" "cleanup" "${stage1_uplink_versions}"
+PATH=$test_dir/bin:$PATH storj-sim -x --host "${STORJ_NETWORK_HOST4}" --config-dir "${test_dir}/local-network" network test bash "${scriptdir}/test-versions.sh" "${test_dir}/local-network" "cleanup" "${stage1_uplink_versions}" ""

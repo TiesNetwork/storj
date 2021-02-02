@@ -6,13 +6,14 @@ package testplanet_test
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
-	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"github.com/zeebo/errs"
 	"golang.org/x/sync/errgroup"
 
 	"storj.io/common/memory"
@@ -25,8 +26,9 @@ import (
 	"storj.io/storj/pkg/revocation"
 	"storj.io/storj/pkg/server"
 	"storj.io/storj/private/testplanet"
-	"storj.io/storj/satellite/overlay"
-	"storj.io/uplink/metainfo"
+	"storj.io/storj/satellite/metainfo/metabase"
+	"storj.io/uplink"
+	"storj.io/uplink/private/metainfo"
 )
 
 func TestUplinksParallel(t *testing.T) {
@@ -88,14 +90,14 @@ func TestDownloadWithSomeNodesOffline(t *testing.T) {
 
 		// get a remote segment from pointerdb
 		pdb := satellite.Metainfo.Service
-		listResponse, _, err := pdb.List(ctx, "", "", true, 0, 0)
+		listResponse, _, err := pdb.List(ctx, metabase.SegmentKey{}, "", true, 0, 0)
 		require.NoError(t, err)
 
 		var path string
 		var pointer *pb.Pointer
 		for _, v := range listResponse {
 			path = v.GetPath()
-			pointer, err = pdb.Get(ctx, path)
+			pointer, err = pdb.Get(ctx, metabase.SegmentKey(path))
 			require.NoError(t, err)
 			if pointer.GetType() == pb.Pointer_REMOTE {
 				break
@@ -109,42 +111,15 @@ func TestDownloadWithSomeNodesOffline(t *testing.T) {
 		numPieces := len(remotePieces)
 		toKill := numPieces - int(minReq)
 
-		nodesToKill := make(map[storj.NodeID]bool)
-		for i, piece := range remotePieces {
-			if i >= toKill {
-				continue
-			}
-			nodesToKill[piece.NodeId] = true
+		for _, piece := range remotePieces[:toKill] {
+			err := planet.StopNodeAndUpdate(ctx, planet.FindNode(piece.NodeId))
+			require.NoError(t, err)
 		}
 
-		for _, node := range planet.StorageNodes {
-			if nodesToKill[node.ID()] {
-				err = planet.StopPeer(node)
-				require.NoError(t, err)
-
-				// mark node as offline in overlay
-				info := overlay.NodeCheckInInfo{
-					NodeID: node.ID(),
-					IsUp:   true,
-					Address: &pb.NodeAddress{
-						Address: node.Addr(),
-					},
-					Version: &pb.NodeVersion{
-						Version:    "v0.0.0",
-						CommitHash: "",
-						Timestamp:  time.Time{},
-						Release:    false,
-					},
-				}
-				err = satellite.Overlay.Service.UpdateCheckIn(ctx, info, time.Now().UTC().Add(-4*time.Hour))
-				require.NoError(t, err)
-			}
-
-		}
 		// confirm that we marked the correct number of storage nodes as offline
 		nodes, err := satellite.Overlay.Service.Reliable(ctx)
 		require.NoError(t, err)
-		require.Len(t, nodes, len(planet.StorageNodes)-len(nodesToKill))
+		require.Len(t, nodes, len(planet.StorageNodes)-toKill)
 
 		// we should be able to download data without any of the original nodes
 		newData, err := ul.Download(ctx, satellite, "testbucket", "test/path")
@@ -156,10 +131,11 @@ func TestDownloadWithSomeNodesOffline(t *testing.T) {
 type piecestoreMock struct {
 }
 
-func (mock *piecestoreMock) Upload(server pb.Piecestore_UploadServer) error {
+func (mock *piecestoreMock) Upload(server pb.DRPCPiecestore_UploadStream) error {
 	return nil
 }
-func (mock *piecestoreMock) Download(server pb.Piecestore_DownloadServer) error {
+
+func (mock *piecestoreMock) Download(server pb.DRPCPiecestore_DownloadStream) error {
 	timoutTicker := time.NewTicker(30 * time.Second)
 	defer timoutTicker.Stop()
 
@@ -171,10 +147,6 @@ func (mock *piecestoreMock) Download(server pb.Piecestore_DownloadServer) error 
 	}
 }
 func (mock *piecestoreMock) Delete(ctx context.Context, delete *pb.PieceDeleteRequest) (_ *pb.PieceDeleteResponse, err error) {
-	return nil, nil
-}
-
-func (mock *piecestoreMock) DeletePiece(ctx context.Context, delete *pb.PieceDeletePieceRequest) (_ *pb.PieceDeletePieceResponse, err error) {
 	return nil, nil
 }
 
@@ -203,63 +175,63 @@ func TestDownloadFromUnresponsiveNode(t *testing.T) {
 
 		// get a remote segment from pointerdb
 		pdb := planet.Satellites[0].Metainfo.Service
-		listResponse, _, err := pdb.List(ctx, "", "", true, 0, 0)
+		listResponse, _, err := pdb.List(ctx, metabase.SegmentKey{}, "", true, 0, 0)
 		require.NoError(t, err)
 
 		var path string
 		var pointer *pb.Pointer
 		for _, v := range listResponse {
 			path = v.GetPath()
-			pointer, err = pdb.Get(ctx, path)
+			pointer, err = pdb.Get(ctx, metabase.SegmentKey(path))
 			require.NoError(t, err)
 			if pointer.GetType() == pb.Pointer_REMOTE {
 				break
 			}
 		}
 
-		stopped := false
 		// choose used storage node and replace it with fake listener
-		unresponsiveNode := pointer.Remote.RemotePieces[0].NodeId
-		for _, storageNode := range planet.StorageNodes {
-			if storageNode.ID() == unresponsiveNode {
-				err = planet.StopPeer(storageNode)
-				require.NoError(t, err)
+		storageNode := planet.FindNode(pointer.Remote.RemotePieces[0].NodeId)
+		require.NotNil(t, storageNode)
 
-				wl, err := planet.WriteWhitelist(storj.LatestIDVersion())
-				require.NoError(t, err)
-				tlscfg := tlsopts.Config{
-					RevocationDBURL:     "bolt://" + filepath.Join(ctx.Dir("fakestoragenode"), "revocation.db"),
-					UsePeerCAWhitelist:  true,
-					PeerCAWhitelistPath: wl,
-					PeerIDVersions:      "*",
-					Extensions: extensions.Config{
-						Revocation:          false,
-						WhitelistSignedLeaf: false,
-					},
-				}
+		err = planet.StopPeer(storageNode)
+		require.NoError(t, err)
 
-				revocationDB, err := revocation.NewDBFromCfg(tlscfg)
-				require.NoError(t, err)
-
-				tlsOptions, err := tlsopts.NewOptions(storageNode.Identity, tlscfg, revocationDB)
-				require.NoError(t, err)
-
-				server, err := server.New(storageNode.Log.Named("mock-server"), tlsOptions, storageNode.Addr(), storageNode.PrivateAddr(), nil)
-				require.NoError(t, err)
-				pb.RegisterPiecestoreServer(server.GRPC(), &piecestoreMock{})
-				go func() {
-					// TODO: get goroutine under control
-					err := server.Run(ctx)
-					require.NoError(t, err)
-
-					err = revocationDB.Close()
-					require.NoError(t, err)
-				}()
-				stopped = true
-				break
-			}
+		wl, err := planet.WriteWhitelist(storj.LatestIDVersion())
+		require.NoError(t, err)
+		tlscfg := tlsopts.Config{
+			RevocationDBURL:     "bolt://" + ctx.File("fakestoragenode", "revocation.db"),
+			UsePeerCAWhitelist:  true,
+			PeerCAWhitelistPath: wl,
+			PeerIDVersions:      "*",
+			Extensions: extensions.Config{
+				Revocation:          false,
+				WhitelistSignedLeaf: false,
+			},
 		}
-		assert.True(t, stopped, "no storage node was altered")
+
+		revocationDB, err := revocation.OpenDBFromCfg(ctx, tlscfg)
+		require.NoError(t, err)
+
+		tlsOptions, err := tlsopts.NewOptions(storageNode.Identity, tlscfg, revocationDB)
+		require.NoError(t, err)
+
+		server, err := server.New(storageNode.Log.Named("mock-server"), tlsOptions, storageNode.Config.Server)
+		require.NoError(t, err)
+
+		err = pb.DRPCRegisterPiecestore(server.DRPC(), &piecestoreMock{})
+		require.NoError(t, err)
+
+		defer ctx.Check(server.Close)
+
+		subctx, subcancel := context.WithCancel(ctx)
+		defer subcancel()
+		ctx.Go(func() error {
+			if err := server.Run(subctx); err != nil {
+				return errs.Wrap(err)
+			}
+
+			return errs.Wrap(revocationDB.Close())
+		})
 
 		data, err := planet.Uplinks[0].Download(ctx, planet.Satellites[0], "testbucket", "test/path")
 		assert.NoError(t, err)
@@ -271,12 +243,13 @@ func TestDownloadFromUnresponsiveNode(t *testing.T) {
 func TestDeleteWithOfflineStoragenode(t *testing.T) {
 	testplanet.Run(t, testplanet.Config{
 		SatelliteCount: 1, StorageNodeCount: 6, UplinkCount: 1,
+		Reconfigure: testplanet.Reconfigure{
+			Satellite: testplanet.MaxSegmentSize(1 * memory.MiB),
+		},
 	}, func(t *testing.T, ctx *testcontext.Context, planet *testplanet.Planet) {
 		expectedData := testrand.Bytes(5 * memory.MiB)
 
-		config := planet.Uplinks[0].GetConfig(planet.Satellites[0])
-		config.Client.SegmentSize = 1 * memory.MiB
-		err := planet.Uplinks[0].UploadWithClientConfig(ctx, planet.Satellites[0], config, "test-bucket", "test-file", expectedData)
+		err := planet.Uplinks[0].Upload(ctx, planet.Satellites[0], "test-bucket", "test-file", expectedData)
 		require.NoError(t, err)
 
 		for _, node := range planet.StorageNodes {
@@ -289,7 +262,7 @@ func TestDeleteWithOfflineStoragenode(t *testing.T) {
 
 		_, err = planet.Uplinks[0].Download(ctx, planet.Satellites[0], "test-bucket", "test-file")
 		require.Error(t, err)
-		require.True(t, storj.ErrObjectNotFound.Has(err))
+		require.True(t, errors.Is(err, uplink.ErrObjectNotFound))
 
 		key := planet.Uplinks[0].APIKey[planet.Satellites[0].ID()]
 		metainfoClient, err := planet.Uplinks[0].DialMetainfo(ctx, planet.Satellites[0], key)
@@ -301,5 +274,18 @@ func TestDeleteWithOfflineStoragenode(t *testing.T) {
 		})
 		require.NoError(t, err)
 		require.Equal(t, 0, len(objects))
+	})
+}
+
+func TestUplinkOpenProject(t *testing.T) {
+	testplanet.Run(t, testplanet.Config{
+		SatelliteCount: 1, StorageNodeCount: 0, UplinkCount: 1,
+	}, func(t *testing.T, ctx *testcontext.Context, planet *testplanet.Planet) {
+		project, err := planet.Uplinks[0].OpenProject(ctx, planet.Satellites[0])
+		require.NoError(t, err)
+		defer ctx.Check(project.Close)
+
+		_, err = project.EnsureBucket(ctx, "bucket-name")
+		require.NoError(t, err)
 	})
 }

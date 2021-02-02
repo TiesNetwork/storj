@@ -8,10 +8,11 @@ import (
 	"github.com/zeebo/errs"
 	"go.uber.org/zap"
 
-	"storj.io/storj/pkg/process"
+	"storj.io/common/context2"
+	"storj.io/common/errs2"
+	"storj.io/private/process"
+	"storj.io/private/version"
 	"storj.io/storj/pkg/revocation"
-	"storj.io/storj/private/context2"
-	"storj.io/storj/private/version"
 	"storj.io/storj/satellite"
 	"storj.io/storj/satellite/metainfo"
 	"storj.io/storj/satellite/orders"
@@ -26,10 +27,11 @@ func cmdRepairerRun(cmd *cobra.Command, args []string) (err error) {
 
 	identity, err := runCfg.Identity.Load()
 	if err != nil {
-		zap.S().Fatal(err)
+		log.Error("Failed to load identity.", zap.Error(err))
+		return errs.New("Failed to load identity: %+v", err)
 	}
 
-	db, err := satellitedb.New(log.Named("db"), runCfg.Database, satellitedb.Options{})
+	db, err := satellitedb.Open(ctx, log.Named("db"), runCfg.Database, satellitedb.Options{ApplicationName: "satellite-repairer"})
 	if err != nil {
 		return errs.New("Error starting master database: %+v", err)
 	}
@@ -37,15 +39,15 @@ func cmdRepairerRun(cmd *cobra.Command, args []string) (err error) {
 		err = errs.Combine(err, db.Close())
 	}()
 
-	pointerDB, err := metainfo.NewStore(log.Named("pointerdb"), runCfg.Metainfo.DatabaseURL)
+	pointerDB, err := metainfo.OpenStore(ctx, log.Named("pointerdb"), runCfg.Metainfo.DatabaseURL, "satellite-repairer")
 	if err != nil {
-		return errs.New("Error creating metainfo database: %+v", err)
+		return errs.New("Error creating metainfo database connection: %+v", err)
 	}
 	defer func() {
 		err = errs.Combine(err, pointerDB.Close())
 	}()
 
-	revocationDB, err := revocation.NewDBFromCfg(runCfg.Server.Config)
+	revocationDB, err := revocation.OpenDBFromCfg(ctx, runCfg.Server.Config)
 	if err != nil {
 		return errs.New("Error creating revocation database: %+v", err)
 	}
@@ -66,31 +68,37 @@ func cmdRepairerRun(cmd *cobra.Command, args []string) (err error) {
 		db.RepairQueue(),
 		db.Buckets(),
 		db.OverlayCache(),
-		db.Orders(),
 		rollupsWriteCache,
+		db.Irreparable(),
 		version.Build,
 		&runCfg.Config,
+		process.AtomicLevel(cmd),
 	)
 	if err != nil {
 		return err
 	}
 
-	err = peer.Version.CheckVersion(ctx)
+	_, err = peer.Version.Service.CheckVersion(ctx)
 	if err != nil {
 		return err
 	}
 
-	if err := process.InitMetricsWithCertPath(ctx, log, nil, runCfg.Identity.CertPath); err != nil {
-		zap.S().Warn("Failed to initialize telemetry batcher on repairer: ", err)
+	if err := process.InitMetricsWithHostname(ctx, log, nil); err != nil {
+		log.Warn("Failed to initialize telemetry batcher on repairer", zap.Error(err))
+	}
+
+	err = pointerDB.MigrateToLatest(ctx)
+	if err != nil {
+		return errs.New("Error creating tables for metainfo database: %+v", err)
 	}
 
 	err = db.CheckVersion(ctx)
 	if err != nil {
-		zap.S().Fatal("failed satellite database version check: ", err)
+		log.Error("Failed satellite database version check.", zap.Error(err))
 		return errs.New("Error checking version for satellitedb: %+v", err)
 	}
 
 	runError := peer.Run(ctx)
 	closeError := peer.Close()
-	return errs.Combine(runError, closeError)
+	return errs2.IgnoreCanceled(errs.Combine(runError, closeError))
 }

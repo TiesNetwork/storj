@@ -12,8 +12,8 @@ import (
 	"github.com/zeebo/errs"
 	"go.uber.org/zap"
 
-	"storj.io/storj/pkg/cfgstruct"
-	"storj.io/storj/pkg/process"
+	"storj.io/private/cfgstruct"
+	"storj.io/private/process"
 	"storj.io/storj/satellite/metainfo"
 )
 
@@ -44,7 +44,12 @@ func cmdDetect(cmd *cobra.Command, args []string) (err error) {
 	ctx, _ := process.Ctx(cmd)
 
 	log := zap.L()
-	db, err := metainfo.NewStore(log.Named("pointerdb"), detectCfg.DatabaseURL)
+
+	if err := process.InitMetricsWithHostname(ctx, log, nil); err != nil {
+		log.Warn("Failed to initialize telemetry batcher on segment reaper", zap.Error(err))
+	}
+
+	db, err := metainfo.OpenStore(ctx, log.Named("pointerdb"), detectCfg.DatabaseURL, "satellite-reaper")
 	if err != nil {
 		return errs.New("error connecting database: %+v", err)
 	}
@@ -97,5 +102,8 @@ func cmdDetect(cmd *cobra.Command, args []string) (err error) {
 	log.Info("number of last inline segments", zap.Int("segments", observer.lastInlineSegments))
 	log.Info("number of remote segments", zap.Int("segments", observer.remoteSegments))
 	log.Info("number of zombie segments", zap.Int("segments", observer.zombieSegments))
-	return nil
+
+	mon.IntVal("zombie_segments").Observe(int64(observer.zombieSegments)) //mon:locked
+
+	return process.Report(ctx)
 }

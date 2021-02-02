@@ -7,7 +7,7 @@ import (
 	"context"
 	"time"
 
-	"github.com/skyrings/skyring-common/tools/uuid"
+	"storj.io/common/uuid"
 )
 
 // ErrProjectRecordExists is error class defining that such project record already exists.
@@ -17,7 +17,7 @@ var ErrProjectRecordExists = Error.New("invoice project record already exists")
 //
 // architecture: Database
 type ProjectRecordsDB interface {
-	// Create creates new invoice project record with coupon usages in the DB.
+	// Create creates new invoice project record with coupon usages and credits spendings in the DB.
 	Create(ctx context.Context, records []CreateProjectRecord, couponUsages []CouponUsage, start, end time.Time) error
 	// Check checks if invoice project record for specified project and billing period exists.
 	Check(ctx context.Context, projectID uuid.UUID, start, end time.Time) error
@@ -26,7 +26,7 @@ type ProjectRecordsDB interface {
 	// Consume consumes invoice project record.
 	Consume(ctx context.Context, id uuid.UUID) error
 	// ListUnapplied returns project records page with unapplied project records.
-	ListUnapplied(ctx context.Context, offset int64, limit int, before time.Time) (ProjectRecordsPage, error)
+	ListUnapplied(ctx context.Context, offset int64, limit int, start, end time.Time) (ProjectRecordsPage, error)
 }
 
 // CreateProjectRecord holds info needed for creation new invoice
@@ -47,6 +47,7 @@ type ProjectRecord struct {
 	Objects     float64
 	PeriodStart time.Time
 	PeriodEnd   time.Time
+	State       int
 }
 
 // ProjectRecordsPage holds project records and

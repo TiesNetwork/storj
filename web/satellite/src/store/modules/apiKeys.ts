@@ -5,6 +5,18 @@ import { StoreModule } from '@/store';
 import { ApiKey, ApiKeyCursor, ApiKeyOrderBy, ApiKeysApi, ApiKeysPage } from '@/types/apiKeys';
 import { SortDirection } from '@/types/common';
 
+export const API_KEYS_ACTIONS = {
+    FETCH: 'fetchApiKeys',
+    CREATE: 'createApiKey',
+    DELETE: 'deleteApiKey',
+    CLEAR: 'clearApiKeys',
+    SET_SEARCH_QUERY: 'setApiKeysSearchQuery',
+    SET_SORT_BY: 'setApiKeysSortingBy',
+    SET_SORT_DIRECTION: 'setApiKeysSortingDirection',
+    TOGGLE_SELECTION: 'toggleApiKeySelection',
+    CLEAR_SELECTION: 'clearApiKeySelection',
+};
+
 export const API_KEYS_MUTATIONS = {
     SET_PAGE: 'setApiKeys',
     TOGGLE_SELECTION: 'toggleApiKeysSelection',
@@ -96,10 +108,10 @@ export function makeApiKeysModule(api: ApiKeysApi): StoreModule<ApiKeysState> {
                 const projectId = rootGetters.selectedProject.id;
                 commit(SET_PAGE_NUMBER, pageNumber);
 
-                const apiKeys = await api.get(projectId, state.cursor);
-                commit(SET_PAGE, apiKeys);
+                const apiKeysPage: ApiKeysPage = await api.get(projectId, state.cursor);
+                commit(SET_PAGE, apiKeysPage);
 
-                return apiKeys;
+                return apiKeysPage;
             },
             createApiKey: async function ({commit, rootGetters}: any, name: string): Promise<ApiKey> {
                 const projectId = rootGetters.selectedProject.id;

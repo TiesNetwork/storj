@@ -6,13 +6,28 @@ package notifications
 import (
 	"context"
 
-	"github.com/skyrings/skyring-common/tools/uuid"
 	"github.com/spacemonkeygo/monkit/v3"
 	"go.uber.org/zap"
+
+	"storj.io/common/uuid"
 )
 
 var (
 	mon = monkit.Package()
+)
+
+// TimesNotified is a numeric value of amount of notifications being sent to user.
+type TimesNotified int
+
+const (
+	// TimesNotifiedZero haven't being notified yet.
+	TimesNotifiedZero TimesNotified = 0
+	// TimesNotifiedFirst sent notification one time.
+	TimesNotifiedFirst TimesNotified = 1
+	// TimesNotifiedSecond sent notifications twice.
+	TimesNotifiedSecond TimesNotified = 2
+	// TimesNotifiedLast three notification has been send.
+	TimesNotifiedLast TimesNotified = 3
 )
 
 // Service is the notification service between storage nodes and satellites.

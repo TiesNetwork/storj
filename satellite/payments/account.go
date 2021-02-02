@@ -5,9 +5,11 @@ package payments
 
 import (
 	"context"
+	"time"
 
-	"github.com/skyrings/skyring-common/tools/uuid"
 	"github.com/zeebo/errs"
+
+	"storj.io/common/uuid"
 )
 
 // ErrAccountNotSetup is an error type which indicates that payment account is not created.
@@ -21,17 +23,18 @@ type Accounts interface {
 	// If account is already set up it will return nil.
 	Setup(ctx context.Context, userID uuid.UUID, email string) error
 
-	// Balance returns an integer amount in cents that represents the current balance of payment account.
-	Balance(ctx context.Context, userID uuid.UUID) (int64, error)
+	// Balance returns an object that represents current free credits and coins balance in cents.
+	Balance(ctx context.Context, userID uuid.UUID) (Balance, error)
 
 	// ProjectCharges returns how much money current user will be charged for each project.
-	ProjectCharges(ctx context.Context, userID uuid.UUID) ([]ProjectCharge, error)
+	ProjectCharges(ctx context.Context, userID uuid.UUID, since, before time.Time) ([]ProjectCharge, error)
+
+	// CheckProjectInvoicingStatus returns true if for the given project there are outstanding project records and/or usage
+	// which have not been applied/invoiced yet (meaning sent over to stripe).
+	CheckProjectInvoicingStatus(ctx context.Context, projectID uuid.UUID) (unpaidUsage bool, err error)
 
 	// Charges returns list of all credit card charges related to account.
 	Charges(ctx context.Context, userID uuid.UUID) ([]Charge, error)
-
-	// Credits exposes all needed functionality to manage credits.
-	Credits() Credits
 
 	// CreditCards exposes all needed functionality to manage account credit cards.
 	CreditCards() CreditCards
@@ -44,4 +47,8 @@ type Accounts interface {
 
 	// Coupons exposes all needed functionality to manage coupons.
 	Coupons() Coupons
+
+	// PaywallEnabled returns a true if a credit card or account
+	// balance is required to create projects
+	PaywallEnabled(uuid.UUID) bool
 }

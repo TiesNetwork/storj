@@ -30,7 +30,7 @@
                         width="205px"
                         height="48px"
                         :on-press="onCloseClick"
-                        is-white="true"
+                        is-transparent="true"
                     />
                     <VButton
                         label="Delete"
@@ -58,11 +58,10 @@ import CloseCrossIcon from '@/../static/images/common/closeCross.svg';
 import DeleteProjectIcon from '@/../static/images/project/deleteProject.svg';
 import ErrorIcon from '@/../static/images/register/ErrorInfo.svg';
 
+import { ACCESS_GRANTS_ACTIONS } from '@/store/modules/accessGrants';
 import { BUCKET_ACTIONS } from '@/store/modules/buckets';
 import { PROJECTS_ACTIONS } from '@/store/modules/projects';
-import { PROJECT_USAGE_ACTIONS } from '@/store/modules/usage';
 import {
-    API_KEYS_ACTIONS,
     APP_STATE_ACTIONS,
     PM_ACTIONS,
 } from '@/utils/constants/actionNames';
@@ -85,6 +84,9 @@ export default class DeleteProjectPopup extends Vue {
         this.nameError = '';
     }
 
+    /**
+     * If entered project name matches tries to delete project and select another.
+     */
     public async onDeleteProjectClick(): Promise<void> {
         if (this.isLoading) {
             return;
@@ -110,17 +112,26 @@ export default class DeleteProjectPopup extends Vue {
 
         this.isLoading = false;
 
-        this.$store.dispatch(APP_STATE_ACTIONS.TOGGLE_DEL_PROJ);
+        await this.$store.dispatch(APP_STATE_ACTIONS.TOGGLE_DEL_PROJ);
     }
 
+    /**
+     * Closes popup.
+     */
     public onCloseClick(): void {
         this.$store.dispatch(APP_STATE_ACTIONS.TOGGLE_DEL_PROJ);
     }
 
+    /**
+     * Indicates if delete button is disabled when project name is not entered or incorrect.
+     */
     public get isDeleteButtonDisabled(): boolean {
         return !this.projectName || !!this.nameError;
     }
 
+    /**
+     * Checks is entered project name matches selected.
+     */
     private validateProjectName(): boolean {
         if (this.projectName === this.$store.getters.selectedProject.name) {
             return true;
@@ -135,9 +146,8 @@ export default class DeleteProjectPopup extends Vue {
     private async selectProject(): Promise<void> {
         if (this.$store.state.projectsModule.projects.length === 0) {
             await this.$store.dispatch(PM_ACTIONS.CLEAR);
-            await this.$store.dispatch(API_KEYS_ACTIONS.CLEAR);
+            await this.$store.dispatch(ACCESS_GRANTS_ACTIONS.CLEAR);
             await this.$store.dispatch(BUCKET_ACTIONS.CLEAR);
-            await this.$store.dispatch(PROJECT_USAGE_ACTIONS.CLEAR);
 
             return;
         }
@@ -145,9 +155,8 @@ export default class DeleteProjectPopup extends Vue {
         // TODO: reuse select project functionality
         await this.$store.dispatch(PROJECTS_ACTIONS.SELECT, this.$store.state.projectsModule.projects[0].id);
         await this.$store.dispatch(PM_ACTIONS.FETCH, 1);
-        await this.$store.dispatch(API_KEYS_ACTIONS.FETCH, 1);
+        await this.$store.dispatch(ACCESS_GRANTS_ACTIONS.FETCH, 1);
         await this.$store.dispatch(BUCKET_ACTIONS.FETCH, 1);
-        await this.$store.dispatch(PROJECT_USAGE_ACTIONS.FETCH_CURRENT_ROLLUP);
     }
 }
 </script>

@@ -2,7 +2,7 @@
 // See LICENSE for copying information.
 
 <template>
-    <div id="app" @click="onClick">
+    <div id="app">
         <router-view/>
         <!-- Area for displaying notification -->
         <NotificationArea/>
@@ -23,51 +23,40 @@ import { MetaUtils } from '@/utils/meta';
     },
 })
 export default class App extends Vue {
-    private ids: string[] = [
-                'accountDropdown',
-                'accountDropdownButton',
-                'projectDropdown',
-                'projectDropdownButton',
-                'sortTeamMemberByDropdown',
-                'sortTeamMemberByDropdownButton',
-                'notificationArea',
-                'successfulRegistrationPopup',
-                'paymentSelectButton',
-                'paymentSelect',
-            ];
-
+    /**
+     * Lifecycle hook after initial render.
+     * Sets up variables from meta tags from config such satellite name, etc.
+     */
     public mounted(): void {
         const satelliteName = MetaUtils.getMetaContent('satellite-name');
+        const isBetaSatellite = MetaUtils.getMetaContent('is-beta-satellite');
         const segmentioId = MetaUtils.getMetaContent('segment-io');
 
         if (satelliteName) {
             this.$store.dispatch(APP_STATE_ACTIONS.SET_SATELLITE_NAME, satelliteName);
         }
 
+        if (isBetaSatellite) {
+            this.$store.dispatch(APP_STATE_ACTIONS.SET_SATELLITE_STATUS, isBetaSatellite === 'true');
+        }
+
         if (segmentioId) {
             this.$segment.init(segmentioId);
         }
-    }
-
-    public onClick(e: Event): void {
-        let target: any = e.target;
-        while (target) {
-            if (this.ids.includes(target.id)) {
-                return;
-            }
-            target = target.parentNode;
-        }
-
-        this.$store.dispatch(APP_STATE_ACTIONS.CLOSE_POPUPS);
     }
 }
 </script>
 
 <style lang="scss">
+    html {
+        overflow: hidden;
+    }
+
     body {
         margin: 0 !important;
         height: 100vh;
         zoom: 100%;
+        overflow: hidden;
     }
 
     img,
@@ -94,6 +83,8 @@ export default class App extends Vue {
     }
 
     a {
+        text-decoration: none;
+        outline: none;
         cursor: pointer;
     }
 
@@ -106,19 +97,13 @@ export default class App extends Vue {
         caret-color: #2683ff;
     }
 
-    /* width */
-
     ::-webkit-scrollbar {
         width: 4px;
     }
 
-    /* Track */
-
     ::-webkit-scrollbar-track {
         box-shadow: inset 0 0 5px #fff;
     }
-
-    /* Handle */
 
     ::-webkit-scrollbar-thumb {
         background: #afb7c1;

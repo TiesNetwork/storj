@@ -2,8 +2,16 @@
 // See LICENSE for copying information.
 
 import { ErrorUnauthorized } from '@/api/errors/ErrorUnauthorized';
-import { BillingHistoryItem, CreditCard, PaymentsApi, ProjectCharge, TokenDeposit } from '@/types/payments';
+import {
+    AccountBalance,
+    CreditCard,
+    PaymentsApi,
+    PaymentsHistoryItem,
+    ProjectUsageAndCharges,
+    TokenDeposit,
+} from '@/types/payments';
 import { HttpClient } from '@/utils/httpClient';
+import { Time } from '@/utils/time';
 
 /**
  * PaymentsHttpApi is a http implementation of Payments API.
@@ -14,28 +22,33 @@ export class PaymentsHttpApi implements PaymentsApi {
     private readonly ROOT_PATH: string = '/api/v0/payments';
 
     /**
-     * Get account balance
+     * Get account balance.
      *
      * @returns balance in cents
      * @throws Error
      */
-    public async getBalance(): Promise<number> {
+    public async getBalance(): Promise<AccountBalance> {
         const path = `${this.ROOT_PATH}/account/balance`;
         const response = await this.client.get(path);
 
-        if (response.ok) {
-            return await response.json();
+        if (!response.ok) {
+            if (response.status === 401) {
+                throw new ErrorUnauthorized();
+            }
+
+            throw new Error('Can not get account balance');
         }
 
-        if (response.status === 401) {
-            throw new ErrorUnauthorized();
+        const balance = await response.json();
+        if (balance) {
+            return new AccountBalance(balance.freeCredits, balance.coins);
         }
 
-        throw new Error('can not get balance');
+        return new AccountBalance();
     }
 
     /**
-     * Try to set up a payment account
+     * Try to set up a payment account.
      *
      * @throws Error
      */
@@ -55,10 +68,12 @@ export class PaymentsHttpApi implements PaymentsApi {
     }
 
     /**
-     * projectsCharges returns how much money current user will be charged for each project which he owns.
+     * projectsUsageAndCharges returns usage and how much money current user will be charged for each project which he owns.
      */
-    public async projectsCharges(): Promise<ProjectCharge[]> {
-        const path = `${this.ROOT_PATH}/account/charges`;
+    public async projectsUsageAndCharges(start: Date, end: Date): Promise<ProjectUsageAndCharges[]> {
+        const since = Time.toUnixTimestamp(start).toString();
+        const before = Time.toUnixTimestamp(end).toString();
+        const path = `${this.ROOT_PATH}/account/charges?from=${since}&to=${before}`;
         const response = await this.client.get(path);
 
         if (!response.ok) {
@@ -72,11 +87,17 @@ export class PaymentsHttpApi implements PaymentsApi {
         const charges = await response.json();
         if (charges) {
             return charges.map(charge =>
-                new ProjectCharge(
-                    charge.projectId,
-                    charge.storage,
+                new ProjectUsageAndCharges(
+                    new Date(charge.since),
+                    new Date(charge.before),
                     charge.egress,
-                    charge.objectCount),
+                    charge.storage,
+                    charge.objectCount,
+                    charge.projectId,
+                    charge.storagePrice,
+                    charge.egressPrice,
+                    charge.objectPrice,
+                ),
             );
         }
 
@@ -84,7 +105,8 @@ export class PaymentsHttpApi implements PaymentsApi {
     }
 
     /**
-     * Add credit card
+     * Add credit card.
+     *
      * @param token - stripe token used to add a credit card as a payment method
      * @throws Error
      */
@@ -105,6 +127,7 @@ export class PaymentsHttpApi implements PaymentsApi {
 
     /**
      * Detach credit card from payment account.
+     *
      * @param cardId
      * @throws Error
      */
@@ -124,7 +147,7 @@ export class PaymentsHttpApi implements PaymentsApi {
     }
 
     /**
-     * Get list of user`s credit cards
+     * Get list of user`s credit cards.
      *
      * @returns list of credit cards
      * @throws Error
@@ -150,7 +173,8 @@ export class PaymentsHttpApi implements PaymentsApi {
     }
 
     /**
-     * Make credit card default
+     * Make credit card default.
+     *
      * @param cardId
      * @throws Error
      */
@@ -170,12 +194,12 @@ export class PaymentsHttpApi implements PaymentsApi {
     }
 
     /**
-     * Returns a list of invoices, transactions and all others billing history items for payment account.
+     * Returns a list of invoices, transactions and all others payments history items for payment account.
      *
-     * @returns list of billing history items
+     * @returns list of payments history items
      * @throws Error
      */
-    public async billingHistory(): Promise<BillingHistoryItem[]> {
+    public async paymentsHistory(): Promise<PaymentsHistoryItem[]> {
         const path = `${this.ROOT_PATH}/billing-history`;
         const response = await this.client.get(path);
 
@@ -186,11 +210,10 @@ export class PaymentsHttpApi implements PaymentsApi {
             throw new Error('can not list billing history');
         }
 
-        const billingHistoryItems = await response.json();
-
-        if (billingHistoryItems) {
-            return billingHistoryItems.map(item =>
-                new BillingHistoryItem(
+        const paymentsHistoryItems = await response.json();
+        if (paymentsHistoryItems) {
+            return paymentsHistoryItems.map(item =>
+                new PaymentsHistoryItem(
                     item.id,
                     item.description,
                     item.amount,
@@ -199,7 +222,9 @@ export class PaymentsHttpApi implements PaymentsApi {
                     item.link,
                     new Date(item.start),
                     new Date(item.end),
-                    item.type),
+                    item.type,
+                    item.remaining,
+                ),
             );
         }
 
@@ -207,7 +232,8 @@ export class PaymentsHttpApi implements PaymentsApi {
     }
 
     /**
-     * makeTokenDeposit process coin payments
+     * makeTokenDeposit process coin payments.
+     *
      * @param amount
      * @throws Error
      */
@@ -226,5 +252,26 @@ export class PaymentsHttpApi implements PaymentsApi {
         const result = await response.json();
 
         return new TokenDeposit(result.amount, result.address, result.link);
+    }
+
+    /**
+     * Indicates if paywall is enabled.
+     *
+     * @param userId
+     * @throws Error
+     */
+    public async getPaywallStatus(userId: string): Promise<boolean> {
+        const path = `${this.ROOT_PATH}/paywall-enabled/${userId}`;
+        const response = await this.client.get(path);
+
+        if (!response.ok) {
+            if (response.status === 401) {
+                throw new ErrorUnauthorized();
+            }
+
+            throw new Error('can not get paywall status');
+        }
+
+        return await response.json();
     }
 }

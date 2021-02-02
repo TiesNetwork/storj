@@ -16,7 +16,7 @@ import (
 
 // LoadSchemaFromSQL inserts script into connstr and loads schema.
 func LoadSchemaFromSQL(ctx context.Context, script string) (_ *dbschema.Schema, err error) {
-	db, err := tagsql.Open("sqlite3", ":memory:")
+	db, err := tagsql.Open(ctx, "sqlite3", ":memory:")
 	if err != nil {
 		return nil, errs.Wrap(err)
 	}
@@ -32,7 +32,7 @@ func LoadSchemaFromSQL(ctx context.Context, script string) (_ *dbschema.Schema, 
 
 // LoadSnapshotFromSQL inserts script into connstr and loads schema.
 func LoadSnapshotFromSQL(ctx context.Context, script string) (_ *dbschema.Snapshot, err error) {
-	db, err := tagsql.Open("sqlite3", ":memory:")
+	db, err := tagsql.Open(ctx, "sqlite3", ":memory:")
 	if err != nil {
 		return nil, errs.Wrap(err)
 	}
@@ -48,11 +48,12 @@ func LoadSnapshotFromSQL(ctx context.Context, script string) (_ *dbschema.Snapsh
 		return nil, errs.Wrap(err)
 	}
 
-	snapshot.Script = script
+	snapshot.Sections = dbschema.NewSections(script)
+
 	return snapshot, nil
 }
 
-// QuerySnapshot loads snapshot from database
+// QuerySnapshot loads snapshot from database.
 func QuerySnapshot(ctx context.Context, db dbschema.Queryer) (*dbschema.Snapshot, error) {
 	schema, err := QuerySchema(ctx, db)
 	if err != nil {
@@ -71,7 +72,7 @@ func QuerySnapshot(ctx context.Context, db dbschema.Queryer) (*dbschema.Snapshot
 	}, err
 }
 
-// QueryData loads all data from tables
+// QueryData loads all data from tables.
 func QueryData(ctx context.Context, db dbschema.Queryer, schema *dbschema.Schema) (*dbschema.Data, error) {
 	return dbschema.QueryData(ctx, db, schema, func(columnName string) string {
 		quoted := strconv.Quote(columnName)
@@ -79,7 +80,7 @@ func QueryData(ctx context.Context, db dbschema.Queryer, schema *dbschema.Schema
 	})
 }
 
-// IsConstraintError checks if given error is about constraint violation
+// IsConstraintError checks if given error is about constraint violation.
 func IsConstraintError(err error) bool {
 	return errs.IsFunc(err, func(err error) bool {
 		if e, ok := err.(sqlite3.Error); ok {

@@ -5,22 +5,30 @@ package consoleapi
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 
 	"github.com/gorilla/mux"
-	"github.com/skyrings/skyring-common/tools/uuid"
 	"github.com/zeebo/errs"
 	"go.uber.org/zap"
 
+	"storj.io/common/uuid"
 	"storj.io/storj/private/post"
 	"storj.io/storj/satellite/console"
 	"storj.io/storj/satellite/console/consoleweb/consoleql"
 	"storj.io/storj/satellite/console/consoleweb/consolewebauth"
 	"storj.io/storj/satellite/mailservice"
+	"storj.io/storj/satellite/rewards"
 )
 
-// ErrAuthAPI - console auth api error type.
-var ErrAuthAPI = errs.Class("console auth api error")
+var (
+	// ErrAuthAPI - console auth api error type.
+	ErrAuthAPI = errs.Class("console auth api error")
+
+	// errNotImplemented is the error value used by handlers of this package to
+	// response with status Not Implemented.
+	errNotImplemented = errs.New("not implemented")
+)
 
 // Auth is an api controller that exposes all auth functionality.
 type Auth struct {
@@ -32,10 +40,11 @@ type Auth struct {
 	service               *console.Service
 	mailService           *mailservice.Service
 	cookieAuth            *consolewebauth.CookieAuth
+	partners              *rewards.PartnersService
 }
 
 // NewAuth is a constructor for api auth controller.
-func NewAuth(log *zap.Logger, service *console.Service, mailService *mailservice.Service, cookieAuth *consolewebauth.CookieAuth, externalAddress string, letUsKnowURL string, termsAndConditionsURL string, contactInfoURL string) *Auth {
+func NewAuth(log *zap.Logger, service *console.Service, mailService *mailservice.Service, cookieAuth *consolewebauth.CookieAuth, partners *rewards.PartnersService, externalAddress string, letUsKnowURL string, termsAndConditionsURL string, contactInfoURL string) *Auth {
 	return &Auth{
 		log:                   log,
 		ExternalAddress:       externalAddress,
@@ -45,6 +54,7 @@ func NewAuth(log *zap.Logger, service *console.Service, mailService *mailservice
 		service:               service,
 		mailService:           mailService,
 		cookieAuth:            cookieAuth,
+		partners:              partners,
 	}
 }
 
@@ -67,6 +77,7 @@ func (a *Auth) Token(w http.ResponseWriter, r *http.Request) {
 
 	token, err := a.service.Token(ctx, tokenRequest.Email, tokenRequest.Password)
 	if err != nil {
+		a.log.Info("Error authenticating token request", zap.String("email", tokenRequest.Email), zap.Error(ErrAuthAPI.Wrap(err)))
 		a.serveJSONError(w, err)
 		return
 	}
@@ -101,10 +112,15 @@ func (a *Auth) Register(w http.ResponseWriter, r *http.Request) {
 		FullName       string `json:"fullName"`
 		ShortName      string `json:"shortName"`
 		Email          string `json:"email"`
+		Partner        string `json:"partner"`
 		PartnerID      string `json:"partnerId"`
 		Password       string `json:"password"`
 		SecretInput    string `json:"secret"`
 		ReferrerUserID string `json:"referrerUserId"`
+		IsProfessional bool   `json:"isProfessional"`
+		Position       string `json:"position"`
+		CompanyName    string `json:"companyName"`
+		EmployeeCount  string `json:"employeeCount"`
 	}
 
 	err = json.NewDecoder(r.Body).Decode(&registerData)
@@ -119,16 +135,28 @@ func (a *Auth) Register(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if registerData.Partner != "" {
+		info, err := a.partners.ByName(ctx, registerData.Partner)
+		if err != nil {
+			a.log.Warn("Invalid partner name", zap.String("Partner name", registerData.Partner), zap.String("User email", registerData.Email), zap.Error(err))
+		} else {
+			registerData.PartnerID = info.ID
+		}
+	}
+
 	user, err := a.service.CreateUser(ctx,
 		console.CreateUser{
-			FullName:  registerData.FullName,
-			ShortName: registerData.ShortName,
-			Email:     registerData.Email,
-			PartnerID: registerData.PartnerID,
-			Password:  registerData.Password,
+			FullName:       registerData.FullName,
+			ShortName:      registerData.ShortName,
+			Email:          registerData.Email,
+			PartnerID:      registerData.PartnerID,
+			Password:       registerData.Password,
+			IsProfessional: registerData.IsProfessional,
+			Position:       registerData.Position,
+			CompanyName:    registerData.CompanyName,
+			EmployeeCount:  registerData.EmployeeCount,
 		},
 		secret,
-		registerData.ReferrerUserID,
 	)
 	if err != nil {
 		a.serveJSONError(w, err)
@@ -194,11 +222,16 @@ func (a *Auth) GetAccount(w http.ResponseWriter, r *http.Request) {
 	defer mon.Task()(&ctx)(&err)
 
 	var user struct {
-		ID        uuid.UUID `json:"id"`
-		FullName  string    `json:"fullName"`
-		ShortName string    `json:"shortName"`
-		Email     string    `json:"email"`
-		PartnerID uuid.UUID `json:"partnerId"`
+		ID             uuid.UUID `json:"id"`
+		FullName       string    `json:"fullName"`
+		ShortName      string    `json:"shortName"`
+		Email          string    `json:"email"`
+		PartnerID      uuid.UUID `json:"partnerId"`
+		ProjectLimit   int       `json:"projectLimit"`
+		IsProfessional bool      `json:"isProfessional"`
+		Position       string    `json:"position"`
+		CompanyName    string    `json:"companyName"`
+		EmployeeCount  string    `json:"employeeCount"`
 	}
 
 	auth, err := console.GetAuth(ctx)
@@ -212,6 +245,11 @@ func (a *Auth) GetAccount(w http.ResponseWriter, r *http.Request) {
 	user.Email = auth.User.Email
 	user.ID = auth.User.ID
 	user.PartnerID = auth.User.PartnerID
+	user.ProjectLimit = auth.User.ProjectLimit
+	user.IsProfessional = auth.User.IsProfessional
+	user.CompanyName = auth.User.CompanyName
+	user.Position = auth.User.Position
+	user.EmployeeCount = auth.User.EmployeeCount
 
 	w.Header().Set("Content-Type", "application/json")
 	err = json.NewEncoder(w).Encode(&user)
@@ -221,25 +259,35 @@ func (a *Auth) GetAccount(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// DeleteAccount - authorizes user and deletes account by password.
+// DeleteAccount authorizes user and deletes account by password.
 func (a *Auth) DeleteAccount(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	defer mon.Task()(&ctx)(&errNotImplemented)
+
+	// We do not want to allow account deletion via API currently.
+	a.serveJSONError(w, errNotImplemented)
+}
+
+// ChangeEmail auth user, changes users email for a new one.
+func (a *Auth) ChangeEmail(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	var err error
 	defer mon.Task()(&ctx)(&err)
 
-	var deleteRequest struct {
-		Password string `json:"password"`
+	var emailChange struct {
+		NewEmail string `json:"newEmail"`
 	}
 
-	err = json.NewDecoder(r.Body).Decode(&deleteRequest)
+	err = json.NewDecoder(r.Body).Decode(&emailChange)
 	if err != nil {
 		a.serveJSONError(w, err)
 		return
 	}
 
-	err = a.service.DeleteAccount(ctx, deleteRequest.Password)
+	err = a.service.ChangeEmail(ctx, emailChange.NewEmail)
 	if err != nil {
 		a.serveJSONError(w, err)
+		return
 	}
 }
 
@@ -332,13 +380,13 @@ func (a *Auth) ResendEmail(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	userID, err := uuid.Parse(id)
+	userID, err := uuid.FromString(id)
 	if err != nil {
 		a.serveJSONError(w, err)
 		return
 	}
 
-	user, err := a.service.GetUser(ctx, *userID)
+	user, err := a.service.GetUser(ctx, userID)
 	if err != nil {
 		a.serveJSONError(w, err)
 		return
@@ -395,6 +443,10 @@ func (a *Auth) getStatusCode(err error) int {
 		return http.StatusBadRequest
 	case console.ErrUnauthorized.Has(err):
 		return http.StatusUnauthorized
+	case console.ErrEmailUsed.Has(err):
+		return http.StatusConflict
+	case errors.Is(err, errNotImplemented):
+		return http.StatusNotImplemented
 	default:
 		return http.StatusInternalServerError
 	}

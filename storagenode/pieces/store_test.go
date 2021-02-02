@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/hex"
+	"errors"
 	"io"
 	"io/ioutil"
 	"os"
@@ -38,13 +39,13 @@ func TestPieces(t *testing.T) {
 	ctx := testcontext.New(t)
 	defer ctx.Cleanup()
 
-	dir, err := filestore.NewDir(ctx.Dir("pieces"))
+	dir, err := filestore.NewDir(zaptest.NewLogger(t), ctx.Dir("pieces"))
 	require.NoError(t, err)
 
-	blobs := filestore.New(zaptest.NewLogger(t), dir)
+	blobs := filestore.New(zaptest.NewLogger(t), dir, filestore.DefaultConfig)
 	defer ctx.Check(blobs.Close)
 
-	store := pieces.NewStore(zaptest.NewLogger(t), blobs, nil, nil, nil)
+	store := pieces.NewStore(zaptest.NewLogger(t), blobs, nil, nil, nil, pieces.DefaultConfig)
 
 	satelliteID := testidentity.MustPregeneratedSignedIdentity(0, storj.LatestIDVersion()).ID
 	pieceID := storj.NewPieceID()
@@ -103,7 +104,7 @@ func TestPieces(t *testing.T) {
 		for {
 			_, err := reader.Read(data)
 			if err != nil {
-				if err == io.EOF {
+				if errors.Is(err, io.EOF) {
 					break
 				}
 				require.NoError(t, err)
@@ -169,7 +170,7 @@ func verifyPieceHandle(t testing.TB, reader *pieces.Reader, expectDataLen int, e
 		pieceHeader, err := reader.GetPieceHeader()
 		require.NoError(t, err)
 		assert.Equal(t, expectFormat, storage.FormatVersion(pieceHeader.FormatVersion))
-		assert.Equal(t, expectCreateTime.UTC(), pieceHeader.CreationTime.UTC())
+		assert.True(t, expectCreateTime.Equal(pieceHeader.CreationTime))
 	}
 }
 
@@ -310,17 +311,17 @@ func TestTrashAndRestore(t *testing.T) {
 	}
 
 	storagenodedbtest.Run(t, func(ctx *testcontext.Context, t *testing.T, db storagenode.DB) {
-		dir, err := filestore.NewDir(ctx.Dir("store"))
+		dir, err := filestore.NewDir(zaptest.NewLogger(t), ctx.Dir("store"))
 		require.NoError(t, err)
 
-		blobs := filestore.New(zaptest.NewLogger(t), dir)
+		blobs := filestore.New(zaptest.NewLogger(t), dir, filestore.DefaultConfig)
 		require.NoError(t, err)
 		defer ctx.Check(blobs.Close)
 
 		v0PieceInfo, ok := db.V0PieceInfo().(pieces.V0PieceInfoDBForTest)
 		require.True(t, ok, "V0PieceInfoDB can not satisfy V0PieceInfoDBForTest")
 
-		store := pieces.NewStore(zaptest.NewLogger(t), blobs, v0PieceInfo, db.PieceExpirationDB(), nil)
+		store := pieces.NewStore(zaptest.NewLogger(t), blobs, v0PieceInfo, db.PieceExpirationDB(), nil, pieces.DefaultConfig)
 		tStore := &pieces.StoreForTest{store}
 
 		var satelliteURLs []trust.SatelliteURL
@@ -419,9 +420,9 @@ func TestTrashAndRestore(t *testing.T) {
 		// Empty trash by running the chore once
 		trashDur := 4 * 24 * time.Hour
 		chore := pieces.NewTrashChore(zaptest.NewLogger(t), 24*time.Hour, trashDur, trust, store)
-		go func() {
-			require.NoError(t, chore.Run(ctx))
-		}()
+		ctx.Go(func() error {
+			return chore.Run(ctx)
+		})
 		chore.TriggerWait(ctx)
 		require.NoError(t, chore.Close())
 
@@ -521,7 +522,7 @@ func TestPieceVersionMigrate(t *testing.T) {
 			data        = testrand.Bytes(pieceSize)
 			satelliteID = testrand.NodeID()
 			pieceID     = testrand.PieceID()
-			now         = time.Now().UTC()
+			now         = time.Now().UTC() // we use UTC here to make struct equality testing easier
 		)
 
 		// Initialize pub/priv keys for signing piece hash
@@ -551,11 +552,11 @@ func TestPieceVersionMigrate(t *testing.T) {
 		v0PieceInfo, ok := db.V0PieceInfo().(pieces.V0PieceInfoDBForTest)
 		require.True(t, ok, "V0PieceInfoDB can not satisfy V0PieceInfoDBForTest")
 
-		blobs, err := filestore.NewAt(zaptest.NewLogger(t), ctx.Dir("store"))
+		blobs, err := filestore.NewAt(zaptest.NewLogger(t), ctx.Dir("store"), filestore.DefaultConfig)
 		require.NoError(t, err)
 		defer ctx.Check(blobs.Close)
 
-		store := pieces.NewStore(zaptest.NewLogger(t), blobs, v0PieceInfo, nil, nil)
+		store := pieces.NewStore(zaptest.NewLogger(t), blobs, v0PieceInfo, nil, nil, pieces.DefaultConfig)
 
 		// write as a v0 piece
 		tStore := &pieces.StoreForTest{store}
@@ -634,11 +635,11 @@ func TestMultipleStorageFormatVersions(t *testing.T) {
 	ctx := testcontext.New(t)
 	defer ctx.Cleanup()
 
-	blobs, err := filestore.NewAt(zaptest.NewLogger(t), ctx.Dir("store"))
+	blobs, err := filestore.NewAt(zaptest.NewLogger(t), ctx.Dir("store"), filestore.DefaultConfig)
 	require.NoError(t, err)
 	defer ctx.Check(blobs.Close)
 
-	store := pieces.NewStore(zaptest.NewLogger(t), blobs, nil, nil, nil)
+	store := pieces.NewStore(zaptest.NewLogger(t), blobs, nil, nil, nil, pieces.DefaultConfig)
 
 	const pieceSize = 1024
 
@@ -647,7 +648,7 @@ func TestMultipleStorageFormatVersions(t *testing.T) {
 		satellite = testrand.NodeID()
 		v0PieceID = testrand.PieceID()
 		v1PieceID = testrand.PieceID()
-		now       = time.Now().UTC()
+		now       = time.Now()
 	)
 
 	// write a V0 piece
@@ -690,9 +691,9 @@ func TestGetExpired(t *testing.T) {
 		require.True(t, ok, "V0PieceInfoDB can not satisfy V0PieceInfoDBForTest")
 		expirationInfo := db.PieceExpirationDB()
 
-		store := pieces.NewStore(zaptest.NewLogger(t), db.Pieces(), v0PieceInfo, expirationInfo, db.PieceSpaceUsedDB())
+		store := pieces.NewStore(zaptest.NewLogger(t), db.Pieces(), v0PieceInfo, expirationInfo, db.PieceSpaceUsedDB(), pieces.DefaultConfig)
 
-		now := time.Now().UTC()
+		now := time.Now()
 		testDates := []struct {
 			years, months, days int
 		}{
@@ -757,7 +758,7 @@ func TestOverwriteV0WithV1(t *testing.T) {
 		require.True(t, ok, "V0PieceInfoDB can not satisfy V0PieceInfoDBForTest")
 		expirationInfo := db.PieceExpirationDB()
 
-		store := pieces.NewStore(zaptest.NewLogger(t), db.Pieces(), v0PieceInfo, expirationInfo, db.PieceSpaceUsedDB())
+		store := pieces.NewStore(zaptest.NewLogger(t), db.Pieces(), v0PieceInfo, expirationInfo, db.PieceSpaceUsedDB(), pieces.DefaultConfig)
 
 		satelliteID := testrand.NodeID()
 		pieceID := testrand.PieceID()
@@ -766,7 +767,7 @@ func TestOverwriteV0WithV1(t *testing.T) {
 
 		// write the piece as V0. We can't provide the expireTime via writeAPiece, because
 		// BlobWriter.Commit only knows how to store expiration times in piece_expirations.
-		v0CreateTime := time.Now().UTC()
+		v0CreateTime := time.Now()
 		v0ExpireTime := v0CreateTime.AddDate(5, 0, 0)
 		writeAPiece(ctx, t, store, satelliteID, pieceID, v0Data, v0CreateTime, nil, filestore.FormatV0)
 		// now put the piece in the pieceinfo db directly, because store won't do that for us.
@@ -801,7 +802,7 @@ func TestOverwriteV0WithV1(t *testing.T) {
 			require.Equal(t, 1, calledTimes)
 			gotCreateTime, err := access.CreationTime(ctx)
 			require.NoError(t, err)
-			assert.Equal(t, v0CreateTime, gotCreateTime)
+			assert.True(t, v0CreateTime.Equal(gotCreateTime))
 			_, gotSize, err := access.Size(ctx)
 			require.NoError(t, err)
 			assert.Equal(t, int64(len(v0Data)), gotSize)
@@ -810,7 +811,7 @@ func TestOverwriteV0WithV1(t *testing.T) {
 		require.NoError(t, err)
 
 		// now "overwrite" the piece (write a new blob with the same id, but with V1 storage)
-		v1CreateTime := time.Now().UTC()
+		v1CreateTime := time.Now()
 		v1ExpireTime := v1CreateTime.AddDate(5, 0, 0)
 		writeAPiece(ctx, t, store, satelliteID, pieceID, v1Data, v1CreateTime, &v1ExpireTime, filestore.FormatV1)
 
@@ -844,7 +845,7 @@ func TestOverwriteV0WithV1(t *testing.T) {
 				assert.Equal(t, filestore.FormatV1, access.StorageFormatVersion())
 				gotCreateTime, err := access.CreationTime(ctx)
 				require.NoError(t, err)
-				assert.Equal(t, v1CreateTime, gotCreateTime)
+				assert.True(t, v1CreateTime.Equal(gotCreateTime))
 				_, gotSize, err := access.Size(ctx)
 				require.NoError(t, err)
 				assert.Equal(t, int64(len(v1Data)), gotSize)
@@ -854,7 +855,7 @@ func TestOverwriteV0WithV1(t *testing.T) {
 				assert.Equal(t, filestore.FormatV0, access.StorageFormatVersion())
 				gotCreateTime, err := access.CreationTime(ctx)
 				require.NoError(t, err)
-				assert.Equal(t, v0CreateTime, gotCreateTime)
+				assert.True(t, v0CreateTime.Equal(gotCreateTime))
 				_, gotSize, err := access.Size(ctx)
 				require.NoError(t, err)
 				assert.Equal(t, int64(len(v0Data)), gotSize)

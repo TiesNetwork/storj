@@ -38,7 +38,7 @@
                         label="Cancel"
                         width="122px"
                         height="48px"
-                        is-white="true"
+                        is-transparent="true"
                         :on-press="onClearSelection"
                     />
                     <span class="header-selected-members__info-text"><b>{{selectedProjectMembersCount}}</b> users selected</span>
@@ -58,7 +58,7 @@
                             label="Cancel"
                             width="122px"
                             height="48px"
-                            is-white="true"
+                            is-transparent="true"
                             :on-press="onClearSelection"
                         />
                     </div>
@@ -85,7 +85,6 @@ import { RouteConfig } from '@/router';
 import { PROJECTS_ACTIONS } from '@/store/modules/projects';
 import { ProjectMemberHeaderState } from '@/types/projectMembers';
 import { APP_STATE_ACTIONS, PM_ACTIONS } from '@/utils/constants/actionNames';
-import { AppState } from '@/utils/constants/appStateEnum';
 
 declare interface ClearSearch {
     clearSearch(): void;
@@ -108,25 +107,31 @@ export default class HeaderArea extends Vue {
 
     private FIRST_PAGE = 1;
 
+    /**
+     * Indicates if state after first delete click is active.
+     */
     public isDeleteClicked: boolean = false;
 
     public $refs!: {
         headerComponent: VHeader & ClearSearch;
     };
 
+    /**
+     * Lifecycle hook before component destruction.
+     * Clears selection and search query for team members page.
+     */
     public beforeDestroy(): void {
         this.onClearSelection();
         this.$store.dispatch(PM_ACTIONS.SET_SEARCH_QUERY, '');
     }
 
     public get userCountTitle(): string {
-        if (this.selectedProjectMembersCount === 1) {
-            return 'user';
-        }
-
-        return 'users';
+        return this.selectedProjectMembersCount === 1 ? 'user' : 'users';
     }
 
+    /**
+     * Opens add team members popup.
+     */
     public onAddUsersClick(): void {
         this.$store.dispatch(APP_STATE_ACTIONS.TOGGLE_TEAM_MEMBERS);
     }
@@ -135,6 +140,9 @@ export default class HeaderArea extends Vue {
         this.isDeleteClicked = true;
     }
 
+    /**
+     * Clears selection and returns area state to default.
+     */
     public onClearSelection(): void {
         this.$store.dispatch(PM_ACTIONS.CLEAR_SELECTION);
         this.isDeleteClicked = false;
@@ -142,6 +150,9 @@ export default class HeaderArea extends Vue {
         this.$emit('onSuccessAction');
     }
 
+    /**
+     * Removes user from selected project.
+     */
     public async onDelete(): Promise<void> {
         try {
             await this.$store.dispatch(PM_ACTIONS.DELETE);
@@ -158,6 +169,10 @@ export default class HeaderArea extends Vue {
         this.isDeleteClicked = false;
     }
 
+    /**
+     * Fetches team members of current project depends on search query.
+     * @param search
+     */
     public async processSearchQuery(search: string): Promise<void> {
         await this.$store.dispatch(PM_ACTIONS.SET_SEARCH_QUERY, search);
         try {
@@ -167,6 +182,9 @@ export default class HeaderArea extends Vue {
         }
     }
 
+    /**
+     * Indicates if add team member popup should be rendered.
+     */
     public get isAddTeamMembersPopupShown(): boolean {
         return this.$store.state.appStateModule.appState.isAddTeamMembersPopupShown;
     }
@@ -186,8 +204,7 @@ export default class HeaderArea extends Vue {
     private async setProjectState(): Promise<void> {
         const projects = await this.$store.dispatch(PROJECTS_ACTIONS.FETCH);
         if (!projects.length) {
-            await this.$store.dispatch(APP_STATE_ACTIONS.CHANGE_STATE, AppState.LOADED_EMPTY);
-            await this.$router.push(RouteConfig.ProjectOverview.with(RouteConfig.ProjectDetails).path);
+            await this.$router.push(RouteConfig.OnboardingTour.path);
 
             return;
         }
@@ -212,7 +229,6 @@ export default class HeaderArea extends Vue {
                 line-height: 39px;
                 color: #263549;
                 margin: 0;
-                user-select: none;
             }
 
             &__info-button {
@@ -300,7 +316,7 @@ export default class HeaderArea extends Vue {
             position: absolute;
             bottom: 0;
             right: 0;
-            width: 602px;
+            width: 540px;
             height: 56px;
             z-index: 100;
             opacity: 0.3;
@@ -322,7 +338,7 @@ export default class HeaderArea extends Vue {
     }
 
     /deep/ .info__message-box {
-        background-image: url('../../../static/images/account/billing/MessageBox.png');
+        background-image: url('../../../static/images/team/MessageBox.png');
         background-repeat: no-repeat;
         min-height: 80px;
         min-width: 200px;

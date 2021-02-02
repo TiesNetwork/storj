@@ -4,6 +4,7 @@
 package pieces_test
 
 import (
+	"errors"
 	"io"
 	"testing"
 	"time"
@@ -27,12 +28,12 @@ func BenchmarkReadWrite(b *testing.B) {
 	ctx := testcontext.New(b)
 	defer ctx.Cleanup()
 
-	dir, err := filestore.NewDir(ctx.Dir("pieces"))
+	dir, err := filestore.NewDir(zap.NewNop(), ctx.Dir("pieces"))
 	require.NoError(b, err)
-	blobs := filestore.New(zap.NewNop(), dir)
+	blobs := filestore.New(zap.NewNop(), dir, filestore.DefaultConfig)
 	defer ctx.Check(blobs.Close)
 
-	store := pieces.NewStore(zap.NewNop(), blobs, nil, nil, nil)
+	store := pieces.NewStore(zap.NewNop(), blobs, nil, nil, nil, pieces.DefaultConfig)
 
 	// setup test parameters
 	const blockSize = int(256 * memory.KiB)
@@ -78,7 +79,7 @@ func BenchmarkReadWrite(b *testing.B) {
 			for {
 				_, err := reader.Read(data)
 				if err != nil {
-					if err == io.EOF {
+					if errors.Is(err, io.EOF) {
 						break
 					}
 					require.NoError(b, err)
@@ -93,12 +94,12 @@ func readAndWritePiece(t *testing.T, content []byte) {
 	ctx := testcontext.New(t)
 	defer ctx.Cleanup()
 
-	dir, err := filestore.NewDir(ctx.Dir("pieces"))
+	dir, err := filestore.NewDir(zaptest.NewLogger(t), ctx.Dir("pieces"))
 	require.NoError(t, err)
-	blobs := filestore.New(zaptest.NewLogger(t), dir)
+	blobs := filestore.New(zaptest.NewLogger(t), dir, filestore.DefaultConfig)
 	defer ctx.Check(blobs.Close)
 
-	store := pieces.NewStore(zaptest.NewLogger(t), blobs, nil, nil, nil)
+	store := pieces.NewStore(zaptest.NewLogger(t), blobs, nil, nil, nil, pieces.DefaultConfig)
 
 	// test parameters
 	satelliteID := testrand.NodeID()

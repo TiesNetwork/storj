@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os/exec"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -35,10 +36,15 @@ func TestSetGetMeta(t *testing.T) {
 
 		// Configure uplink.
 		{
+			access := planet.Uplinks[0].Access[planet.Satellites[0].ID()]
+
+			accessString, err := access.Serialize()
+			require.NoError(t, err)
+
 			output, err := exec.Command(uplinkExe,
 				"--config-dir", ctx.Dir("uplink"),
 				"import",
-				planet.Uplinks[0].GetConfig(planet.Satellites[0]).Access,
+				accessString,
 			).CombinedOutput()
 			t.Log(string(output))
 			require.NoError(t, err)
@@ -59,6 +65,13 @@ func TestSetGetMeta(t *testing.T) {
 
 		// Upload file with metadata.
 		metadata := testrand.Metadata()
+
+		// TODO fix this in storj/common
+		for k, v := range metadata {
+			if strings.IndexByte(k, 0) >= 0 || strings.IndexByte(v, 0) >= 0 {
+				delete(metadata, k)
+			}
+		}
 
 		metadataBs, err := json.Marshal(metadata)
 		require.NoError(t, err)

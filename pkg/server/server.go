@@ -6,38 +6,56 @@ package server
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"net"
+	"os"
+	"runtime"
 	"sync"
+	"syscall"
 
+	quicgo "github.com/lucas-clemente/quic-go"
 	"github.com/zeebo/errs"
 	"go.uber.org/zap"
 	"golang.org/x/sync/errgroup"
-	"google.golang.org/grpc"
 
 	"storj.io/common/identity"
 	"storj.io/common/peertls/tlsopts"
 	"storj.io/common/rpc"
+	"storj.io/common/rpc/rpctracing"
+	"storj.io/drpc/drpcmux"
 	"storj.io/drpc/drpcserver"
+	jaeger "storj.io/monkit-jaeger"
 	"storj.io/storj/pkg/listenmux"
+	"storj.io/storj/pkg/quic"
 )
 
-// Service represents a specific gRPC method collection to be registered
-// on a shared gRPC server. Metainfo, OverlayCache, PieceStore,
-// etc. are all examples of services.
-type Service interface {
-	Run(ctx context.Context, server *Server) error
+// Config holds server specific configuration parameters.
+type Config struct {
+	tlsopts.Config
+	Address        string `user:"true" help:"public address to listen on" default:":7777"`
+	PrivateAddress string `user:"true" help:"private address to listen on" default:"127.0.0.1:7778"`
+	DisableQUIC    bool   `help:"disable QUIC listener on a server" hidden:"true" default:"false"`
+
+	DisableTCPTLS   bool `help:"disable TCP/TLS listener on a server" internal:"true"`
+	DebugLogTraffic bool `hidden:"true" default:"false"` // Deprecated
 }
 
 type public struct {
-	listener net.Listener
-	drpc     *drpcserver.Server
-	grpc     *grpc.Server
+	tcpListener   net.Listener
+	udpConn       *net.UDPConn
+	quicListener  net.Listener
+	addr          net.Addr
+	disableTCPTLS bool
+	disableQUIC   bool
+
+	drpc *drpcserver.Server
+	mux  *drpcmux.Mux
 }
 
 type private struct {
 	listener net.Listener
 	drpc     *drpcserver.Server
-	grpc     *grpc.Server
+	mux      *drpcmux.Mux
 }
 
 // Server represents a bundle of services defined by a specific ID.
@@ -46,7 +64,6 @@ type Server struct {
 	log        *zap.Logger
 	public     public
 	private    private
-	next       []Service
 	tlsOptions *tlsopts.Options
 
 	mu   sync.Mutex
@@ -56,73 +73,53 @@ type Server struct {
 }
 
 // New creates a Server out of an Identity, a net.Listener,
-// a UnaryServerInterceptor, and a set of services.
-func New(log *zap.Logger, tlsOptions *tlsopts.Options, publicAddr, privateAddr string, interceptor grpc.UnaryServerInterceptor, services ...Service) (*Server, error) {
+// and interceptors.
+func New(log *zap.Logger, tlsOptions *tlsopts.Options, config Config) (_ *Server, err error) {
 	server := &Server{
 		log:        log,
-		next:       services,
 		tlsOptions: tlsOptions,
 		done:       make(chan struct{}),
+	}
+
+	server.public, err = newPublic(config.Address, config.DisableTCPTLS, config.DisableQUIC)
+	if err != nil {
+		return nil, Error.Wrap(err)
 	}
 
 	serverOptions := drpcserver.Options{
 		Manager: rpc.NewDefaultManagerOptions(),
 	}
-
-	unaryInterceptor := server.logOnErrorUnaryInterceptor
-	if interceptor != nil {
-		unaryInterceptor = CombineInterceptors(unaryInterceptor, interceptor)
-	}
-
-	publicListener, err := net.Listen("tcp", publicAddr)
+	privateListener, err := net.Listen("tcp", config.PrivateAddress)
 	if err != nil {
-		return nil, err
+		return nil, errs.Combine(err, server.public.Close())
 	}
-	server.public = public{
-		listener: wrapListener(publicListener),
-		drpc:     drpcserver.NewWithOptions(serverOptions),
-		grpc: grpc.NewServer(
-			grpc.StreamInterceptor(server.logOnErrorStreamInterceptor),
-			grpc.UnaryInterceptor(unaryInterceptor),
-			tlsOptions.ServerOption(),
-		),
-	}
-
-	privateListener, err := net.Listen("tcp", privateAddr)
-	if err != nil {
-		return nil, errs.Combine(err, publicListener.Close())
-	}
+	privateMux := drpcmux.New()
+	privateTracingHandler := rpctracing.NewHandler(privateMux, jaeger.RemoteTraceHandler)
 	server.private = private{
 		listener: wrapListener(privateListener),
-		drpc:     drpcserver.NewWithOptions(serverOptions),
-		grpc:     grpc.NewServer(),
+		drpc:     drpcserver.NewWithOptions(privateTracingHandler, serverOptions),
+		mux:      privateMux,
 	}
 
 	return server, nil
 }
 
-// Identity returns the server's identity
+// Identity returns the server's identity.
 func (p *Server) Identity() *identity.FullIdentity { return p.tlsOptions.Ident }
 
-// Addr returns the server's public listener address
-func (p *Server) Addr() net.Addr { return p.public.listener.Addr() }
+// Addr returns the server's public listener address.
+func (p *Server) Addr() net.Addr { return p.public.addr }
 
-// PrivateAddr returns the server's private listener address
+// PrivateAddr returns the server's private listener address.
 func (p *Server) PrivateAddr() net.Addr { return p.private.listener.Addr() }
 
-// GRPC returns the server's gRPC handle for registration purposes
-func (p *Server) GRPC() *grpc.Server { return p.public.grpc }
+// DRPC returns the server's dRPC mux for registration purposes.
+func (p *Server) DRPC() *drpcmux.Mux { return p.public.mux }
 
-// DRPC returns the server's dRPC handle for registration purposes
-func (p *Server) DRPC() *drpcserver.Server { return p.public.drpc }
+// PrivateDRPC returns the server's dRPC mux for registration purposes.
+func (p *Server) PrivateDRPC() *drpcmux.Mux { return p.private.mux }
 
-// PrivateGRPC returns the server's gRPC handle for registration purposes
-func (p *Server) PrivateGRPC() *grpc.Server { return p.private.grpc }
-
-// PrivateDRPC returns the server's dRPC handle for registration purposes
-func (p *Server) PrivateDRPC() *drpcserver.Server { return p.private.drpc }
-
-// Close shuts down the server
+// Close shuts down the server.
 func (p *Server) Close() error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -135,22 +132,14 @@ func (p *Server) Close() error {
 	// We ignore these errors because there's not really anything to do
 	// even if they happen, and they'll just be errors due to duplicate
 	// closes anyway.
-	_ = p.public.listener.Close()
+	_ = p.public.Close()
 	_ = p.private.listener.Close()
 	return nil
 }
 
-// Run will run the server and all of its services
+// Run will run the server and all of its services.
 func (p *Server) Run(ctx context.Context) (err error) {
 	defer mon.Task()(&ctx)(&err)
-
-	// are there any unstarted services? start those first. the
-	// services should know to call Run again once they're ready.
-	if len(p.next) > 0 {
-		next := p.next[0]
-		p.next = p.next[1:]
-		return next.Run(ctx, p)
-	}
 
 	// Make sure the server isn't already closed. If it is, register
 	// ourselves in the wait group so that Close can wait on it.
@@ -172,14 +161,27 @@ func (p *Server) Run(ctx context.Context) (err error) {
 	// a chance to be notified that they're done running.
 	const drpcHeader = "DRPC!!!1"
 
-	publicMux := listenmux.New(p.public.listener, len(drpcHeader))
-	publicDRPCListener := tls.NewListener(publicMux.Route(drpcHeader), p.tlsOptions.ServerTLSConfig())
+	var (
+		publicMux          *listenmux.Mux
+		publicDRPCListener net.Listener
+	)
+	if p.public.tcpListener != nil {
+		publicMux = listenmux.New(p.public.tcpListener, len(drpcHeader))
+		publicDRPCListener = tls.NewListener(publicMux.Route(drpcHeader), p.tlsOptions.ServerTLSConfig())
+	}
+
+	if p.public.udpConn != nil {
+		p.public.quicListener, err = quic.NewListener(p.public.udpConn, p.tlsOptions.ServerTLSConfig(), &quicgo.Config{MaxIdleTimeout: defaultUserTimeout})
+		if err != nil {
+			return err
+		}
+	}
 
 	privateMux := listenmux.New(p.private.listener, len(drpcHeader))
 	privateDRPCListener := privateMux.Route(drpcHeader)
 
 	// We need a new context chain because we require this context to be
-	// canceled only after all of the upcoming grpc/drpc servers have
+	// canceled only after all of the upcoming drpc servers have
 	// fully exited. The reason why is because Run closes listener for
 	// the mux when it exits, and we can only do that after all of the
 	// Servers are no longer accepting.
@@ -187,9 +189,11 @@ func (p *Server) Run(ctx context.Context) (err error) {
 	defer muxCancel()
 
 	var muxGroup errgroup.Group
-	muxGroup.Go(func() error {
-		return publicMux.Run(muxCtx)
-	})
+	if publicMux != nil {
+		muxGroup.Go(func() error {
+			return publicMux.Run(muxCtx)
+		})
+	}
 	muxGroup.Go(func() error {
 		return privateMux.Run(muxCtx)
 	})
@@ -206,24 +210,23 @@ func (p *Server) Run(ctx context.Context) (err error) {
 		case <-ctx.Done():
 		}
 
-		p.public.grpc.GracefulStop()
-		p.private.grpc.GracefulStop()
-
 		return nil
 	})
 
-	group.Go(func() error {
-		defer cancel()
-		return p.public.grpc.Serve(publicMux.Default())
-	})
-	group.Go(func() error {
-		defer cancel()
-		return p.public.drpc.Serve(ctx, publicDRPCListener)
-	})
-	group.Go(func() error {
-		defer cancel()
-		return p.private.grpc.Serve(privateMux.Default())
-	})
+	if publicDRPCListener != nil {
+		group.Go(func() error {
+			defer cancel()
+			return p.public.drpc.Serve(ctx, publicDRPCListener)
+		})
+	}
+
+	if p.public.quicListener != nil {
+		group.Go(func() error {
+			defer cancel()
+			return p.public.drpc.Serve(ctx, wrapListener(p.public.quicListener))
+		})
+	}
+
 	group.Go(func() error {
 		defer cancel()
 		return p.private.drpc.Serve(ctx, privateDRPCListener)
@@ -235,4 +238,108 @@ func (p *Server) Run(ctx context.Context) (err error) {
 	// Now we close down our listeners.
 	muxCancel()
 	return errs.Combine(err, muxGroup.Wait())
+}
+
+func newPublic(publicAddr string, disableTCPTLS, disableQUIC bool) (public, error) {
+	var (
+		err               error
+		publicTCPListener net.Listener
+		publicUDPConn     *net.UDPConn
+	)
+
+	for retry := 0; ; retry++ {
+		addr := publicAddr
+		if !disableTCPTLS {
+			publicTCPListener, err = net.Listen("tcp", addr)
+			if err != nil {
+				return public{}, err
+			}
+
+			addr = publicTCPListener.Addr().String()
+		}
+
+		if !disableQUIC {
+			udpAddr, err := net.ResolveUDPAddr("udp", addr)
+			if err != nil {
+				return public{}, err
+			}
+
+			publicUDPConn, err = net.ListenUDP("udp", udpAddr)
+			if err != nil {
+				_, port, _ := net.SplitHostPort(publicAddr)
+				if port == "0" && retry < 10 && isErrorAddressAlreadyInUse(err) {
+					// from here, we know for sure that the tcp port chosen by the
+					// os is available, but we don't know if the same port number
+					// for udp is also available.
+					// if a udp port is already in use, we will close the tcp port and retry
+					// to find one that is available for both udp and tcp.
+					_ = publicTCPListener.Close()
+					continue
+				}
+				return public{}, errs.Combine(err, publicTCPListener.Close())
+			}
+		}
+
+		break
+	}
+
+	publicMux := drpcmux.New()
+	publicTracingHandler := rpctracing.NewHandler(publicMux, jaeger.RemoteTraceHandler)
+	serverOptions := drpcserver.Options{
+		Manager: rpc.NewDefaultManagerOptions(),
+	}
+
+	var netAddr net.Addr
+	if publicTCPListener != nil {
+		netAddr = publicTCPListener.Addr()
+	}
+
+	if publicUDPConn != nil && netAddr == nil {
+		netAddr = publicUDPConn.LocalAddr()
+	}
+
+	return public{
+		tcpListener:   wrapListener(publicTCPListener),
+		udpConn:       publicUDPConn,
+		addr:          netAddr,
+		drpc:          drpcserver.NewWithOptions(publicTracingHandler, serverOptions),
+		mux:           publicMux,
+		disableTCPTLS: disableTCPTLS,
+		disableQUIC:   disableQUIC,
+	}, nil
+}
+
+func (p public) Close() (err error) {
+	if p.quicListener != nil {
+		err = p.quicListener.Close()
+	}
+	if p.udpConn != nil {
+		err = errs.Combine(err, p.udpConn.Close())
+	}
+	if p.tcpListener != nil {
+		err = errs.Combine(err, p.tcpListener.Close())
+	}
+
+	return err
+}
+
+// isErrorAddressAlreadyInUse checks whether the error is corresponding to
+// EADDRINUSE. Taken from https://stackoverflow.com/a/65865898.
+func isErrorAddressAlreadyInUse(err error) bool {
+	var eOsSyscall *os.SyscallError
+	if !errors.As(err, &eOsSyscall) {
+		return false
+	}
+	var errErrno syscall.Errno
+	if !errors.As(eOsSyscall.Err, &errErrno) {
+		return false
+	}
+	if errErrno == syscall.EADDRINUSE {
+		return true
+	}
+	const WSAEADDRINUSE = 10048
+	if runtime.GOOS == "windows" && errErrno == WSAEADDRINUSE {
+		return true
+	}
+	return false
 }

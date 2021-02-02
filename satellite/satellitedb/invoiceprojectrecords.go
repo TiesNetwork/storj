@@ -6,12 +6,12 @@ package satellitedb
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"time"
 
-	"github.com/skyrings/skyring-common/tools/uuid"
 	"github.com/zeebo/errs"
 
-	"storj.io/storj/private/dbutil"
+	"storj.io/common/uuid"
 	"storj.io/storj/satellite/payments/stripecoinpayments"
 	"storj.io/storj/satellite/satellitedb/dbx"
 )
@@ -79,6 +79,7 @@ func (db *invoiceProjectRecords) Create(ctx context.Context, records []stripecoi
 				return err
 			}
 		}
+
 		return nil
 	})
 }
@@ -94,7 +95,7 @@ func (db *invoiceProjectRecords) Check(ctx context.Context, projectID uuid.UUID,
 	)
 
 	if err != nil {
-		if err == sql.ErrNoRows {
+		if errors.Is(err, sql.ErrNoRows) {
 			return nil
 		}
 
@@ -115,6 +116,9 @@ func (db *invoiceProjectRecords) Get(ctx context.Context, projectID uuid.UUID, s
 	)
 
 	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		}
 		return nil, err
 	}
 
@@ -136,13 +140,14 @@ func (db *invoiceProjectRecords) Consume(ctx context.Context, id uuid.UUID) (err
 }
 
 // ListUnapplied returns project records page with unapplied project records.
-func (db *invoiceProjectRecords) ListUnapplied(ctx context.Context, offset int64, limit int, before time.Time) (_ stripecoinpayments.ProjectRecordsPage, err error) {
+func (db *invoiceProjectRecords) ListUnapplied(ctx context.Context, offset int64, limit int, start, end time.Time) (_ stripecoinpayments.ProjectRecordsPage, err error) {
 	defer mon.Task()(&ctx)(&err)
 
 	var page stripecoinpayments.ProjectRecordsPage
 
-	dbxRecords, err := db.db.Limited_StripecoinpaymentsInvoiceProjectRecord_By_CreatedAt_LessOrEqual_And_State_OrderBy_Desc_CreatedAt(ctx,
-		dbx.StripecoinpaymentsInvoiceProjectRecord_CreatedAt(before),
+	dbxRecords, err := db.db.Limited_StripecoinpaymentsInvoiceProjectRecord_By_PeriodStart_And_PeriodEnd_And_State(ctx,
+		dbx.StripecoinpaymentsInvoiceProjectRecord_PeriodStart(start),
+		dbx.StripecoinpaymentsInvoiceProjectRecord_PeriodEnd(end),
 		dbx.StripecoinpaymentsInvoiceProjectRecord_State(invoiceProjectRecordStateUnapplied.Int()),
 		limit+1,
 		offset,
@@ -170,13 +175,13 @@ func (db *invoiceProjectRecords) ListUnapplied(ctx context.Context, offset int64
 	return page, nil
 }
 
-// fromDBXInvoiceProjectRecord converts *dbx.StripecoinpaymentsInvoiceProjectRecord to *stripecoinpayments.ProjectRecord
+// fromDBXInvoiceProjectRecord converts *dbx.StripecoinpaymentsInvoiceProjectRecord to *stripecoinpayments.ProjectRecord.
 func fromDBXInvoiceProjectRecord(dbxRecord *dbx.StripecoinpaymentsInvoiceProjectRecord) (*stripecoinpayments.ProjectRecord, error) {
-	id, err := dbutil.BytesToUUID(dbxRecord.Id)
+	id, err := uuid.FromBytes(dbxRecord.Id)
 	if err != nil {
 		return nil, errs.Wrap(err)
 	}
-	projectID, err := dbutil.BytesToUUID(dbxRecord.ProjectId)
+	projectID, err := uuid.FromBytes(dbxRecord.ProjectId)
 	if err != nil {
 		return nil, errs.Wrap(err)
 	}
@@ -189,5 +194,6 @@ func fromDBXInvoiceProjectRecord(dbxRecord *dbx.StripecoinpaymentsInvoiceProject
 		Objects:     float64(dbxRecord.Objects),
 		PeriodStart: dbxRecord.PeriodStart,
 		PeriodEnd:   dbxRecord.PeriodEnd,
+		State:       dbxRecord.State,
 	}, nil
 }

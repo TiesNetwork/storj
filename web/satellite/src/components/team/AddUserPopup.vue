@@ -46,7 +46,7 @@
                             width='205px'
                             height='48px'
                             :on-press="onClose"
-                            is-white="true"
+                            is-transparent="true"
                         />
                         <VButton
                             label='Add Team Members'
@@ -64,7 +64,13 @@
             <div class="notification-wrap">
                 <AddMemberNotificationIcon class="notification-wrap__image"/>
                 <div class="notification-wrap__text-area">
-                    <p class="notification-wrap__text-area__text">If the team member you want to invite to join the project is still not on this Satellite, please share this link to the signup page and ask them to register here: <router-link target="_blank" exact to="/register" >{{registerPath}}</router-link></p>
+                    <p class="notification-wrap__text-area__text">
+                        If the team member you want to invite to join the project is still not on this Satellite, please
+                        share this link to the signup page and ask them to register here:
+                        <router-link target="_blank" rel="noopener noreferrer" exact to="/signup">
+                            {{registerPath}}
+                        </router-link>
+                    </p>
                 </div>
             </div>
         </div>
@@ -86,7 +92,7 @@ import { RouteConfig } from '@/router';
 import { EmailInput } from '@/types/EmailInput';
 import { APP_STATE_ACTIONS, PM_ACTIONS } from '@/utils/constants/actionNames';
 import { SegmentEvent } from '@/utils/constants/analyticsEventNames';
-import { validateEmail } from '@/utils/validation';
+import { Validator } from '@/utils/validation';
 
 @Component({
     components: {
@@ -99,12 +105,18 @@ import { validateEmail } from '@/utils/validation';
     },
 })
 export default class AddUserPopup extends Vue {
+    /**
+     * Initial empty inputs set.
+     */
     private inputs: EmailInput[] = [new EmailInput(), new EmailInput(), new EmailInput()];
     private formError: string = '';
     private isLoading: boolean = false;
 
     private FIRST_PAGE = 1;
 
+    /**
+     * Tries to add users related to entered emails list to current project.
+     */
     public async onAddUsersClick(): Promise<void> {
         if (this.isLoading) {
             return;
@@ -119,7 +131,7 @@ export default class AddUserPopup extends Vue {
 
         for (let i = 0; i < length; i++) {
             const element = this.inputs[i];
-            const isEmail = validateEmail(element.value);
+            const isEmail = Validator.email(element.value);
 
             if (isEmail) {
                 emailArray.push(element.value);
@@ -191,6 +203,9 @@ export default class AddUserPopup extends Vue {
         this.isLoading = false;
     }
 
+    /**
+     * Adds additional email input.
+     */
     public addInput(): void {
         const inputsLength = this.inputs.length;
         if (inputsLength < 10) {
@@ -198,6 +213,10 @@ export default class AddUserPopup extends Vue {
         }
     }
 
+    /**
+     * Deletes selected email input from list.
+     * @param index
+     */
     public deleteInput(index): void {
         if (this.inputs.length === 1) return;
 
@@ -206,14 +225,24 @@ export default class AddUserPopup extends Vue {
         this.$delete(this.inputs, index);
     }
 
+    /**
+     * Closes popup.
+     */
     public onClose(): void {
         this.$store.dispatch(APP_STATE_ACTIONS.TOGGLE_TEAM_MEMBERS);
     }
 
+    /**
+     * Indicates if emails count reached maximum.
+     */
     public get isMaxInputsCount(): boolean {
         return this.inputs.length > 9;
     }
 
+    /**
+     * Indicates if add button is active.
+     * Active when no errors and at least one input is not empty.
+     */
     public get isButtonActive(): boolean {
         if (this.formError) return false;
 
@@ -234,15 +263,21 @@ export default class AddUserPopup extends Vue {
         return this.inputs.length > 4;
     }
 
+    /**
+     * Removes error for selected input.
+     */
     private resetFormErrors(index): void {
         this.inputs[index].setError(false);
-        if (!this.hasInputError()) {
+        if (!this.hasInputError) {
 
             this.formError = '';
         }
     }
 
-    private hasInputError(): boolean {
+    /**
+     * Indicates if at least one input has error.
+     */
+    private get hasInputError(): boolean {
         return this.inputs.some((element: EmailInput) => {
             return element.error;
         });
@@ -292,10 +327,6 @@ export default class AddUserPopup extends Vue {
 
             &:first-child {
                 cursor: pointer;
-                -webkit-user-select: none;
-                -moz-user-select: none;
-                -ms-user-select: none;
-                user-select: none;
             }
         }
     }
@@ -370,7 +401,6 @@ export default class AddUserPopup extends Vue {
                 margin: 0 0 90px 0;
                 width: 130%;
                 text-align: end;
-                user-select: none;
             }
         }
 
@@ -399,7 +429,7 @@ export default class AddUserPopup extends Vue {
             &__inputs-group {
                 max-height: 35vh;
                 overflow-y: hidden;
-                padding: 0 50px;
+                padding: 3px 50px 0 50px;
 
                 &__item {
                     display: flex;
@@ -447,7 +477,6 @@ export default class AddUserPopup extends Vue {
                 font-size: 16px;
                 line-height: 25px;
                 padding-left: 50px;
-                user-select: none;
             }
 
             &__button-container {

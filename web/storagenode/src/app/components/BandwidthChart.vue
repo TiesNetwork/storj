@@ -3,27 +3,28 @@
 
 <template>
     <div class="chart">
-        <p class="bandwidth-chart__data-dimension">{{chartDataDimension}}</p>
+        <p class="bandwidth-chart__data-dimension">{{ chartDataDimension }}</p>
         <VChart
             id="bandwidth-chart"
             :chart-data="chartData"
-            :width="400"
-            :height="240"
+            :width="chartWidth"
+            :height="chartHeight"
             :tooltip-constructor="bandwidthTooltip"
+            :key="chartKey"
         />
     </div>
 </template>
 
 <script lang="ts">
-import { Component, Vue } from 'vue-property-decorator';
+import { Component } from 'vue-property-decorator';
 
-import VChart from '@/app/components/VChart.vue';
+import BaseChart from '@/app/components/BaseChart.vue';
 
 import { ChartData } from '@/app/types/chartData';
 import { Tooltip, TooltipParams } from '@/app/types/tooltip';
 import { ChartUtils } from '@/app/utils/chart';
-import { formatBytes } from '@/app/utils/converter';
-import { BandwidthUsed } from '@/storagenode/satellite';
+import { Size } from '@/private/memory/size';
+import { BandwidthUsed } from '@/storagenode/sno/sno';
 
 /**
  * stores bandwidth data for bandwidth chart's tooltip
@@ -37,21 +38,21 @@ class BandwidthTooltip {
     public date: string;
 
     public constructor(bandwidth: BandwidthUsed) {
-        this.normalEgress = formatBytes(bandwidth.egress.usage);
-        this.normalIngress = formatBytes(bandwidth.ingress.usage);
-        this.repairIngress = formatBytes(bandwidth.ingress.repair);
-        this.repairEgress = formatBytes(bandwidth.egress.repair);
-        this.auditEgress = formatBytes(bandwidth.egress.audit);
+        this.normalEgress = Size.toBase10String(bandwidth.egress.usage);
+        this.normalIngress = Size.toBase10String(bandwidth.ingress.usage);
+        this.repairIngress = Size.toBase10String(bandwidth.ingress.repair);
+        this.repairEgress = Size.toBase10String(bandwidth.egress.repair);
+        this.auditEgress = Size.toBase10String(bandwidth.egress.audit);
         this.date = bandwidth.intervalStart.toUTCString().slice(0, 16);
     }
 }
 
-@Component ({
-    components: {
-        VChart,
-    },
-})
-export default class BandwidthChart extends Vue {
+@Component
+export default class BandwidthChart extends BaseChart {
+    private get chartBackgroundColor(): string {
+        return this.isDarkMode ? '#4F97F7' : '#F2F6FC';
+    }
+
     private get allBandwidth(): BandwidthUsed[] {
         return ChartUtils.populateEmptyBandwidth(this.$store.state.node.bandwidthChartData);
     }
@@ -69,9 +70,9 @@ export default class BandwidthChart extends Vue {
     public get chartData(): ChartData {
         let data: number[] = [0];
         const daysCount = ChartUtils.daysDisplayedOnChart();
-        const chartBackgroundColor = '#F2F6FC';
+        const chartBackgroundColor = this.chartBackgroundColor;
         const chartBorderColor = '#1F49A3';
-        const chartBorderWidth = 2;
+        const chartBorderWidth = 1;
 
         if (this.allBandwidth.length) {
             data = ChartUtils.normalizeChartData(this.allBandwidth.map(elem => elem.summary()));
@@ -129,30 +130,31 @@ export default class BandwidthChart extends Vue {
     }
 
     .bandwidth-chart {
+        z-index: 102;
 
         &__data-dimension {
             font-size: 13px;
-            color: #586c86;
-            margin: 0 0 5px 31px;
+            color: var(--regular-text-color);
+            margin: 0 0 5px 31px !important;
             font-family: 'font_medium', sans-serif;
         }
     }
 
     #bandwidth-tooltip {
-        background-image: url('../../../static/images/tooltipBack.png');
+        background-image: var(--tooltip-background-path);
         background-repeat: no-repeat;
         background-size: cover;
         min-width: 250px;
         min-height: 230px;
         font-size: 12px;
         border-radius: 14px;
-        box-shadow: 0 2px 10px #d2d6de;
-        color: #535f77;
+        color: var(--regular-text-color);
         pointer-events: none;
+        z-index: 9999;
     }
 
     #bandwidth-tooltip-arrow {
-        background-image: url('../../../static/images/tooltipArrow.png');
+        background-image: var(--tooltip-arrow-path);
         background-repeat: no-repeat;
         background-size: 50px 30px;
         min-width: 50px;
@@ -175,7 +177,7 @@ export default class BandwidthChart extends Vue {
 
         &__info {
             display: flex;
-            background-color: #ebecf0;
+            background-color: var(--block-background-color);
             border-radius: 12px;
             padding: 14px 17px 14px 14px;
             align-items: center;
@@ -205,6 +207,6 @@ export default class BandwidthChart extends Vue {
         align-items: center;
         justify-content: center;
         padding: 10px 0 16px 0;
-        color: rgba(83, 95, 119, 0.44);
+        color: var(--regular-text-color);
     }
 </style>

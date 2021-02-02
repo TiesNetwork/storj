@@ -11,7 +11,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/skyrings/skyring-common/tools/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/zeebo/errs"
@@ -22,28 +21,30 @@ import (
 	"storj.io/common/memory"
 	"storj.io/common/pb"
 	"storj.io/common/rpc/rpcstatus"
-	"storj.io/common/storj"
 	"storj.io/common/sync2"
 	"storj.io/common/testcontext"
 	"storj.io/common/testrand"
+	"storj.io/common/uuid"
 	"storj.io/storj/private/testplanet"
 	"storj.io/storj/satellite"
 	"storj.io/storj/satellite/accounting"
+	"storj.io/storj/satellite/metainfo"
+	"storj.io/storj/satellite/metainfo/metabase"
 	"storj.io/storj/satellite/orders"
 	"storj.io/storj/satellite/satellitedb/satellitedbtest"
+	"storj.io/uplink/private/storage/meta"
 )
 
 func TestProjectUsageStorage(t *testing.T) {
 	testplanet.Run(t, testplanet.Config{
-		SatelliteCount: 1, StorageNodeCount: 6, UplinkCount: 1,
+		SatelliteCount: 1, StorageNodeCount: 4, UplinkCount: 1,
 		Reconfigure: testplanet.Reconfigure{
 			Satellite: func(log *zap.Logger, index int, config *satellite.Config) {
-				config.Rollup.MaxAlphaUsage = 1 * memory.MB
+				config.Metainfo.ProjectLimits.DefaultMaxUsage = 1 * memory.MB
+				config.Metainfo.ProjectLimits.DefaultMaxBandwidth = 1 * memory.MB
 			},
 		},
 	}, func(t *testing.T, ctx *testcontext.Context, planet *testplanet.Planet) {
-		projectID := planet.Uplinks[0].ProjectID[planet.Satellites[0].ID()]
-
 		var uploaded uint32
 
 		checkctx, checkcancel := context.WithCancel(ctx)
@@ -63,7 +64,7 @@ func TestProjectUsageStorage(t *testing.T) {
 					return nil
 				}
 
-				total, err := planet.Satellites[0].Accounting.ProjectUsage.GetProjectStorageTotals(ctx, projectID)
+				total, err := planet.Satellites[0].Accounting.ProjectUsage.GetProjectStorageTotals(ctx, planet.Uplinks[0].Projects[0].ID)
 				if err != nil {
 					return errs.Wrap(err)
 				}
@@ -75,8 +76,13 @@ func TestProjectUsageStorage(t *testing.T) {
 
 		data := testrand.Bytes(1 * memory.MB)
 
+		// set limit manually to 1MB until column values can be nullable
+		accountingDB := planet.Satellites[0].DB.ProjectAccounting()
+		err := accountingDB.UpdateProjectUsageLimit(ctx, planet.Uplinks[0].Projects[0].ID, 1*memory.MB)
+		require.NoError(t, err)
+
 		// successful upload
-		err := planet.Uplinks[0].Upload(ctx, planet.Satellites[0], "testbucket", "test/path/0", data)
+		err = planet.Uplinks[0].Upload(ctx, planet.Satellites[0], "testbucket", "test/path/0", data)
 		atomic.StoreUint32(&uploaded, 1)
 		require.NoError(t, err)
 		planet.Satellites[0].Accounting.Tally.Loop.TriggerWait()
@@ -112,23 +118,16 @@ func TestProjectUsageBandwidth(t *testing.T) {
 			testplanet.Run(t, testplanet.Config{
 				SatelliteCount: 1, StorageNodeCount: 6, UplinkCount: 1,
 			}, func(t *testing.T, ctx *testcontext.Context, planet *testplanet.Planet) {
-
 				saDB := planet.Satellites[0].DB
 				orderDB := saDB.Orders()
 
-				// Setup: get projectID and create bucketID
-				projects, err := planet.Satellites[0].DB.Console().Projects().GetAll(ctx)
-				projectID := projects[0].ID
-				require.NoError(t, err)
-				bucketName := "testbucket"
-				bucketID := createBucketID(projectID, []byte(bucketName))
-
+				bucket := metabase.BucketLocation{ProjectID: planet.Uplinks[0].Projects[0].ID, BucketName: "testbucket"}
 				projectUsage := planet.Satellites[0].Accounting.ProjectUsage
 
 				// Setup: create a BucketBandwidthRollup record to test exceeding bandwidth project limit
 				if testCase.expectedResource == "bandwidth" {
-					now := time.Now().UTC()
-					err := setUpBucketBandwidthAllocations(ctx, projectID, orderDB, now)
+					now := time.Now()
+					err := setUpBucketBandwidthAllocations(ctx, bucket.ProjectID, orderDB, now)
 					require.NoError(t, err)
 				}
 
@@ -136,15 +135,15 @@ func TestProjectUsageBandwidth(t *testing.T) {
 				expectedData := testrand.Bytes(50 * memory.KiB)
 
 				filePath := "test/path"
-				err = planet.Uplinks[0].Upload(ctx, planet.Satellites[0], bucketName, filePath, expectedData)
+				err := planet.Uplinks[0].Upload(ctx, planet.Satellites[0], bucket.BucketName, filePath, expectedData)
 				require.NoError(t, err)
 
-				actualExceeded, _, err := projectUsage.ExceedsBandwidthUsage(ctx, projectID, bucketID)
+				actualExceeded, _, err := projectUsage.ExceedsBandwidthUsage(ctx, bucket.ProjectID)
 				require.NoError(t, err)
 				require.Equal(t, testCase.expectedExceeded, actualExceeded)
 
 				// Execute test: check that the uplink gets an error when they have exceeded bandwidth limits and try to download a file
-				_, actualErr := planet.Uplinks[0].Download(ctx, planet.Satellites[0], bucketName, filePath)
+				_, actualErr := planet.Uplinks[0].Download(ctx, planet.Satellites[0], bucket.BucketName, filePath)
 				if testCase.expectedResource == "bandwidth" {
 					require.True(t, errs2.IsRPC(actualErr, testCase.expectedStatus))
 				} else {
@@ -155,14 +154,86 @@ func TestProjectUsageBandwidth(t *testing.T) {
 	}
 }
 
-func createBucketID(projectID uuid.UUID, bucket []byte) []byte {
-	entries := make([]string, 0)
-	entries = append(entries, projectID.String())
-	entries = append(entries, string(bucket))
-	return []byte(storj.JoinPaths(entries...))
+func TestProjectBandwidthRollups(t *testing.T) {
+	timeBuf := time.Second * 5
+
+	satellitedbtest.Run(t, func(ctx *testcontext.Context, t *testing.T, db satellite.DB) {
+		p1 := testrand.UUID()
+		p2 := testrand.UUID()
+		b1 := testrand.Bytes(10)
+		b2 := testrand.Bytes(20)
+
+		now := time.Now().UTC()
+		// could be flaky near next month
+		if now.Month() != now.Add(timeBuf).Month() {
+			time.Sleep(timeBuf)
+			now = time.Now().UTC()
+		}
+
+		hour := time.Date(now.Year(), now.Month(), now.Day(), now.Hour(), 0, 0, 0, now.Location())
+		// things that should be counted
+		err := db.Orders().UpdateBucketBandwidthAllocation(ctx, p1, b1, pb.PieceAction_GET, 1000, hour)
+		require.NoError(t, err)
+		err = db.Orders().UpdateBucketBandwidthAllocation(ctx, p1, b2, pb.PieceAction_GET, 1000, hour)
+		require.NoError(t, err)
+
+		rollups := []orders.BucketBandwidthRollup{
+			{ProjectID: p1, BucketName: string(b1), Action: pb.PieceAction_GET, Inline: 1000, Allocated: 1000 /* counted */, Settled: 1000},
+			{ProjectID: p1, BucketName: string(b2), Action: pb.PieceAction_GET, Inline: 1000, Allocated: 1000 /* counted */, Settled: 1000},
+		}
+		err = db.Orders().UpdateBucketBandwidthBatch(ctx, hour, rollups)
+		require.NoError(t, err)
+
+		// things that shouldn't be counted
+		err = db.Orders().UpdateBucketBandwidthAllocation(ctx, p1, b1, pb.PieceAction_PUT, 1000, hour)
+		require.NoError(t, err)
+		err = db.Orders().UpdateBucketBandwidthAllocation(ctx, p1, b2, pb.PieceAction_PUT, 1000, hour)
+		require.NoError(t, err)
+		err = db.Orders().UpdateBucketBandwidthAllocation(ctx, p1, b1, pb.PieceAction_PUT_GRACEFUL_EXIT, 1000, hour)
+		require.NoError(t, err)
+		err = db.Orders().UpdateBucketBandwidthAllocation(ctx, p1, b2, pb.PieceAction_PUT_REPAIR, 1000, hour)
+		require.NoError(t, err)
+		err = db.Orders().UpdateBucketBandwidthAllocation(ctx, p1, b1, pb.PieceAction_GET_AUDIT, 1000, hour)
+		require.NoError(t, err)
+		err = db.Orders().UpdateBucketBandwidthAllocation(ctx, p1, b2, pb.PieceAction_GET_REPAIR, 1000, hour)
+		require.NoError(t, err)
+		err = db.Orders().UpdateBucketBandwidthAllocation(ctx, p2, b1, pb.PieceAction_PUT, 1000, hour)
+		require.NoError(t, err)
+		err = db.Orders().UpdateBucketBandwidthAllocation(ctx, p2, b2, pb.PieceAction_PUT, 1000, hour)
+		require.NoError(t, err)
+		err = db.Orders().UpdateBucketBandwidthAllocation(ctx, p2, b1, pb.PieceAction_PUT_GRACEFUL_EXIT, 1000, hour)
+		require.NoError(t, err)
+		err = db.Orders().UpdateBucketBandwidthAllocation(ctx, p2, b2, pb.PieceAction_PUT_REPAIR, 1000, hour)
+		require.NoError(t, err)
+		err = db.Orders().UpdateBucketBandwidthAllocation(ctx, p2, b1, pb.PieceAction_GET_AUDIT, 1000, hour)
+		require.NoError(t, err)
+		err = db.Orders().UpdateBucketBandwidthAllocation(ctx, p2, b2, pb.PieceAction_GET_REPAIR, 1000, hour)
+		require.NoError(t, err)
+
+		rollups = []orders.BucketBandwidthRollup{
+			{ProjectID: p1, BucketName: string(b1), Action: pb.PieceAction_PUT, Inline: 1000, Allocated: 1000, Settled: 1000},
+			{ProjectID: p1, BucketName: string(b2), Action: pb.PieceAction_PUT, Inline: 1000, Allocated: 1000, Settled: 1000},
+			{ProjectID: p1, BucketName: string(b1), Action: pb.PieceAction_PUT_GRACEFUL_EXIT, Inline: 1000, Allocated: 1000, Settled: 1000},
+			{ProjectID: p1, BucketName: string(b2), Action: pb.PieceAction_PUT_REPAIR, Inline: 1000, Allocated: 1000, Settled: 1000},
+			{ProjectID: p1, BucketName: string(b1), Action: pb.PieceAction_GET_AUDIT, Inline: 1000, Allocated: 1000, Settled: 1000},
+			{ProjectID: p1, BucketName: string(b2), Action: pb.PieceAction_GET_REPAIR, Inline: 1000, Allocated: 1000, Settled: 1000},
+			{ProjectID: p2, BucketName: string(b1), Action: pb.PieceAction_PUT, Inline: 1000, Allocated: 1000, Settled: 1000},
+			{ProjectID: p2, BucketName: string(b2), Action: pb.PieceAction_PUT, Inline: 1000, Allocated: 1000, Settled: 1000},
+			{ProjectID: p2, BucketName: string(b1), Action: pb.PieceAction_PUT_GRACEFUL_EXIT, Inline: 1000, Allocated: 1000, Settled: 1000},
+			{ProjectID: p2, BucketName: string(b2), Action: pb.PieceAction_PUT_REPAIR, Inline: 1000, Allocated: 1000, Settled: 1000},
+			{ProjectID: p2, BucketName: string(b1), Action: pb.PieceAction_GET_AUDIT, Inline: 1000, Allocated: 1000, Settled: 1000},
+			{ProjectID: p2, BucketName: string(b2), Action: pb.PieceAction_GET_REPAIR, Inline: 1000, Allocated: 1000, Settled: 1000},
+		}
+		err = db.Orders().UpdateBucketBandwidthBatch(ctx, hour, rollups)
+		require.NoError(t, err)
+
+		alloc, err := db.ProjectAccounting().GetProjectAllocatedBandwidth(ctx, p1, now.Year(), now.Month())
+		require.NoError(t, err)
+		require.EqualValues(t, 4000, alloc)
+	})
 }
 
-func createBucketBandwidthRollups(ctx *testcontext.Context, satelliteDB satellite.DB, projectID uuid.UUID) (int64, error) {
+func createBucketBandwidthRollupsForPast4Days(ctx *testcontext.Context, satelliteDB satellite.DB, projectID uuid.UUID) (int64, error) {
 	var expectedSum int64
 	ordersDB := satelliteDB.Orders()
 	amount := int64(1000)
@@ -211,25 +282,26 @@ func TestProjectBandwidthTotal(t *testing.T) {
 		projectID := testrand.UUID()
 
 		// Setup: create bucket bandwidth rollup records
-		expectedTotal, err := createBucketBandwidthRollups(ctx, db, projectID)
+		expectedTotal, err := createBucketBandwidthRollupsForPast4Days(ctx, db, projectID)
 		require.NoError(t, err)
 
 		// Execute test: get project bandwidth total
-		from := time.Now().AddDate(0, 0, -accounting.AverageDaysInMonth) // past 30 days
-		actualBandwidthTotal, err := pdb.GetAllocatedBandwidthTotal(ctx, projectID, from)
+		since := time.Now().AddDate(0, -1, 0)
+
+		actualBandwidthTotal, err := pdb.GetAllocatedBandwidthTotal(ctx, projectID, since)
 		require.NoError(t, err)
-		require.Equal(t, actualBandwidthTotal, expectedTotal)
+		require.Equal(t, expectedTotal, actualBandwidthTotal)
 	})
 }
 
 func setUpBucketBandwidthAllocations(ctx *testcontext.Context, projectID uuid.UUID, orderDB orders.DB, now time.Time) error {
-	// Create many records that sum greater than project usage limit of 25GB
+	// Create many records that sum greater than project usage limit of 50GB
 	for i := 0; i < 4; i++ {
 		bucketName := fmt.Sprintf("%s%d", "testbucket", i)
 
 		// In order to exceed the project limits, create bandwidth allocation records
-		// that sum greater than the maxAlphaUsage * expansionFactor
-		amount := 10 * memory.GB.Int64() * accounting.ExpansionFactor
+		// that sum greater than the defaultMaxUsage
+		amount := 15 * memory.GB.Int64()
 		action := pb.PieceAction_GET
 		intervalStart := time.Date(now.Year(), now.Month(), now.Day(), now.Hour(), 0, 0, 0, now.Location())
 		err := orderDB.UpdateBucketBandwidthAllocation(ctx, projectID, []byte(bucketName), action, amount, intervalStart)
@@ -242,7 +314,7 @@ func setUpBucketBandwidthAllocations(ctx *testcontext.Context, projectID uuid.UU
 
 func TestProjectUsageCustomLimit(t *testing.T) {
 	testplanet.Run(t, testplanet.Config{
-		SatelliteCount: 1, StorageNodeCount: 6, UplinkCount: 1,
+		SatelliteCount: 1, StorageNodeCount: 4, UplinkCount: 1,
 	}, func(t *testing.T, ctx *testcontext.Context, planet *testplanet.Planet) {
 		satDB := planet.Satellites[0].DB
 		acctDB := satDB.ProjectAccounting()
@@ -254,7 +326,6 @@ func TestProjectUsageCustomLimit(t *testing.T) {
 		project := projects[0]
 		// set custom usage limit for project
 		expectedLimit := memory.Size(memory.GiB.Int64() * 10)
-
 		err = acctDB.UpdateProjectUsageLimit(ctx, project.ID, expectedLimit)
 		require.NoError(t, err)
 
@@ -279,18 +350,22 @@ func TestProjectUsageCustomLimit(t *testing.T) {
 }
 
 func TestUsageRollups(t *testing.T) {
-	const (
-		numBuckets     = 5
-		tallyIntervals = 10
-		tallyInterval  = time.Hour
-	)
+	testplanet.Run(t, testplanet.Config{
+		SatelliteCount: 1, StorageNodeCount: 0, UplinkCount: 2,
+	}, func(t *testing.T, ctx *testcontext.Context, planet *testplanet.Planet) {
+		const (
+			numBuckets     = 5
+			tallyIntervals = 10
+			tallyInterval  = time.Hour
+		)
 
-	satellitedbtest.Run(t, func(ctx *testcontext.Context, t *testing.T, db satellite.DB) {
 		now := time.Now()
-		start := now.Add(tallyInterval * time.Duration(-tallyIntervals))
+		start := now.Add(tallyInterval * -tallyIntervals)
 
-		project1 := testrand.UUID()
-		project2 := testrand.UUID()
+		db := planet.Satellites[0].DB
+
+		project1 := planet.Uplinks[0].Projects[0].ID
+		project2 := planet.Uplinks[1].Projects[0].ID
 
 		p1base := binary.BigEndian.Uint64(project1[:8]) >> 48
 		p2base := binary.BigEndian.Uint64(project2[:8]) >> 48
@@ -309,7 +384,10 @@ func TestUsageRollups(t *testing.T) {
 
 		var buckets []string
 		for i := 0; i < numBuckets; i++ {
-			bucketName := fmt.Sprintf("bucket_%d", i)
+			bucketName := fmt.Sprintf("bucket-%d", i)
+
+			err := planet.Uplinks[0].CreateBucket(ctx, planet.Satellites[0], bucketName)
+			require.NoError(t, err)
 
 			// project 1
 			for _, action := range actions {
@@ -324,6 +402,9 @@ func TestUsageRollups(t *testing.T) {
 				err = db.Orders().UpdateBucketBandwidthInline(ctx, project1, []byte(bucketName), action, value, now)
 				require.NoError(t, err)
 			}
+
+			err = planet.Uplinks[1].CreateBucket(ctx, planet.Satellites[0], bucketName)
+			require.NoError(t, err)
 
 			// project 2
 			for _, action := range actions {
@@ -345,16 +426,21 @@ func TestUsageRollups(t *testing.T) {
 		for i := 0; i < tallyIntervals; i++ {
 			interval := start.Add(tallyInterval * time.Duration(i))
 
-			bucketTallies := make(map[string]*accounting.BucketTally)
+			bucketTallies := make(map[metabase.BucketLocation]*accounting.BucketTally)
 			for j, bucket := range buckets {
-				bucketID1 := project1.String() + "/" + bucket
-				bucketID2 := project2.String() + "/" + bucket
+				bucketLoc1 := metabase.BucketLocation{
+					ProjectID:  project1,
+					BucketName: bucket,
+				}
+				bucketLoc2 := metabase.BucketLocation{
+					ProjectID:  project2,
+					BucketName: bucket,
+				}
 				value1 := getValue(i, j, p1base) * 10
 				value2 := getValue(i, j, p2base) * 10
 
 				tally1 := &accounting.BucketTally{
-					BucketName:     []byte(bucket),
-					ProjectID:      project1,
+					BucketLocation: bucketLoc1,
 					ObjectCount:    value1,
 					InlineSegments: value1,
 					RemoteSegments: value1,
@@ -364,8 +450,7 @@ func TestUsageRollups(t *testing.T) {
 				}
 
 				tally2 := &accounting.BucketTally{
-					BucketName:     []byte(bucket),
-					ProjectID:      project2,
+					BucketLocation: bucketLoc2,
 					ObjectCount:    value2,
 					InlineSegments: value2,
 					RemoteSegments: value2,
@@ -374,8 +459,8 @@ func TestUsageRollups(t *testing.T) {
 					MetadataSize:   value2,
 				}
 
-				bucketTallies[bucketID1] = tally1
-				bucketTallies[bucketID2] = tally2
+				bucketTallies[bucketLoc1] = tally1
+				bucketTallies[bucketLoc2] = tally2
 			}
 
 			err := db.ProjectAccounting().SaveTallies(ctx, interval, bucketTallies)
@@ -445,7 +530,7 @@ func TestUsageRollups(t *testing.T) {
 			assert.Equal(t, uint(1), bucketsPage.PageCount)
 			assert.Equal(t, 5, len(bucketsPage.BucketUsages))
 
-			bucketsPage, err = usageRollups.GetBucketTotals(ctx, project1, accounting.BucketUsageCursor{Limit: 5, Search: "bucket_0", Page: 1}, start, now)
+			bucketsPage, err = usageRollups.GetBucketTotals(ctx, project1, accounting.BucketUsageCursor{Limit: 5, Search: "bucket-0", Page: 1}, start, now)
 			require.NoError(t, err)
 			require.NotNil(t, bucketsPage)
 			assert.Equal(t, uint64(1), bucketsPage.TotalCount)
@@ -461,5 +546,205 @@ func TestUsageRollups(t *testing.T) {
 			assert.Equal(t, uint(0), bucketsPage.PageCount)
 			assert.Equal(t, 0, len(bucketsPage.BucketUsages))
 		})
+	})
+}
+
+func TestProjectUsage_FreeUsedStorageSpace(t *testing.T) {
+	testplanet.Run(t, testplanet.Config{
+		SatelliteCount: 1, StorageNodeCount: 4, UplinkCount: 1,
+	}, func(t *testing.T, ctx *testcontext.Context, planet *testplanet.Planet) {
+		satDB := planet.Satellites[0].DB
+		acctDB := satDB.ProjectAccounting()
+		accounting := planet.Satellites[0].Accounting
+		satMetainfo := planet.Satellites[0].Metainfo
+		projectsDB := satDB.Console().Projects()
+
+		accounting.Tally.Loop.Pause()
+
+		projects, err := projectsDB.GetAll(ctx)
+		require.NoError(t, err)
+
+		project := projects[0]
+
+		// set custom usage limit for project
+		customLimit := 100 * memory.KiB
+		err = acctDB.UpdateProjectUsageLimit(ctx, project.ID, customLimit)
+		require.NoError(t, err)
+
+		data := testrand.Bytes(50 * memory.KiB)
+
+		err = planet.Uplinks[0].Upload(ctx, planet.Satellites[0], "testbucket", "test/path1", data)
+		require.NoError(t, err)
+
+		// check if usage is equal to first uploaded file
+		prefix, err := metainfo.CreatePath(ctx, project.ID, -1, []byte("testbucket"), []byte{})
+		require.NoError(t, err)
+		items, _, err := satMetainfo.Service.List(ctx, prefix.Encode(), "", true, 1, meta.All)
+		require.NoError(t, err)
+
+		usage, err := accounting.ProjectUsage.GetProjectStorageTotals(ctx, project.ID)
+		require.NoError(t, err)
+		require.Equal(t, items[0].Pointer.SegmentSize, usage)
+
+		err = planet.Uplinks[0].Upload(ctx, planet.Satellites[0], "testbucket", "test/path2", data)
+		require.NoError(t, err)
+
+		// we used limit so we should get error
+		err = planet.Uplinks[0].Upload(ctx, planet.Satellites[0], "testbucket", "test/path3", data)
+		require.Error(t, err)
+		require.True(t, errs2.IsRPC(err, rpcstatus.ResourceExhausted))
+
+		// delete object to free some storage space
+		err = planet.Uplinks[0].DeleteObject(ctx, planet.Satellites[0], "testbucket", "test/path2")
+		require.NoError(t, err)
+
+		// we need to wait for tally to update storage usage after delete
+		accounting.Tally.Loop.TriggerWait()
+
+		// try to upload object as we have free space now
+		err = planet.Uplinks[0].Upload(ctx, planet.Satellites[0], "testbucket", "test/path3", data)
+		require.NoError(t, err)
+
+		// should fail because we once again used space up to limit
+		err = planet.Uplinks[0].Upload(ctx, planet.Satellites[0], "testbucket", "test/path2", data)
+		require.Error(t, err)
+		require.True(t, errs2.IsRPC(err, rpcstatus.ResourceExhausted))
+	})
+}
+
+func TestProjectUsage_ResetLimitsFirstDayOfNextMonth(t *testing.T) {
+	testplanet.Run(t, testplanet.Config{
+		SatelliteCount: 1, StorageNodeCount: 4, UplinkCount: 1,
+	}, func(t *testing.T, ctx *testcontext.Context, planet *testplanet.Planet) {
+		satDB := planet.Satellites[0].DB
+		acctDB := satDB.ProjectAccounting()
+		projectsDB := satDB.Console().Projects()
+
+		planet.Satellites[0].Orders.Chore.Loop.Pause()
+
+		projects, err := projectsDB.GetAll(ctx)
+		require.NoError(t, err)
+
+		project := projects[0]
+
+		// set custom usage limit for project
+		customLimit := 100 * memory.KiB
+		err = acctDB.UpdateProjectUsageLimit(ctx, project.ID, customLimit)
+		require.NoError(t, err)
+		err = acctDB.UpdateProjectBandwidthLimit(ctx, project.ID, customLimit)
+		require.NoError(t, err)
+
+		data := testrand.Bytes(customLimit)
+		err = planet.Uplinks[0].Upload(ctx, planet.Satellites[0], "testbucket", "test/path1", data)
+		require.NoError(t, err)
+
+		// verify that storage limit is all used
+		err = planet.Uplinks[0].Upload(ctx, planet.Satellites[0], "testbucket", "test/path2", data)
+		require.Error(t, err)
+		require.True(t, errs2.IsRPC(err, rpcstatus.ResourceExhausted))
+
+		_, err = planet.Uplinks[0].Download(ctx, planet.Satellites[0], "testbucket", "test/path1")
+		require.NoError(t, err)
+
+		require.NoError(t, planet.WaitForStorageNodeEndpoints(ctx))
+		tomorrow := time.Now().Add(24 * time.Hour)
+		for _, storageNode := range planet.StorageNodes {
+			storageNode.Storage2.Orders.SendOrders(ctx, tomorrow)
+		}
+
+		planet.Satellites[0].Orders.Chore.Loop.TriggerWait()
+
+		// verify that bandwidth limit is all used
+		_, err = planet.Uplinks[0].Download(ctx, planet.Satellites[0], "testbucket", "test/path1")
+		require.Error(t, err)
+		require.True(t, errs2.IsRPC(err, rpcstatus.ResourceExhausted))
+
+		now := time.Now()
+		planet.Satellites[0].API.Accounting.ProjectUsage.SetNow(func() time.Time {
+			return time.Date(now.Year(), now.Month()+1, 1, 0, 0, 0, 0, time.UTC)
+		})
+
+		// verify that storage limit is all used even at the new billing cycle
+		err = planet.Uplinks[0].Upload(ctx, planet.Satellites[0], "testbucket", "test/path2", data)
+		require.Error(t, err)
+		require.True(t, errs2.IsRPC(err, rpcstatus.ResourceExhausted))
+
+		// verify that new billing cycle reset bandwidth limit
+		_, err = planet.Uplinks[0].Download(ctx, planet.Satellites[0], "testbucket", "test/path1")
+		require.NoError(t, err)
+	})
+}
+
+func TestProjectUsage_BandwidthCache(t *testing.T) {
+	testplanet.Run(t, testplanet.Config{
+		SatelliteCount: 1, StorageNodeCount: 4, UplinkCount: 1,
+	}, func(t *testing.T, ctx *testcontext.Context, planet *testplanet.Planet) {
+		project := planet.Uplinks[0].Projects[0]
+		projectUsage := planet.Satellites[0].Accounting.ProjectUsage
+
+		badwidthUsed := int64(42)
+
+		err := projectUsage.UpdateProjectBandwidthUsage(ctx, project.ID, badwidthUsed)
+		require.NoError(t, err)
+
+		// verify cache key creation.
+		fromCache, err := projectUsage.GetProjectBandwidthUsage(ctx, project.ID)
+		require.NoError(t, err)
+		require.Equal(t, badwidthUsed, fromCache)
+
+		// verify cache key increment.
+		increment := int64(10)
+		err = projectUsage.UpdateProjectBandwidthUsage(ctx, project.ID, increment)
+		require.NoError(t, err)
+		fromCache, err = projectUsage.GetProjectBandwidthUsage(ctx, project.ID)
+		require.NoError(t, err)
+		require.Equal(t, badwidthUsed+increment, fromCache)
+	})
+}
+
+func TestProjectUsage_BandwidthDownloadLimit(t *testing.T) {
+	testplanet.Run(t, testplanet.Config{
+		SatelliteCount: 1, StorageNodeCount: 4, UplinkCount: 1,
+	}, func(t *testing.T, ctx *testcontext.Context, planet *testplanet.Planet) {
+		satDB := planet.Satellites[0].DB
+		acctDB := satDB.ProjectAccounting()
+
+		now := time.Now()
+		project := planet.Uplinks[0].Projects[0]
+
+		// set custom bandwidth limit for project 512 Kb
+		bandwidthLimit := 500 * memory.KiB
+		err := acctDB.UpdateProjectBandwidthLimit(ctx, project.ID, bandwidthLimit)
+		require.NoError(t, err)
+
+		dataSize := 100 * memory.KiB
+		data := testrand.Bytes(dataSize)
+
+		err = planet.Uplinks[0].Upload(ctx, planet.Satellites[0], "testbucket", "test/path1", data)
+		require.NoError(t, err)
+
+		// Let's calculate the maximum number of iterations
+		// Bandwidth limit: 512 Kb
+		// Pointer Segment size: 103.936 Kb
+		// (5 x 103.936) = 519.68
+		// We'll be able to download 5X before reach the limit.
+		for i := 0; i < 5; i++ {
+			_, err = planet.Uplinks[0].Download(ctx, planet.Satellites[0], "testbucket", "test/path1")
+			require.NoError(t, err)
+		}
+
+		// An extra download should return 'Exceeded Usage Limit' error
+		_, err = planet.Uplinks[0].Download(ctx, planet.Satellites[0], "testbucket", "test/path1")
+		require.Error(t, err)
+		require.True(t, errs2.IsRPC(err, rpcstatus.ResourceExhausted))
+
+		// Simulate new billing cycle (newxt month)
+		planet.Satellites[0].API.Accounting.ProjectUsage.SetNow(func() time.Time {
+			return time.Date(now.Year(), now.Month()+1, 1, 0, 0, 0, 0, time.UTC)
+		})
+
+		// Should not return an error since it's a new month
+		_, err = planet.Uplinks[0].Download(ctx, planet.Satellites[0], "testbucket", "test/path1")
+		require.NoError(t, err)
 	})
 }
